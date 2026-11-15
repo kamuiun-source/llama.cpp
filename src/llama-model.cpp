@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-expert-placement.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -1790,6 +1791,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    if (const char * profile = std::getenv("LLAMA_EXPERT_PLACEMENT")) {
+        if (arch != LLM_ARCH_QWEN4EXP || hparams.n_layer() != llama_expert_profile::n_layers ||
+                hparams.n_expert != llama_expert_profile::n_experts || hparams.n_expert_used_max() == 0 ||
+                ml.load_mtp || ml.files.empty() || ml.use_direct_io || split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::runtime_error("packed expert placement requires the Flash-Next base GGUF and layer split without Direct I/O");
+        }
+        if (ml.no_alloc) {
+            throw std::runtime_error("packed expert placement requires --fit off");
+        }
+        const char * device_name = std::getenv("LLAMA_EXPERT_DEVICE");
+        const auto target = device_name ? ggml_backend_dev_by_name(device_name) : nullptr;
+        if (!target || ggml_backend_dev_type(target) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                std::none_of(devices.begin(), devices.end(), [target](const auto & d) { return d.dev == target; }) ||
+                std::any_of(pimpl->dev_layer.begin(), pimpl->dev_layer.end(), [target](const auto & d) { return d.dev == target; })) {
+            throw std::runtime_error("LLAMA_EXPERT_DEVICE must name a selected GPU distinct from the layer devices");
+        }
+        expert_placement = std::make_unique<llama_expert_placement>(profile, target, hparams.n_expert_used_max());
+        ml.expert_placement = expert_placement.get();
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -1993,6 +2014,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    if (expert_placement) {
+        for (const auto & w : expert_placement->weights) {
+            tensors_by_name.emplace_back(w.host->name, w.host);
+        }
+    }
 
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
@@ -2142,6 +2168,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    if (expert_placement && !expert_placement->load(ml, params)) {
+        return false;
+    }
     for (auto & [ctx, bufs] : ctx_bufs) {
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
@@ -2548,6 +2577,13 @@ bool llama_model::no_alloc() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+    if (expert_placement) {
+        for (const auto * buffer : { &expert_placement->host_buf, &expert_placement->bank_buf }) {
+            if (*buffer) {
+                ret[ggml_backend_buffer_get_type(buffer->get())] += ggml_backend_buffer_get_size(buffer->get());
+            }
+        }
+    }
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (no_alloc()) {
             GGML_ASSERT(bufs.size() == 1);

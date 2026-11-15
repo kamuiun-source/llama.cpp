@@ -1,5 +1,6 @@
 #include "llama-moe-cache.h"
 
+#include "llama-expert-placement.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
@@ -368,6 +369,10 @@ struct llama_moe_cache::impl {
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
+    const llama_expert_placement * placement;
+    std::unique_ptr<const llama_expert_placement, void (*)(const llama_expert_placement *)> placement_owner{
+        nullptr, [](const llama_expert_placement * p) { p->context_in_use.store(false); },
+    };
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -399,7 +404,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+            n_expert_used(model.hparams.n_expert_used_max()), placement(model.expert_placement.get()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -416,6 +421,43 @@ struct llama_moe_cache::impl {
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("MoE cache requires a MoE model");
+        }
+
+        if (placement) {
+            const auto device = std::find_if(devices.begin(), devices.end(), [&](const auto & d) {
+                return ggml_backend_get_device(d.backend) == placement->target;
+            });
+            if (device == devices.end() || no_alloc || cpu_share != 0.0f) {
+                throw std::runtime_error("packed expert execution requires the placement device and CPU share 0");
+            }
+            if (placement->context_in_use.exchange(true)) {
+                throw std::runtime_error("packed expert scratch slots are already in use by another context");
+            }
+            placement_owner.reset(placement);
+            groups.emplace_back().id = static_cast<int32_t>(device - devices.begin());
+            const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead(), nullptr, true};
+            ctx_host.reset(ggml_init(params));
+            if (!ctx_host) {
+                throw std::runtime_error("could not allocate packed expert slot map context");
+            }
+            for (size_t il = 0; il < placement->maps.size(); ++il) {
+                auto & l = layers.at(il);
+                l.ig = 0;
+                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
+                layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
+            }
+            for (const auto & w : placement->weights) {
+                layers.at(w.layer).experts.push_back(w.host);
+                bindings.emplace(w.host, binding{w.layer, 0, w.bank});
+            }
+            buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), ggml_backend_cpu_buffer_type()));
+            if (!buf_host) {
+                throw std::runtime_error("could not allocate packed expert slot maps");
+            }
+            ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
+            return;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -689,6 +731,9 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        if (placement) {
+            return n_tokens == 1 && n_expert_used <= placement->n_slots ? l.slot_map : nullptr;
+        }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
@@ -724,6 +769,9 @@ struct llama_moe_cache::impl {
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        if (placement) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -791,13 +839,50 @@ struct llama_moe_cache::impl {
             }
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
-        GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_moe_cache_slots
-
-        const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+        // A cross-device split receives a plain tensor copy of the reshaped IDs.
+        GGML_ASSERT(placement || sel->op == GGML_OP_RESHAPE);
+        const int32_t n_used = placement ? n_expert_used : (int32_t) sel->src[0]->ne[0];
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+
+        if (placement) {
+            const auto & map = placement->maps[il];
+            auto slots = map.resident;
+            int32_t n_uploads = 0;
+            size_t bytes = 0;
+            size_t hits = 0;
+            for (const int32_t expert : ids) {
+                if (expert < 0 || static_cast<size_t>(expert) >= slots.size()) {
+                    GGML_ABORT("invalid packed expert ID in layer %d", il);
+                }
+                if (slots[expert] >= 0) {
+                    hits += map.resident[expert] >= 0;
+                    continue;
+                }
+                if (n_uploads == placement->n_slots) {
+                    GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
+                }
+                const int32_t slot = llama_expert_profile::n_resident + n_uploads++;
+                slots[expert] = slot;
+                for (ggml_tensor * host : l.experts) {
+                    ggml_tensor * bank = bindings.at(host).cached;
+                    const size_t stride = host->nb[2];
+                    const auto * data = static_cast<const uint8_t *>(host->data) + map.host[expert] * stride;
+                    ggml_backend_tensor_set(bank, data, slot * stride, stride);
+                    bytes += stride;
+                }
+            }
+            // Publish the slot map only after all selected weights have been copied.
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_set(dst, slots.data(), 0, ggml_nbytes(dst));
+            stats_small.hits += hits;
+            stats_small.misses += n_uploads;
+            stats_small.bytes += bytes;
+            LLAMA_LOG_DEBUG("packed experts: layer %d: %zu hits, %d RAM uploads, %zu bytes\n", il, hits, n_uploads, bytes);
+            return true;
+        }
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -880,6 +965,10 @@ llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
+}
+
+bool llama_moe_cache::requires_slots(int32_t il) const {
+    return pimpl->placement && il >= 0 && static_cast<size_t>(il) < pimpl->placement->maps.size();
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {

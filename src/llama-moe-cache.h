@@ -19,6 +19,7 @@ public:
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
+    bool requires_slots(int32_t il) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)

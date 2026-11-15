@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -2279,6 +2280,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const llm_arch arch = model.arch;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    if (n_tokens == 0 && moe_cache && moe_cache->requires_slots(il)) {
+        return ggml_view_tensor(ctx0, cur);
+    }
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -2681,10 +2685,17 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         return { nullptr, nullptr };
     }
 
+    auto unavailable = [&](const char * reason) -> llm_graph_moe_cache_slots {
+        if (moe_cache->requires_slots(il)) {
+            throw std::runtime_error(format("cannot execute packed experts in layer %d: %s", il, reason));
+        }
+        return { nullptr, nullptr };
+    };
+
     ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
     if (slot_map == nullptr) {
-        return { nullptr, nullptr };
+        return unavailable(format("no slots for %" PRId64 " tokens and %" PRId64 " selected experts", selected_experts->ne[1], selected_experts->ne[0]).c_str());
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
         if (w == nullptr) {
@@ -2692,12 +2703,13 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         }
         ggml_tensor * experts = moe_cache->get_experts(w);
         if (experts == nullptr) {
-            return { nullptr, nullptr };
+            return unavailable(w->name);
         }
         // the device of the cache must compute the matmul, else the scheduler copies the cache to another backend
         ggml_tensor * b = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, experts->ne[0], w == down_exps ? selected_experts->ne[0] : 1, selected_experts->ne[1]);
         if (!ggml_backend_supports_op(moe_cache->backend(il), ggml_mul_mat_id(ctx0, experts, b, selected_experts))) {
-            return { nullptr, nullptr };
+            return unavailable(format("%s does not support MUL_MAT_ID for %s (%s)",
+                    ggml_backend_name(moe_cache->backend(il)), w->name, ggml_type_name(w->type)).c_str());
         }
     }
 
@@ -2711,7 +2723,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
-        return { nullptr, nullptr };
+        return unavailable("placement device does not support I32 slot lookup");
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);

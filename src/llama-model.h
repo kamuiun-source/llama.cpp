@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_placement;
 struct llama_model;
 
 // available models
@@ -766,6 +767,8 @@ struct llama_rope_params {
 };
 
 struct llama_model {
+    std::unique_ptr<llama_expert_placement> expert_placement;
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
