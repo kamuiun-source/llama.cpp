@@ -2578,7 +2578,7 @@ bool llama_model::no_alloc() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     if (expert_placement) {
-        for (const auto * buffer : { &expert_placement->host_buf, &expert_placement->bank_buf }) {
+        for (const auto * buffer : { &expert_placement->host_buf, &expert_placement->bank_buf, &expert_placement->cold_buf }) {
             if (*buffer) {
                 ret[ggml_backend_buffer_get_type(buffer->get())] += ggml_backend_buffer_get_size(buffer->get());
             }

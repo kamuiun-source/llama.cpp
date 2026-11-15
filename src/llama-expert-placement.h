@@ -16,6 +16,7 @@ struct llama_expert_placement {
         size_t offset;
         ggml_tensor * host;
         ggml_tensor * bank;
+        ggml_tensor * cold;
     };
 
     struct layer_map {
@@ -29,12 +30,15 @@ struct llama_expert_placement {
 
     const ggml_backend_dev_t target;
     const int32_t n_slots;
+    const bool overlap;
     mutable std::atomic<bool> context_in_use{false};
     std::array<layer_map, llama_expert_profile::n_layers> maps;
     std::vector<weight> weights;
     ggml_context_ptr host_ctx;
     ggml_context_ptr bank_ctx;
+    ggml_context_ptr cold_ctx;
     ggml_backend_buffer_ptr host_buf;
     ggml_backend_buffer_ptr bank_buf;
+    ggml_backend_buffer_ptr cold_buf;
     llama_mlock host_lock;
 };

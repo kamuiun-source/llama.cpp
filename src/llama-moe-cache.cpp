@@ -346,6 +346,7 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * cold_slot_map = nullptr;
         ggml_tensor * slot_map_cpu = nullptr; // looked up in place of slot_map by the graphs with a CPU part, if cpu_share > 0, its data is not used
         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
@@ -357,6 +358,7 @@ struct llama_moe_cache::impl {
         int32_t il;
         int32_t ip;           // index of the bank
         ggml_tensor * cached; // view of the bank used in place of the host experts
+        ggml_tensor * cold = nullptr;
     };
 
     struct stats {
@@ -385,6 +387,12 @@ struct llama_moe_cache::impl {
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
     std::vector<int32_t> ids;
+    std::vector<int32_t> packed_misses;
+    std::array<int32_t, llama_expert_profile::n_experts> packed_cold_slots{};
+    int32_t pending_layer = -1;
+    int64_t packed_wait_us = 0;
+    size_t packed_wait_count = 0;
+    ggml_backend_buffer_ptr packed_staging;
     std::vector<moe_cache_lru::fill> fills;
     std::vector<moe_cache_lru::fill> cpu;
 
@@ -435,7 +443,7 @@ struct llama_moe_cache::impl {
             }
             placement_owner.reset(placement);
             groups.emplace_back().id = static_cast<int32_t>(device - devices.begin());
-            const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead(), nullptr, true};
+            const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * (placement->overlap ? 2 : 1), nullptr, true};
             ctx_host.reset(ggml_init(params));
             if (!ctx_host) {
                 throw std::runtime_error("could not allocate packed expert slot map context");
@@ -446,10 +454,17 @@ struct llama_moe_cache::impl {
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
+                if (placement->overlap) {
+                    l.cold_slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                    ggml_format_name(l.cold_slot_map, "moe_cache.packed_cold-%zu", il);
+                    layer_of.emplace(l.cold_slot_map, std::make_pair(static_cast<int32_t>(il), true));
+                }
             }
+            std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
             for (const auto & w : placement->weights) {
                 layers.at(w.layer).experts.push_back(w.host);
-                bindings.emplace(w.host, binding{w.layer, 0, w.bank});
+                bindings.emplace(w.host, binding{w.layer, 0, w.bank, w.cold});
+                bytes_per_layer.at(w.layer) += w.host->nb[2];
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), ggml_backend_cpu_buffer_type()));
             if (!buf_host) {
@@ -457,6 +472,17 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
+            if (placement->overlap) {
+                const auto host_type = ggml_backend_dev_host_buffer_type(placement->target);
+                const size_t max_bytes = *std::max_element(bytes_per_layer.begin(), bytes_per_layer.end());
+                if (host_type) {
+                    packed_staging.reset(ggml_backend_buft_alloc_buffer(host_type, max_bytes * placement->n_slots));
+                }
+                if (!packed_staging || ggml_backend_buffer_get_type(packed_staging.get()) != host_type) {
+                    throw std::runtime_error("expert overlap requires a Vulkan host staging buffer");
+                }
+                packed_misses.reserve(placement->n_slots);
+            }
             return;
         }
 
@@ -763,9 +789,9 @@ struct llama_moe_cache::impl {
         return layers[il].cpu_map;
     }
 
-    ggml_tensor * get_experts(const ggml_tensor * w) const {
+    ggml_tensor * get_experts(const ggml_tensor * w, bool cold) const {
         const auto it = bindings.find(w);
-        return it != bindings.end() ? it->second.cached : nullptr;
+        return it != bindings.end() ? (cold ? it->second.cold : it->second.cached) : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -818,6 +844,32 @@ struct llama_moe_cache::impl {
 
         GGML_ASSERT(backend == devices[g.id].backend);
 
+        if (placement && placement->overlap && has_cpu) {
+            // The earlier split has submitted the resident kernels on this backend.
+            GGML_ASSERT(pending_layer == il);
+            if (!packed_misses.empty()) {
+                auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+                size_t bytes = 0;
+                const int64_t start = ggml_time_us();
+                for (size_t slot = 0; slot < packed_misses.size(); ++slot) {
+                    for (ggml_tensor * host : l.experts) {
+                        const size_t stride = host->nb[2];
+                        const auto * data = static_cast<const uint8_t *>(host->data) + packed_misses[slot] * stride;
+                        std::memcpy(staging + bytes, data, stride);
+                        ggml_backend_tensor_set_async(backend, bindings.at(host).cold, staging + bytes, slot * stride, stride);
+                        bytes += stride;
+                    }
+                }
+                ggml_backend_synchronize(backend);
+                packed_wait_us += ggml_time_us() - start;
+                ++packed_wait_count;
+                stats_small.bytes += bytes;
+            }
+            ggml_backend_tensor_set(dst, packed_cold_slots.data(), 0, ggml_nbytes(dst));
+            pending_layer = -1;
+            return true;
+        }
+
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
         const ggml_tensor * lookup = nullptr;
@@ -853,6 +905,13 @@ struct llama_moe_cache::impl {
             int32_t n_uploads = 0;
             size_t bytes = 0;
             size_t hits = 0;
+            const int64_t start = ggml_time_us();
+            if (placement->overlap) {
+                GGML_ASSERT(pending_layer == -1);
+                pending_layer = il;
+                packed_misses.clear();
+                packed_cold_slots.fill(placement->n_slots);
+            }
             for (const int32_t expert : ids) {
                 if (expert < 0 || static_cast<size_t>(expert) >= slots.size()) {
                     GGML_ABORT("invalid packed expert ID in layer %d", il);
@@ -863,6 +922,12 @@ struct llama_moe_cache::impl {
                 }
                 if (n_uploads == placement->n_slots) {
                     GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
+                }
+                if (placement->overlap) {
+                    packed_cold_slots[expert] = n_uploads++;
+                    packed_misses.push_back(map.host[expert]);
+                    slots[expert] = llama_expert_profile::n_resident;
+                    continue;
                 }
                 const int32_t slot = llama_expert_profile::n_resident + n_uploads++;
                 slots[expert] = slot;
@@ -875,12 +940,20 @@ struct llama_moe_cache::impl {
                 }
             }
             // Publish the slot map only after all selected weights have been copied.
-            ggml_backend_synchronize(backend);
+            if (!placement->overlap && n_uploads > 0) {
+                ggml_backend_synchronize(backend);
+                packed_wait_us += ggml_time_us() - start;
+                ++packed_wait_count;
+            }
             ggml_backend_tensor_set(dst, slots.data(), 0, ggml_nbytes(dst));
             stats_small.hits += hits;
             stats_small.misses += n_uploads;
             stats_small.bytes += bytes;
-            LLAMA_LOG_DEBUG("packed experts: layer %d: %zu hits, %d RAM uploads, %zu bytes\n", il, hits, n_uploads, bytes);
+            if (placement->overlap) {
+                LLAMA_LOG_DEBUG("packed experts: layer %d: %zu hits, %d pending RAM uploads\n", il, hits, n_uploads);
+            } else {
+                LLAMA_LOG_DEBUG("packed experts: layer %d: %zu hits, %d RAM uploads, %zu bytes\n", il, hits, n_uploads, bytes);
+            }
             return true;
         }
 
@@ -941,6 +1014,10 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (placement) {
+            LLAMA_LOG_INFO("packed expert transfer phase (%s): %.3f ms across %zu layer steps\n",
+                    placement->overlap ? "overlap" : "sync", packed_wait_us / 1000.0, packed_wait_count);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -975,8 +1052,12 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
     return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part);
 }
 
-ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
-    return pimpl->get_experts(w);
+ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w, bool cold) const {
+    return pimpl->get_experts(w, cold);
+}
+
+ggml_tensor * llama_moe_cache::get_cold_slot_map(int32_t il) const {
+    return requires_slots(il) ? pimpl->layers[il].cold_slot_map : nullptr;
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
@@ -1000,6 +1081,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     if (pimpl->buf_host) {
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
+    }
+    if (pimpl->packed_staging) {
+        const auto buffer = pimpl->packed_staging.get();
+        res[ggml_backend_buffer_get_type(buffer)] += ggml_backend_buffer_get_size(buffer);
     }
     return res;
 }

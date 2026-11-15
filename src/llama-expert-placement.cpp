@@ -3,10 +3,20 @@
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 
+#include <cstdlib>
+#include <cstring>
+
 using namespace llama_expert_profile;
 
 llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_slots)
-    : target(target), n_slots(n_slots) {
+    : target(target), n_slots(n_slots), overlap([] {
+        const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
+        return value && std::strcmp(value, "1") == 0;
+    }()) {
+    if (overlap && (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
+            !std::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE"))) {
+        throw std::runtime_error("expert overlap requires Vulkan and GGML_VK_ASYNC_USE_TRANSFER_QUEUE");
+    }
     const auto selected = read_profile(path);
     for (int il = 0; il < n_layers; ++il) {
         int32_t resident = 0;
@@ -20,7 +30,10 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     const ggml_init_params init{3 * n_layers * ggml_tensor_overhead(), nullptr, true};
     host_ctx.reset(ggml_init(init));
     bank_ctx.reset(ggml_init(init));
-    if (!host_ctx || !bank_ctx) {
+    if (overlap) {
+        cold_ctx.reset(ggml_init(init));
+    }
+    if (!host_ctx || !bank_ctx || (overlap && !cold_ctx)) {
         throw std::runtime_error("could not create packed expert contexts");
     }
 }
@@ -31,10 +44,14 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
         throw std::runtime_error(format("cannot pack expert tensor %s", source->name));
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
-    auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1], n_resident + n_slots);
+    auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1], n_resident + (overlap ? 1 : n_slots));
+    auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
-    weights.push_back({layer, shard, offset, host, bank});
+    if (cold) {
+        ggml_format_name(cold, "expert_cold.%s", source->name);
+    }
+    weights.push_back({layer, shard, offset, host, bank, cold});
     return host;
 }
 
@@ -50,6 +67,13 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     }
     ggml_backend_buffer_set_usage(host_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     ggml_backend_buffer_set_usage(bank_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (overlap) {
+        cold_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(cold_ctx.get(), ggml_backend_dev_buffer_type(target)));
+        if (!cold_buf || ggml_backend_buffer_is_host(cold_buf.get())) {
+            throw std::runtime_error("could not allocate separate cold expert buffers");
+        }
+        ggml_backend_buffer_set_usage(cold_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
         host_lock.init(ggml_backend_buffer_get_base(host_buf.get()));
         host_lock.grow_to(ggml_backend_buffer_get_size(host_buf.get()));
@@ -82,6 +106,11 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
             }
         }
         ggml_backend_tensor_set(w.bank, resident.data(), 0, resident.size());
+        if (w.cold) {
+            // Each half of the graph uses a zero expert for the other half's IDs.
+            ggml_backend_tensor_memset(w.bank, 0, resident.size(), stride);
+            ggml_backend_tensor_memset(w.cold, 0, n_slots * stride, stride);
+        }
         resident_bytes += resident.size();
         ram_bytes += ggml_nbytes(w.host);
         loader.size_done += n_experts * stride;
