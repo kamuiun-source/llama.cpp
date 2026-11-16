@@ -8,11 +8,53 @@
 
 using namespace llama_expert_profile;
 
+std::vector<int32_t> llama_expert_placement::layer_map::scratch_slots(int32_t n_slots) const {
+    if (n_slots <= 0 || n_slots > n_experts - n_resident) {
+        throw std::runtime_error("invalid packed expert scratch capacity");
+    }
+    const int32_t n_gpu = n_resident + n_slots;
+    std::array<bool, n_experts> gpu_used{};
+    std::array<bool, n_experts - n_resident> host_used{};
+    for (int32_t expert = 0; expert < n_experts; ++expert) {
+        const int32_t gpu_slot = resident[expert];
+        const int32_t host_slot = host[expert];
+        if (gpu_slot >= 0 && gpu_slot < n_gpu && host_slot == -1 && !gpu_used[gpu_slot]) {
+            gpu_used[gpu_slot] = true;
+        } else if (host_slot >= 0 && host_slot < n_experts - n_resident && gpu_slot == -1 && !host_used[host_slot]) {
+            host_used[host_slot] = true;
+        } else {
+            throw std::runtime_error("invalid packed expert ownership map");
+        }
+    }
+    std::vector<int32_t> slots;
+    slots.reserve(n_slots);
+    for (int32_t slot = 0; slot < n_gpu; ++slot) {
+        if (!gpu_used[slot]) {
+            slots.push_back(slot);
+        }
+    }
+    if (slots.size() != static_cast<size_t>(n_slots)) {
+        throw std::runtime_error("invalid packed expert residency budget");
+    }
+    return slots;
+}
+
 llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_slots)
     : target(target), n_slots(n_slots), overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
+    }()), dynamic_resident([] {
+        const char * value = std::getenv("LLAMA_EXPERT_DYNAMIC_RESIDENT");
+        return value && std::strcmp(value, "1") == 0;
     }()) {
+    if (dynamic_resident) {
+        const char * reuse = std::getenv("LLAMA_EXPERT_SCRATCH_REUSE");
+        if (overlap || (reuse && std::strcmp(reuse, "0") == 0) ||
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
+                n_slots <= 0 || n_slots > n_experts - n_resident) {
+            throw std::runtime_error("dynamic expert residency requires synchronous Vulkan placement with scratch reuse");
+        }
+    }
     if (overlap && (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
             !std::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE"))) {
         throw std::runtime_error("expert overlap requires Vulkan and GGML_VK_ASYNC_USE_TRANSFER_QUEUE");

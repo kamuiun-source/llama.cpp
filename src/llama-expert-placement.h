@@ -22,6 +22,8 @@ struct llama_expert_placement {
     struct layer_map {
         std::array<int32_t, llama_expert_profile::n_experts> resident;
         std::array<int32_t, llama_expert_profile::n_experts> host;
+
+        std::vector<int32_t> scratch_slots(int32_t n_slots) const;
     };
 
     llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_slots);
@@ -31,6 +33,7 @@ struct llama_expert_placement {
     const ggml_backend_dev_t target;
     const int32_t n_slots;
     const bool overlap;
+    const bool dynamic_resident;
     mutable std::atomic<bool> context_in_use{false};
     std::array<layer_map, llama_expert_profile::n_layers> maps;
     std::vector<weight> weights;
