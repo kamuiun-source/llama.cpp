@@ -390,6 +390,9 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Serialize split execution and collect host timings for graphs run while enabled. Log totals when the scheduler is freed.
+    GGML_API void                 ggml_backend_sched_set_split_profile(ggml_backend_sched_t sched, bool enabled);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

@@ -34,7 +34,7 @@ public:
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

@@ -392,6 +392,11 @@ struct llama_moe_cache::impl {
     int32_t pending_layer = -1;
     int64_t packed_wait_us = 0;
     size_t packed_wait_count = 0;
+    int64_t profile_router_us = 0;
+    size_t profile_router_reads = 0;
+    int64_t profile_upload_us = 0;
+    size_t profile_upload_steps = 0;
+    size_t profile_upload_bytes = 0;
     ggml_backend_buffer_ptr packed_staging;
     std::vector<moe_cache_lru::fill> fills;
     std::vector<moe_cache_lru::fill> cpu;
@@ -832,7 +837,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -896,8 +901,13 @@ struct llama_moe_cache::impl {
         const int32_t n_used = placement ? n_expert_used : (int32_t) sel->src[0]->ne[0];
 
         ids.resize(ggml_nelements(sel));
+        const int64_t router_start_us = profile ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        if (profile) {
+            profile_router_us += ggml_time_us() - router_start_us;
+            profile_router_reads++;
+        }
 
         if (placement) {
             const auto & map = placement->maps[il];
@@ -906,6 +916,7 @@ struct llama_moe_cache::impl {
             size_t bytes = 0;
             size_t hits = 0;
             const int64_t start = ggml_time_us();
+            int64_t upload_start_us = 0;
             if (placement->overlap) {
                 GGML_ASSERT(pending_layer == -1);
                 pending_layer = il;
@@ -931,6 +942,9 @@ struct llama_moe_cache::impl {
                 }
                 const int32_t slot = llama_expert_profile::n_resident + n_uploads++;
                 slots[expert] = slot;
+                if (profile && n_uploads == 1) {
+                    upload_start_us = ggml_time_us();
+                }
                 for (ggml_tensor * host : l.experts) {
                     ggml_tensor * bank = bindings.at(host).cached;
                     const size_t stride = host->nb[2];
@@ -942,8 +956,14 @@ struct llama_moe_cache::impl {
             // Publish the slot map only after all selected weights have been copied.
             if (!placement->overlap && n_uploads > 0) {
                 ggml_backend_synchronize(backend);
-                packed_wait_us += ggml_time_us() - start;
+                const int64_t end_us = ggml_time_us();
+                packed_wait_us += end_us - start;
                 ++packed_wait_count;
+                if (profile) {
+                    profile_upload_us += end_us - upload_start_us;
+                    profile_upload_steps++;
+                    profile_upload_bytes += bytes;
+                }
             }
             ggml_backend_tensor_set(dst, slots.data(), 0, ggml_nbytes(dst));
             stats_small.hits += hits;
@@ -1014,6 +1034,11 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (profile_router_reads > 0) {
+            LLAMA_LOG_INFO("decode_profile: expert_router_readback_ms=%.3f router_reads=%zu expert_upload_ms=%.3f upload_steps=%zu uploaded_MiB=%.3f\n",
+                    profile_router_us / 1000.0, profile_router_reads, profile_upload_us / 1000.0,
+                    profile_upload_steps, profile_upload_bytes / (1024.0 * 1024.0));
+        }
         if (placement) {
             LLAMA_LOG_INFO("packed expert transfer phase (%s): %.3f ms across %zu layer steps\n",
                     placement->overlap ? "overlap" : "sync", packed_wait_us / 1000.0, packed_wait_count);
@@ -1064,8 +1089,8 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
     return pimpl->get_cpu_map(il, n_tokens);
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
-    return pimpl->copy(backend, src, dst, graph);
+bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile) {
+    return pimpl->copy(backend, src, dst, graph, profile);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

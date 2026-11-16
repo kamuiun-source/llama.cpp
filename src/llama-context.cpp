@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-expert-placement.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -400,6 +401,15 @@ llama_context::llama_context(
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
+
+    if (const char * env = getenv("LLAMA_DECODE_PROFILE"); env && strcmp(env, "1") == 0) {
+        decode_profile = model.expert_placement && !model.expert_placement->overlap;
+        if (decode_profile) {
+            LLAMA_LOG_INFO("decode_profile: profiling single-token decode calls with serialized splits\n");
+        } else {
+            LLAMA_LOG_WARN("decode_profile: requires synchronous Expert placement\n");
+        }
+    }
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -1827,7 +1837,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool profile) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1890,7 +1900,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2377,7 +2387,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+                decode_profile && n_tokens_all == 1);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3135,7 +3146,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   profile) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3154,6 +3166,21 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    struct profile_scope {
+        ggml_backend_sched_t sched;
+        bool & active;
+        ~profile_scope() {
+            if (active) {
+                ggml_backend_sched_set_split_profile(sched, false);
+                active = false;
+            }
+        }
+    } scope{sched.get(), decode_profile_active};
+    if (profile) {
+        ggml_backend_sched_set_split_profile(sched.get(), true);
+        decode_profile_active = true;
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3168,7 +3195,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active)) {
         return true;
     }
 

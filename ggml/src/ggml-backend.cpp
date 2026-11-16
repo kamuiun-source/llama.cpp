@@ -1183,6 +1183,24 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_split_profile {
+    bool enabled;
+    size_t graphs;
+    int64_t graph_us;
+    int64_t entry_wait_us;
+    int64_t input_us;
+    int64_t callback_us;
+    size_t callback_count;
+    size_t cross_backend_copies;
+    size_t cross_backend_bytes;
+    struct {
+        char name[GGML_MAX_NAME];
+        size_t splits;
+        int64_t submit_us;
+        int64_t wait_us;
+    } backend[GGML_SCHED_MAX_BACKENDS];
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1229,6 +1247,7 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    struct ggml_backend_sched_split_profile profile;
 
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
@@ -2110,6 +2129,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         }
     }
 
+    auto count_copy = [&]() {
+        if (sched->profile.enabled && input_backend != split_backend) {
+            sched->profile.cross_backend_copies++;
+            sched->profile.cross_backend_bytes += ggml_nbytes(input);
+        }
+    };
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2118,6 +2144,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+        count_copy();
         return;
     }
 
@@ -2128,11 +2155,19 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-        return;
+    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input)) {
+        const int64_t start_us = sched->profile.enabled ? ggml_time_us() : 0;
+        if (sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+            if (sched->profile.enabled) {
+                ggml_backend_synchronize(split_backend);
+                sched->profile.callback_us += ggml_time_us() - start_us;
+                sched->profile.callback_count++;
+            }
+            return;
+        }
     }
 
+    count_copy();
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -2143,6 +2178,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+    } else if (sched->profile.enabled) {
+        ggml_backend_synchronize(split_backend);
     }
 }
 
@@ -2212,11 +2249,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+    auto & profile = sched->profile;
+    if (profile.enabled) {
+        sched->n_prefetched = 0;
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t input_start_us = profile.enabled ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2238,7 +2280,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         // after the copies above, which may read host memory reused by the copies of the next split
         // before the weights, whose copy callback may queue large uploads
-        ggml_backend_sched_prefetch_inputs(sched, split_id);
+        if (!profile.enabled) {
+            ggml_backend_sched_prefetch_inputs(sched, split_id);
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
@@ -2246,8 +2290,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        auto & backend_profile = profile.backend[split_backend_id];
+        if (profile.enabled) {
+            profile.input_us += ggml_time_us() - input_start_us;
+            if (backend_profile.splits == 0) {
+                snprintf(backend_profile.name, sizeof(backend_profile.name), "%s", ggml_backend_name(split_backend));
+            }
+            backend_profile.splits++;
+        }
+
+        auto compute = [&](struct ggml_cgraph * graph) {
+            const int64_t submit_start_us = profile.enabled ? ggml_time_us() : 0;
+            const enum ggml_status status = ggml_backend_graph_compute_async(split_backend, graph);
+            if (profile.enabled) {
+                const int64_t wait_start_us = ggml_time_us();
+                ggml_backend_synchronize(split_backend);
+                backend_profile.submit_us += wait_start_us - submit_start_us;
+                backend_profile.wait_us += ggml_time_us() - wait_start_us;
+            }
+            return status;
+        };
+
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = compute(&split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2269,13 +2334,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec = compute(&gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                if (!profile.enabled) {
+                    ggml_backend_synchronize(split_backend);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -2372,6 +2439,23 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    const auto & profile = sched->profile;
+    if (profile.graphs > 0) {
+        int64_t compute_us = 0;
+        for (int b = 0; b < sched->n_backends; b++) {
+            const auto & backend = profile.backend[b];
+            if (backend.splits > 0) {
+                GGML_LOG_INFO("decode_profile: backend=%s splits=%zu compute_ms=%.3f submit_ms=%.3f completion_wait_ms=%.3f\n",
+                        backend.name, backend.splits, (backend.submit_us + backend.wait_us) / 1000.0,
+                        backend.submit_us / 1000.0, backend.wait_us / 1000.0);
+                compute_us += backend.submit_us + backend.wait_us;
+            }
+        }
+        GGML_LOG_INFO("decode_profile: single_token_graphs=%zu split_wall_ms=%.3f entry_wait_ms=%.3f input_copy_and_dep_ms=%.3f cross_backend_copies=%zu cross_backend_MiB=%.3f copy_callback_ms=%.3f copy_callbacks=%zu other_split_ms=%.3f\n",
+                profile.graphs, profile.graph_us / 1000.0, profile.entry_wait_us / 1000.0,
+                (profile.input_us - profile.callback_us) / 1000.0, profile.cross_backend_copies, profile.cross_backend_bytes / (1024.0 * 1024.0),
+                profile.callback_us / 1000.0, profile.callback_count, (profile.graph_us - profile.input_us - compute_us) / 1000.0);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2481,7 +2565,19 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    auto & profile = sched->profile;
+    if (!profile.enabled) {
+        return ggml_backend_sched_compute_splits(sched);
+    }
+
+    const int64_t entry_us = ggml_time_us();
+    ggml_backend_sched_synchronize(sched);
+    const int64_t start_us = ggml_time_us();
+    const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
+    profile.graph_us += ggml_time_us() - start_us;
+    profile.entry_wait_us += start_us - entry_us;
+    profile.graphs++;
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
@@ -2507,6 +2603,11 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_profile(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->profile.enabled = enabled;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
