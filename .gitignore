@@ -153,3 +153,13 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local benchmark logs and profiler output
+/fork-docs/research/logs/
+/fork-docs/**/profiles/
+/fork-docs/**/profiling/
+/fork-docs/**/traces/
+*.nsys-rep
+*.ncu-rep
+*.prof
+*.etl
