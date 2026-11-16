@@ -352,9 +352,23 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
-    if (model.expert_placement) {
-        // Each layer reserves one token's worth of cold expert slots.
-        cparams.n_ubatch = 1;
+    if (const auto * placement = model.expert_placement.get()) {
+        if (placement->max_ubatch > 1 && cparams.n_seq_max != 1) {
+            throw std::runtime_error("packed expert batching requires a single sequence");
+        }
+        cparams.n_ubatch = std::min(cparams.n_ubatch, static_cast<uint32_t>(placement->max_ubatch));
+        if (cparams.n_ubatch == 0) {
+            throw std::runtime_error("packed expert placement requires a nonzero microbatch");
+        }
+        if (cparams.n_rs_seq >= cparams.n_ubatch) {
+            LLAMA_LOG_INFO("%s: packed expert microbatch cannot hold the requested recurrent snapshots, using checkpoint rollback\n",
+                    __func__);
+            cparams.n_rs_seq = 0;
+        }
+        if (placement->max_ubatch > 1) {
+            LLAMA_LOG_INFO("%s: packed expert batch capacity = %d, n_ubatch = %u, n_rs_seq = %u\n",
+                    __func__, placement->max_ubatch, cparams.n_ubatch, cparams.n_rs_seq);
+        }
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
@@ -795,6 +809,13 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    if (moe_cache && moe_cache->early_copy_enabled()) {
+        ggml_backend_sched_set_early_copy_callback(sched.get(),
+                [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+                    auto * lctx = static_cast<llama_context *>(user_data);
+                    return lctx->moe_cache->copy(backend, src, dst, graph, false, true);
+                }, this);
+    }
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     sched_params_cur = params;
@@ -4617,6 +4638,11 @@ llama_context * llama_init_from_model(
         //user-specified pooling-type is different from the model default
         LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
                        model->hparams.pooling_type, params.pooling_type);
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model->expert_placement) {
+        LLAMA_LOG_ERROR("%s: packed expert placement requires a separate MTP draft GGUF (--spec-draft-model)\n", __func__);
+        return nullptr;
     }
 
     // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP

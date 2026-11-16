@@ -26,11 +26,12 @@ struct llama_expert_placement {
         std::vector<int32_t> scratch_slots(int32_t n_slots) const;
     };
 
-    llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_slots);
+    llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used);
     ggml_tensor * add_weight(int layer, const ggml_tensor * source, uint16_t shard, size_t offset);
     bool load(llama_model_loader & loader, const llama_model_params & params);
 
     const ggml_backend_dev_t target;
+    const int32_t max_ubatch;
     const int32_t n_slots;
     const bool overlap;
     const bool dynamic_resident;

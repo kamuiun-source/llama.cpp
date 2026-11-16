@@ -59,3 +59,36 @@ Expert再利用を両条件で有効、overlapを無効にし、LLAMA_EXPERT_BAT
 現在の改善は層内の複数アップロードをキューに積み、層ごとに待つ方式。一回の連続DMAへの完全な結合や、常駐Expert計算との並行化まで実現したとは扱わない。
 
 参考実装の報告値は投稿の平均70 tok/sを保証しない。MTP、ヒット率、量子化、OS、ドライバー、計測条件が異なる。現行測定で残った支配的な時間に対応する変更だけを次の対象とする。
+
+## 追加ソース確認とCUDA Graph確認 (2026-11-16)
+
+### 入力集約の適用範囲
+
+tandem.patchのggml_backend_sched_compute_splitsは、host bufferかつhost weightではない入力を抽出する。mode 3はまとめたH2D転送とscatterを使い、mode 2は入力コピー完了イベントを記録し、ホストが入力を書き換える前に待つ。対象ファイルはggml/src/ggml-backend.cpp、CUDA backend、src/llama-context.cpp、待機関数の宣言。単純に同期呼び出しを消す変更ではない。
+
+本プロジェクトのCUDA/Vulkan間Activation転送は、元テンソルがGPU bufferの場合この抽出条件に入らない。従ってinput_copy_and_dep_ms=5383.689を全て削減できるとは見積もらない。次に着手するなら、ホスト入力コピーと異種GPUコピー、それぞれの回数・時間を切り分ける。
+
+### Graph形状別キャッシュ
+
+tandem.patchのggml_cuda_graph_get_keyは、先頭ノードのアドレスにノード数と幅を組み合わせてキーを作る。MTPの検証バッチ幅の変化でキャッシュが入れ替わる問題を狙う。現在はMTPオフ、n_ubatch=1固定のため、正常に再利用できている場合は取り込み優先度を下げる。
+
+### Expertコピー並列化とmailbox
+
+llama.cpp-labのsrc/llama-moe-cache.cppでは、転送前にcpy_jobの列を作りcpy_pool::runでstagingへコピーし、その後アップロードを登録する。連続するExpert IDと転送先slotの場合のみ複数Expertをまとめる。今回の約4.73秒のupload計測はCPUコピーとGPU転送待ちを含むため、CPUコピーが支配的と確認するまではworker poolを追加しない。
+
+mailboxはCPUがGPUからのID通知をポーリングし、約50msの期限で通常readbackへ戻る構成。volatile領域の公開・再利用とGPU側の可視性まで合わせてレビューが必要。こちらではRouterがCUDA側にあるためVulkan単独のコードを移すだけでは成立しない。Router読み戻しは約1.05秒で、優先度は入力待ちより低い。
+
+engine-lab READMEは予測prefetchや転送キュー単独等で改善しなかった試行も報告している。ハードウェア固有の結果であり不可能の根拠にはしないが、先読みを無条件に追加する根拠にもならない。
+
+### CUDA Graph実行ログの結果
+
+ログ: logs/cuda-graphs-20261116-094559/run.log。詳細計測オフ、Expert batch uploadオン、64-token生成。終了コード0。
+
+- CUDA Graph id reused: 3951件、97種類のID。
+- 同じDecode側IDの再利用は最大63回。
+- warmup complete: 97件。warmup reset、graphs無効化、graph update failedの一致は0件。
+- llama側graph reallocs: 0/0。こちらのgraph reuseとCUDA Graph reuseは別指標。
+- 実装ggml_cuda_graph_update_requiredとggml_backend_cuda_graph_computeの分岐を照合し、安定したUIDでは再capture不要のCUDA Graph経路を継続することを確認。
+- 9.26 tok/sは大量のDEBUGログを出した測定で、通常速度10.84 tok/sとの性能比較に使わない。
+
+判断: 毎トークンの再captureが現状の主因という仮説は支持されない。shape-key改善を急いで導入せず、入力コピー・依存待ちの内訳を次の調査候補とする。外部変更の追加実装は未実施。

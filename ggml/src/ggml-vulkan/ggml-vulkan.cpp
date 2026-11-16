@@ -16802,6 +16802,14 @@ static ggml_backend_buffer_t ggml_backend_vk_alloc_host_upload_buffer(ggml_backe
     return ggml_backend_vk_alloc_host_buffer(ggml_backend_vk_host_buffer_type(), size, device->idx);
 }
 
+static ggml_backend_buffer_t ggml_backend_vk_alloc_transfer_host_upload_buffer(ggml_backend_dev_t dev, size_t size) {
+    auto * ctx = (ggml_backend_vk_device_context *) dev->context;
+    if (!ggml_vk_get_device(ctx->device)->async_use_transfer_queue) {
+        return nullptr;
+    }
+    return ggml_backend_vk_alloc_host_upload_buffer(dev, size);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
 #if !defined(_WIN32)
@@ -16815,6 +16823,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         return (void *) ggml_backend_vk_comm_allreduce_tensor;
     }
 #endif
+    if (strcmp(name, "ggml_backend_vk_alloc_transfer_host_upload_buffer") == 0) {
+        return (void *) ggml_backend_vk_alloc_transfer_host_upload_buffer;
+    }
     if (strcmp(name, "ggml_backend_vk_alloc_host_upload_buffer") == 0) {
         return (void *) ggml_backend_vk_alloc_host_upload_buffer;
     }

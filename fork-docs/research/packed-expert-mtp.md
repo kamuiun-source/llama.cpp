@@ -1,0 +1,11 @@
+# Ordinary MTP with packed Experts
+
+Scope: standalone Qwen4exp MTP head on CUDA0, target trunk using dynamic packed Experts on Vulkan1 plus RAM. Reuses existing draft-mtp token generation, target verification and sampler acceptance. No speculative Expert prefetch, shared-head tensor borrowing or multi-token packed verification is added. Embedded MTP on the packed target is explicitly rejected.
+
+The downloaded self-contained Q8_0 head was verified by reading GGUF metadata only: 4137429120 bytes, qwen4exp, block_count=49, nextn_predict_layers=1, 34 tensors, blk.48.nextn.eh_proj present, no trunk blk.0 probe, token embedding and output present, no PLE tensor. The target shards contain 48 trunk layers without NextN weights.
+
+Changes: llama-model.cpp detects a standalone head using existing nextn_flags and bypasses target packed placement; qwen4exp.cpp treats trunk PLE as optional for a head-only file; llama-context.cpp keeps packed n_ubatch=1 and disables recurrent snapshots in favor of existing full checkpoint/replay; server-context.cpp saves/restores speculative pending hidden state around FULL rollback. Existing common_memory already truncates both target and draft tails.
+
+Independent source review and all four changed translation units' MSVC syntax checks passed. Real-model startup, generated output equality, rejection/replay correctness and speed remain unverified. The target verifies candidates serially across one-token microbatches; do not assume speculative speedup before measurement.
+
+Build llama-cli and llama-server, then run fork-docs/scripts/compare-mtp.ps1. Default: 256 generated tokens, maximum 2 draft tokens, 2K context, greedy sampling, dynamic residency and native batched uploads on, HC/host batching/overlap off. The script logs stdout/stderr/args and rejects a run with no draft acceptance summary. Inspect accepted/generated counts, output text and timing. A summary can still contain zero accepted tokens. Log location: fork-docs/research/logs/mtp-ab-TIMESTAMP. No model runs or full builds were performed by the agents and no commit was requested for this patch.

@@ -1791,10 +1791,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
-    if (const char * profile = std::getenv("LLAMA_EXPERT_PLACEMENT")) {
+    const char * expert_profile = std::getenv("LLAMA_EXPERT_PLACEMENT");
+    if (expert_profile && arch == LLM_ARCH_QWEN4EXP && ml.load_mtp && hparams.n_layer_nextn > 0) {
+        const auto nextn = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+        if (!(nextn.mtp & TENSOR_NOT_REQUIRED)) {
+            if (hparams.n_layer_nextn != 1 || !(nextn.trunk & TENSOR_NOT_REQUIRED)) {
+                throw std::runtime_error("packed expert placement requires a separate one-block MTP draft GGUF");
+            }
+            expert_profile = nullptr;
+            LLAMA_LOG_INFO("%s: loading standalone MTP weights without packed expert placement\n", __func__);
+        }
+    }
+    if (expert_profile) {
         if (arch != LLM_ARCH_QWEN4EXP || hparams.n_layer() != llama_expert_profile::n_layers ||
                 hparams.n_expert != llama_expert_profile::n_experts || hparams.n_expert_used_max() == 0 ||
-                ml.load_mtp || ml.files.empty() || ml.use_direct_io || split_mode != LLAMA_SPLIT_MODE_LAYER) {
+                ml.files.empty() || ml.use_direct_io || split_mode != LLAMA_SPLIT_MODE_LAYER) {
             throw std::runtime_error("packed expert placement requires the Flash-Next base GGUF and layer split without Direct I/O");
         }
         if (ml.no_alloc) {
@@ -1807,7 +1818,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 std::any_of(pimpl->dev_layer.begin(), pimpl->dev_layer.end(), [target](const auto & d) { return d.dev == target; })) {
             throw std::runtime_error("LLAMA_EXPERT_DEVICE must name a selected GPU distinct from the layer devices");
         }
-        expert_placement = std::make_unique<llama_expert_placement>(profile, target, hparams.n_expert_used_max());
+        expert_placement = std::make_unique<llama_expert_placement>(expert_profile, target, hparams.n_expert_used_max());
         ml.expert_placement = expert_placement.get();
     }
 

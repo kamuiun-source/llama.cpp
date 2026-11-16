@@ -39,14 +39,35 @@ std::vector<int32_t> llama_expert_placement::layer_map::scratch_slots(int32_t n_
     return slots;
 }
 
-llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_slots)
-    : target(target), n_slots(n_slots), overlap([] {
+static int32_t packed_max_ubatch() {
+    const char * value = std::getenv("LLAMA_EXPERT_BATCH_TOKENS");
+    if (!value || std::strcmp(value, "1") == 0) {
+        return 1;
+    }
+    if (std::strcmp(value, "2") == 0) {
+        return 2;
+    }
+    throw std::runtime_error("LLAMA_EXPERT_BATCH_TOKENS must be 1 or 2");
+}
+
+static int32_t packed_scratch_capacity(int32_t n_expert_used, int32_t max_ubatch) {
+    if (n_expert_used <= 0 || n_expert_used > (n_experts - n_resident) / max_ubatch) {
+        throw std::runtime_error("invalid packed expert count for scratch capacity");
+    }
+    return n_expert_used * max_ubatch;
+}
+
+llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used)
+    : target(target), max_ubatch(packed_max_ubatch()), n_slots(packed_scratch_capacity(n_expert_used, max_ubatch)), overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
     }()), dynamic_resident([] {
         const char * value = std::getenv("LLAMA_EXPERT_DYNAMIC_RESIDENT");
         return value && std::strcmp(value, "1") == 0;
     }()) {
+    if (max_ubatch > 1 && !dynamic_resident) {
+        throw std::runtime_error("packed expert batching requires LLAMA_EXPERT_DYNAMIC_RESIDENT=1");
+    }
     if (dynamic_resident) {
         const char * reuse = std::getenv("LLAMA_EXPERT_SCRATCH_REUSE");
         if (overlap || (reuse && std::strcmp(reuse, "0") == 0) ||
