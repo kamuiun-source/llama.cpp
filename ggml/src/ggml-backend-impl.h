@@ -10,6 +10,12 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 3
 
+    // Optional CUDA dispatch profiling via ggml_backend_reg_get_proc_address.
+    typedef void (*ggml_backend_cuda_profile_callback)(struct ggml_tensor * const * nodes, int n_nodes,
+                                                       int64_t submit_us, int64_t wait_us, void * user_data);
+    typedef enum ggml_status (*ggml_backend_cuda_profile_compute_t)(ggml_backend_t backend, struct ggml_cgraph * graph,
+                                                                    ggml_backend_cuda_profile_callback callback, void * user_data);
+
     //
     // Backend buffer type
     //

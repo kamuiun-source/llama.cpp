@@ -13702,12 +13702,15 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
     ggml_vk_host_free(buffer->context);
 }
 
-static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+static ggml_backend_buffer_t ggml_backend_vk_alloc_host_buffer(ggml_backend_buffer_type_t buft, size_t size, int device_idx) {
+    VK_LOG_MEMORY("ggml_backend_vk_alloc_host_buffer(" << size << ")");
 
     size += 32;  // Behave like the CPU buffer type
-    void * ptr = ggml_vk_host_malloc(size);
+    void * ptr = ggml_vk_host_malloc(size, device_idx);
     if (ptr == nullptr) {
+        if (device_idx >= 0) {
+            return nullptr;
+        }
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory\n");
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
@@ -13718,8 +13721,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
+}
 
-    UNUSED(buft);
+static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    return ggml_backend_vk_alloc_host_buffer(buft, size, -1);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -16787,6 +16792,24 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static ggml_backend_buffer_t ggml_backend_vk_alloc_host_upload_buffer(ggml_backend_dev_t dev, size_t size) {
+    auto * ctx = (ggml_backend_vk_device_context *) dev->context;
+    const auto device = ggml_vk_get_device(ctx->device);
+    // The serialized path does not join the transfer queue when there is no compute work.
+    if (device->serialize_submissions && device->async_use_transfer_queue) {
+        return nullptr;
+    }
+    return ggml_backend_vk_alloc_host_buffer(ggml_backend_vk_host_buffer_type(), size, device->idx);
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_alloc_transfer_host_upload_buffer(ggml_backend_dev_t dev, size_t size) {
+    auto * ctx = (ggml_backend_vk_device_context *) dev->context;
+    if (!ggml_vk_get_device(ctx->device)->async_use_transfer_queue) {
+        return nullptr;
+    }
+    return ggml_backend_vk_alloc_host_upload_buffer(dev, size);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
 #if !defined(_WIN32)
@@ -16800,6 +16823,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         return (void *) ggml_backend_vk_comm_allreduce_tensor;
     }
 #endif
+    if (strcmp(name, "ggml_backend_vk_alloc_transfer_host_upload_buffer") == 0) {
+        return (void *) ggml_backend_vk_alloc_transfer_host_upload_buffer;
+    }
+    if (strcmp(name, "ggml_backend_vk_alloc_host_upload_buffer") == 0) {
+        return (void *) ggml_backend_vk_alloc_host_upload_buffer;
+    }
     if (strcmp(name, "ggml_backend_fusion_get") == 0) {
         return (void *) ggml_backend_vk_fusion_get;
     }

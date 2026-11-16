@@ -279,12 +279,12 @@ static size_t ggml_vk_host_allocation_find(const void * ptr) {
     return SIZE_MAX;
 }
 
-void * ggml_vk_host_malloc(size_t size) {
+void * ggml_vk_host_malloc(size_t size, int device_idx) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
 
     ggml_vk_instance_init();
 
-    if (vk_instance.multi_device) {
+    if (device_idx < 0 && vk_instance.multi_device) {
         const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
         const size_t alloc_size = (size + align - 1) / align * align;
 
@@ -295,16 +295,17 @@ void * ggml_vk_host_malloc(size_t size) {
         vk_host_allocation entry;
         entry.base = ptr;
         entry.size = alloc_size;
+        entry.importable = true;
 
         std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
         vk_instance.host_allocations.push_back(std::move(entry));
         return ptr;
     }
 
-    vk_device dev0 = ggml_vk_get_device(0);
+    vk_device device = ggml_vk_get_device(device_idx < 0 ? 0 : device_idx);
     vk_buffer buf;
     try {
-        buf = ggml_vk_create_buffer(dev0, size,
+        buf = ggml_vk_create_buffer(device, size,
             {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
     } catch (vk::SystemError&) {
@@ -320,7 +321,7 @@ void * ggml_vk_host_malloc(size_t size) {
     vk_host_allocation entry;
     entry.base             = buf->ptr;
     entry.size             = size;
-    entry.views[dev0->idx] = buf;
+    entry.views[device->idx] = buf;
 
     std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
     vk_instance.host_allocations.push_back(std::move(entry));
@@ -348,7 +349,7 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    if (entry.importable) {
         portable_aligned_free(entry.base);
     }
 }
@@ -367,7 +368,7 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
 
     if (entry.views[device->idx] == nullptr) {
         const uint32_t bit = 1u << device->idx;
-        if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
+        if (!entry.importable || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
             return;
         }
         GGML_ASSERT(device->external_memory_host);

@@ -19,20 +19,23 @@ public:
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
+    bool requires_slots(int32_t il) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
 
     // the experts of w in the cache, nullptr if w is not cached
-    ggml_tensor * get_experts(const ggml_tensor * w) const;
+    ggml_tensor * get_experts(const ggml_tensor * w, bool cold = false) const;
+    ggml_tensor * get_cold_slot_map(int32_t il) const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    bool early_copy_enabled() const;
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early = false);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

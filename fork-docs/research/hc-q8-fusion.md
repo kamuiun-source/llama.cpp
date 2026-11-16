@@ -1,0 +1,7 @@
+# Q8_0 HC fusion validation
+
+The target UD-IQ3_XXS shards use Q8_0 HC down/up projections. The earlier BF16-only matcher did not activate on them. The Q8_0 extension keeps existing RMS/multiply and down MMVQ, fuses scale/SiLU/Q8_1 quantization, and uses the existing Q8_0 x Q8_1 dot helper for up followed by HC gating. Separate F32 inject still receives the original normalized output. Combined projections and unsupported layouts fall back.
+
+The changed CUDA units compiled with NVCC 13.1 for sm_89. Independent review found no blocker. A synthetic CUDA graph on RTX 4070 Ti used embd=2560, streams=4, rank=320 and separate F32 inject, four executions per off/on case. The on case emitted the q8_0 application marker once. Mixed output max absolute difference was 2.794e-8 and RMS difference 6.47e-10; normalized output and inject output were bit-identical. This is a small synthetic fixture, not full-model quality or performance validation. Up reduction order can differ from the ordinary MMVQ path.
+
+Run fork-docs/scripts/compare-hc-q8.ps1 after building. It compares 512-token HC off/on with dynamic residency, scratch reuse and native batch uploads enabled in both; MTP, overlap and host-input batching disabled. Logs go to fork-docs/research/logs/hc-q8-ab-TIMESTAMP. The on case fails explicitly if the q8_0 application marker is missing. Review generated text, Expert request/transfer counts and timing before adoption. The HC change is integrated but not committed pending the user's real-model comparison.

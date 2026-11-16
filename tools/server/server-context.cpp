@@ -3903,6 +3903,10 @@ private:
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+                        if (use_ckpt_tgt) {
+                            slot.spec_ckpt.data_spec.clear();
+                            common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+                        }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
@@ -5009,6 +5013,9 @@ private:
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !ckpt.data_spec.empty()) {
+                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());

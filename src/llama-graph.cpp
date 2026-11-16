@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1764,13 +1765,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots,
-                 bool   cached) const {
+                 bool   cached,
+                 bool   cold) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w, cold) : w, cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2279,6 +2281,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const llm_arch arch = model.arch;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    if (n_tokens == 0 && moe_cache && moe_cache->requires_slots(il)) {
+        return ggml_view_tensor(ctx0, cur);
+    }
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -2443,12 +2448,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, bool cold = false) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached, cold); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (up_exps_s) {
@@ -2467,7 +2472,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached, cold); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_s) {
@@ -2480,7 +2485,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, mm_ids, cached, cold); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2592,7 +2597,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached, cold); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2604,6 +2609,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    if (moe_cache && moe_cache->get_cold_slot_map(il)) {
+        if (gate_up_exps_b || gate_exps_b || up_exps_b || !loras->empty()) {
+            throw std::runtime_error("expert overlap requires bias-free gate/up projections and no LoRA");
+        }
+        // Finish the resident split before the cold map starts the upload callback.
+        ggml_build_forward_expand(gf, experts);
+        const auto cold = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, true);
+        experts = ggml_add(ctx0, experts, build_experts(cur, selected_experts, cold.slots, true, true));
+    }
     if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
         // the cached experts come first in the graph, so that they are computed while the misses are
@@ -2676,28 +2690,38 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
                 bool   cpu_part,
-                 int   il) const {
+                 int   il,
+                bool   cold) const {
     if (moe_cache == nullptr) {
         return { nullptr, nullptr };
     }
 
-    ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
-    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
-    if (slot_map == nullptr) {
+    auto unavailable = [&](const char * reason) -> llm_graph_moe_cache_slots {
+        if (moe_cache->requires_slots(il)) {
+            throw std::runtime_error(format("cannot execute packed experts in layer %d: %s", il, reason));
+        }
         return { nullptr, nullptr };
+    };
+
+    ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
+    ggml_tensor * slot_map = cold ? moe_cache->get_cold_slot_map(il) :
+            moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
+    if (slot_map == nullptr) {
+        return unavailable(format("no slots for %" PRId64 " tokens and %" PRId64 " selected experts", selected_experts->ne[1], selected_experts->ne[0]).c_str());
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
         if (w == nullptr) {
             continue;
         }
-        ggml_tensor * experts = moe_cache->get_experts(w);
+        ggml_tensor * experts = moe_cache->get_experts(w, cold);
         if (experts == nullptr) {
-            return { nullptr, nullptr };
+            return unavailable(w->name);
         }
         // the device of the cache must compute the matmul, else the scheduler copies the cache to another backend
         ggml_tensor * b = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, experts->ne[0], w == down_exps ? selected_experts->ne[0] : 1, selected_experts->ne[1]);
         if (!ggml_backend_supports_op(moe_cache->backend(il), ggml_mul_mat_id(ctx0, experts, b, selected_experts))) {
-            return { nullptr, nullptr };
+            return unavailable(format("%s does not support MUL_MAT_ID for %s (%s)",
+                    ggml_backend_name(moe_cache->backend(il)), w->name, ggml_type_name(w->type)).c_str());
         }
     }
 
@@ -2711,10 +2735,10 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
-        return { nullptr, nullptr };
+        return unavailable("placement device does not support I32 slot lookup");
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
-    cb(slots, "ffn_moe_slots", il);
+    cb(slots, cold ? "ffn_moe_cold_slots" : "ffn_moe_slots", il);
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(gf, slots);

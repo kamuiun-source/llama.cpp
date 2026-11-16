@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-expert-placement.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -351,6 +352,24 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    if (const auto * placement = model.expert_placement.get()) {
+        if (placement->max_ubatch > 1 && cparams.n_seq_max != 1) {
+            throw std::runtime_error("packed expert batching requires a single sequence");
+        }
+        cparams.n_ubatch = std::min(cparams.n_ubatch, static_cast<uint32_t>(placement->max_ubatch));
+        if (cparams.n_ubatch == 0) {
+            throw std::runtime_error("packed expert placement requires a nonzero microbatch");
+        }
+        if (cparams.n_rs_seq >= cparams.n_ubatch) {
+            LLAMA_LOG_INFO("%s: packed expert microbatch cannot hold the requested recurrent snapshots, using checkpoint rollback\n",
+                    __func__);
+            cparams.n_rs_seq = 0;
+        }
+        if (placement->max_ubatch > 1) {
+            LLAMA_LOG_INFO("%s: packed expert batch capacity = %d, n_ubatch = %u, n_rs_seq = %u\n",
+                    __func__, placement->max_ubatch, cparams.n_ubatch, cparams.n_rs_seq);
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -396,6 +415,15 @@ llama_context::llama_context(
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
+
+    if (const char * env = getenv("LLAMA_DECODE_PROFILE"); env && strcmp(env, "1") == 0) {
+        decode_profile = model.expert_placement && !model.expert_placement->overlap;
+        if (decode_profile) {
+            LLAMA_LOG_INFO("decode_profile: profiling single-token decode calls with serialized splits\n");
+        } else {
+            LLAMA_LOG_WARN("decode_profile: requires synchronous Expert placement\n");
+        }
+    }
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -579,7 +607,7 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            cparams.moe_cache_size == 0 && !model.expert_placement; // not supported by the MoE cache
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -607,7 +635,7 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
+        if (cparams.moe_cache_size > 0 || model.expert_placement) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
@@ -781,6 +809,13 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    if (moe_cache && moe_cache->early_copy_enabled()) {
+        ggml_backend_sched_set_early_copy_callback(sched.get(),
+                [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+                    auto * lctx = static_cast<llama_context *>(user_data);
+                    return lctx->moe_cache->copy(backend, src, dst, graph, false, true);
+                }, this);
+    }
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     sched_params_cur = params;
@@ -1823,7 +1858,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool profile) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1886,7 +1921,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2373,7 +2408,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+                decode_profile && n_tokens_all == 1);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3131,7 +3167,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   profile) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3150,6 +3187,21 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    struct profile_scope {
+        ggml_backend_sched_t sched;
+        bool & active;
+        ~profile_scope() {
+            if (active) {
+                ggml_backend_sched_set_split_profile(sched, false);
+                active = false;
+            }
+        }
+    } scope{sched.get(), decode_profile_active};
+    if (profile) {
+        ggml_backend_sched_set_split_profile(sched.get(), true);
+        decode_profile_active = true;
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3164,7 +3216,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active)) {
         return true;
     }
 
@@ -4586,6 +4638,11 @@ llama_context * llama_init_from_model(
         //user-specified pooling-type is different from the model default
         LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
                        model->hparams.pooling_type, params.pooling_type);
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model->expert_placement) {
+        LLAMA_LOG_ERROR("%s: packed expert placement requires a separate MTP draft GGUF (--spec-draft-model)\n", __func__);
+        return nullptr;
     }
 
     // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP

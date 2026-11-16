@@ -1,5 +1,6 @@
 #include "llama-moe-cache.h"
 
+#include "llama-expert-placement.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
@@ -7,6 +8,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -345,9 +347,14 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * cold_slot_map = nullptr;
         ggml_tensor * slot_map_cpu = nullptr; // looked up in place of slot_map by the graphs with a CPU part, if cpu_share > 0, its data is not used
         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
+        std::vector<int32_t> packed_scratch; // original expert ID per scratch slot, -1 if empty
+        std::vector<int32_t> packed_scratch_slots; // physical slots when the permanent map can change
+        std::vector<uint64_t> packed_last_used;
+        uint64_t packed_lookups = 0;
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
     };
@@ -356,6 +363,7 @@ struct llama_moe_cache::impl {
         int32_t il;
         int32_t ip;           // index of the bank
         ggml_tensor * cached; // view of the bank used in place of the host experts
+        ggml_tensor * cold = nullptr;
     };
 
     struct stats {
@@ -368,6 +376,10 @@ struct llama_moe_cache::impl {
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
+    llama_expert_placement * placement;
+    std::unique_ptr<const llama_expert_placement, void (*)(const llama_expert_placement *)> placement_owner{
+        nullptr, [](const llama_expert_placement * p) { p->context_in_use.store(false); },
+    };
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -380,8 +392,32 @@ struct llama_moe_cache::impl {
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
     std::vector<int32_t> ids;
-    std::vector<moe_cache_lru::fill> fills;
+    std::vector<int32_t> packed_cold_scratch;
+    std::array<int32_t, llama_expert_profile::n_experts> packed_cold_slots{};
+    int32_t pending_layer = -1;
+    size_t pending_permanent_hits = 0;
+    size_t pending_scratch_hits = 0;
+    size_t pending_upload_bytes = 0;
+    bool packed_scratch_reuse = false;
+    size_t packed_scratch_hits = 0;
+    size_t packed_request_misses = 0;
+    int64_t packed_wait_us = 0;
+    size_t packed_wait_count = 0;
+    std::vector<uint8_t> packed_writeback;
+    size_t packed_promotions = 0;
+    size_t packed_writeback_bytes = 0;
+    int64_t packed_writeback_us = 0;
+    int64_t profile_router_us = 0;
+    size_t profile_router_reads = 0;
+    int64_t profile_upload_us = 0;
+    size_t profile_upload_steps = 0;
+    size_t profile_upload_bytes = 0;
+    ggml_backend_buffer_ptr packed_staging;
+    std::vector<moe_cache_lru::fill> fills; // packed fills use logical scratch indices
     std::vector<moe_cache_lru::fill> cpu;
+
+    bool packed_early_copy = false;
+    size_t packed_early_upload_steps = 0;
 
     float    cpu_share = 0.0f;
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
@@ -399,7 +435,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+            n_expert_used(model.hparams.n_expert_used_max()), placement(model.expert_placement.get()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -416,6 +452,113 @@ struct llama_moe_cache::impl {
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("MoE cache requires a MoE model");
+        }
+
+        if (placement) {
+            const auto device = std::find_if(devices.begin(), devices.end(), [&](const auto & d) {
+                return ggml_backend_get_device(d.backend) == placement->target;
+            });
+            if (device == devices.end() || no_alloc || cpu_share != 0.0f) {
+                throw std::runtime_error("packed expert execution requires the placement device and CPU share 0");
+            }
+            if (placement->context_in_use.exchange(true)) {
+                throw std::runtime_error("packed expert scratch slots are already in use by another context");
+            }
+            placement_owner.reset(placement);
+            const char * scratch_reuse = std::getenv("LLAMA_EXPERT_SCRATCH_REUSE");
+            packed_scratch_reuse = !scratch_reuse || std::strcmp(scratch_reuse, "0") != 0;
+            if (placement->dynamic_resident && !packed_scratch_reuse) {
+                throw std::runtime_error("dynamic expert residency requires scratch reuse for every context");
+            }
+            groups.emplace_back().id = static_cast<int32_t>(device - devices.begin());
+            const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * (placement->overlap ? 2 : 1), nullptr, true};
+            ctx_host.reset(ggml_init(params));
+            if (!ctx_host) {
+                throw std::runtime_error("could not allocate packed expert slot map context");
+            }
+            for (size_t il = 0; il < placement->maps.size(); ++il) {
+                auto & l = layers.at(il);
+                l.ig = 0;
+                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
+                layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
+                if (placement->overlap) {
+                    l.cold_slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                    ggml_format_name(l.cold_slot_map, "moe_cache.packed_cold-%zu", il);
+                    layer_of.emplace(l.cold_slot_map, std::make_pair(static_cast<int32_t>(il), true));
+                }
+                if (packed_scratch_reuse) {
+                    l.packed_scratch.assign(placement->n_slots, -1);
+                }
+                if (placement->dynamic_resident) {
+                    l.packed_scratch_slots = placement->maps[il].scratch_slots(placement->n_slots);
+                    l.packed_last_used.assign(llama_expert_profile::n_experts, 0);
+                }
+            }
+            std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
+            for (const auto & w : placement->weights) {
+                layers.at(w.layer).experts.push_back(w.host);
+                bindings.emplace(w.host, binding{w.layer, 0, w.bank, w.cold});
+                auto & bytes = bytes_per_layer.at(w.layer);
+                if (w.host->nb[2] > SIZE_MAX - bytes) {
+                    throw std::runtime_error("packed expert tuple is too large");
+                }
+                bytes += w.host->nb[2];
+            }
+            const size_t tuple_bytes = *std::max_element(bytes_per_layer.begin(), bytes_per_layer.end());
+            if (placement->dynamic_resident) {
+                for (size_t il = 0; il < placement->maps.size(); ++il) {
+                    const size_t n_planes = layers[il].experts.size();
+                    if (n_planes != 2 && n_planes != 3) {
+                        throw std::runtime_error("dynamic expert residency requires gate/up and down weights");
+                    }
+                }
+                packed_writeback.resize(tuple_bytes);
+                LLAMA_LOG_INFO("packed expert dynamic residency: stale_lookups=%" PRIu64 " writeback_buffer_bytes=%zu\n",
+                        packed_min_resident_age, packed_writeback.size());
+            }
+            buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), ggml_backend_cpu_buffer_type()));
+            if (!buf_host) {
+                throw std::runtime_error("could not allocate packed expert slot maps");
+            }
+            ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
+            const char * batch_upload = std::getenv("LLAMA_EXPERT_BATCH_UPLOAD");
+            const bool batch_requested = !placement->overlap && batch_upload && std::strcmp(batch_upload, "1") == 0;
+            if (placement->n_slots <= 0 || tuple_bytes > SIZE_MAX / placement->n_slots) {
+                throw std::runtime_error("packed expert staging is too large");
+            }
+            const size_t staging_bytes = tuple_bytes * placement->n_slots;
+            if (placement->overlap || batch_requested) {
+                using alloc_host_upload_buffer_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, size_t);
+                const auto reg = ggml_backend_dev_backend_reg(placement->target);
+                const char * proc = placement->overlap ? "ggml_backend_vk_alloc_transfer_host_upload_buffer" :
+                        "ggml_backend_vk_alloc_host_upload_buffer";
+                const auto alloc_host_upload_buffer = reg ? (alloc_host_upload_buffer_t) ggml_backend_reg_get_proc_address(reg, proc) : nullptr;
+                if (alloc_host_upload_buffer) {
+                    packed_staging.reset(alloc_host_upload_buffer(placement->target, staging_bytes));
+                }
+                if (packed_staging) {
+                    fills.reserve(placement->n_slots);
+                    if (placement->overlap) {
+                        if (packed_scratch_reuse) {
+                            packed_cold_scratch.reserve(placement->n_slots);
+                        }
+                        const char * early_copy = std::getenv("LLAMA_EXPERT_OVERLAP_EARLY_COPY");
+                        packed_early_copy = !early_copy || std::strcmp(early_copy, "0") != 0;
+                        LLAMA_LOG_INFO("packed expert overlap: early cold uploads %s\n", packed_early_copy ? "enabled" : "disabled");
+                    }
+                    LLAMA_LOG_INFO("packed expert %s upload: %zu bytes of native host staging on %s (%s)\n",
+                            placement->overlap ? "overlap" : "batch", ggml_backend_buffer_get_size(packed_staging.get()),
+                            ggml_backend_dev_name(placement->target), ggml_backend_dev_description(placement->target));
+                } else if (placement->overlap) {
+                    throw std::runtime_error("expert overlap requires native Vulkan host staging on the target and an async transfer queue without serialized submissions");
+                } else {
+                    LLAMA_LOG_WARN("packed expert batch upload unavailable on %s, using serial uploads\n",
+                            ggml_backend_dev_name(placement->target));
+                }
+            }
+            return;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -689,6 +832,10 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        if (placement) {
+            return n_tokens > 0 && n_tokens <= placement->max_ubatch && n_expert_used > 0 &&
+                    n_expert_used <= placement->n_slots / n_tokens ? l.slot_map : nullptr;
+        }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
@@ -718,12 +865,15 @@ struct llama_moe_cache::impl {
         return layers[il].cpu_map;
     }
 
-    ggml_tensor * get_experts(const ggml_tensor * w) const {
+    ggml_tensor * get_experts(const ggml_tensor * w, bool cold) const {
         const auto it = bindings.find(w);
-        return it != bindings.end() ? it->second.cached : nullptr;
+        return it != bindings.end() ? (cold ? it->second.cold : it->second.cached) : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        if (placement) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -758,17 +908,148 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    static constexpr uint64_t packed_min_resident_age = 32;
+
+    static int32_t packed_slot(const layer & l, int32_t scratch_index) {
+        return l.packed_scratch_slots.empty() ? llama_expert_profile::n_resident + scratch_index :
+                l.packed_scratch_slots[scratch_index];
+    }
+
+    void promote_packed(layer & l, int32_t il, int32_t scratch_index) {
+        auto & map = placement->maps[il];
+        int32_t evict = -1;
+        uint64_t oldest = l.packed_lookups;
+        for (int32_t expert = 0; expert < llama_expert_profile::n_experts; ++expert) {
+            if (map.resident[expert] >= 0 && l.packed_last_used[expert] < oldest) {
+                evict = expert;
+                oldest = l.packed_last_used[expert];
+            }
+        }
+        if (evict < 0 || l.packed_lookups - oldest < packed_min_resident_age) {
+            return;
+        }
+        const int32_t promote = l.packed_scratch[scratch_index];
+        const int32_t host_slot = map.host[promote];
+        const int32_t old_gpu_slot = map.resident[evict];
+        const int32_t new_gpu_slot = packed_slot(l, scratch_index);
+        GGML_ASSERT(host_slot >= 0 && map.resident[promote] == -1 && map.host[evict] == -1);
+
+        struct plane {
+            ggml_tensor * bank;
+            uint8_t * host_data;
+            size_t stride;
+        };
+        std::array<plane, 3> planes;
+        const size_t n_planes = l.experts.size();
+        size_t bytes = 0;
+        for (size_t i = 0; i < n_planes; ++i) {
+            ggml_tensor * host = l.experts[i];
+            ggml_tensor * bank = bindings.at(host).cached;
+            const size_t stride = host->nb[2];
+            if (!stride || stride > packed_writeback.size() - bytes || !host->data || !bank || !bank->data ||
+                    bank->nb[2] != stride || static_cast<size_t>(host_slot) >= ggml_nbytes(host) / stride ||
+                    static_cast<size_t>(old_gpu_slot) >= ggml_nbytes(bank) / stride ||
+                    static_cast<size_t>(new_gpu_slot) >= ggml_nbytes(bank) / stride) {
+                throw std::runtime_error("invalid packed expert writeback range");
+            }
+            planes[i] = {bank, static_cast<uint8_t *>(host->data) + host_slot * stride, stride};
+            bytes += stride;
+        }
+
+        const int64_t start = ggml_time_us();
+        size_t offset = 0;
+        for (size_t i = 0; i < n_planes; ++i) {
+            const auto & p = planes[i];
+            ggml_backend_tensor_get(p.bank, packed_writeback.data() + offset, old_gpu_slot * p.stride, p.stride);
+            offset += p.stride;
+        }
+
+        // The whole victim is safe in RAM before changing the only original copies.
+        offset = 0;
+        for (size_t i = 0; i < n_planes; ++i) {
+            const auto & p = planes[i];
+            std::memcpy(p.host_data, packed_writeback.data() + offset, p.stride);
+            offset += p.stride;
+        }
+        map.host[evict] = host_slot;
+        map.host[promote] = -1;
+        map.resident[evict] = -1;
+        map.resident[promote] = new_gpu_slot;
+        l.packed_scratch[scratch_index] = evict;
+        l.packed_scratch_slots[scratch_index] = old_gpu_slot;
+        ++packed_promotions;
+        packed_writeback_bytes += bytes;
+        packed_writeback_us += ggml_time_us() - start;
+    }
+
+    size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold) {
+        const auto & map = placement->maps[il];
+        auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        const size_t staging_bytes = ggml_backend_buffer_get_size(packed_staging.get());
+        size_t bytes = 0;
+        for (const auto & fill : fills) {
+            const int32_t slot = cold ? fill.slot : packed_slot(l, fill.slot);
+            for (ggml_tensor * host : l.experts) {
+                const auto & binding = bindings.at(host);
+                const size_t stride = host->nb[2];
+                const auto * data = static_cast<const uint8_t *>(host->data) + map.host[fill.expert] * stride;
+                GGML_ASSERT(stride <= staging_bytes - bytes);
+                std::memcpy(staging + bytes, data, stride);
+                ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, staging + bytes, slot * stride, stride);
+                bytes += stride;
+            }
+        }
+        // Wait before publishing the slot map or writing this staging buffer again.
+        ggml_backend_synchronize(backend);
+        return bytes;
+    }
+
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
         }
         const int32_t il      = it->second.first;
         const bool    has_cpu = it->second.second;
+        if (early && (!packed_early_copy || !has_cpu || pending_layer != il || fills.empty() || pending_upload_bytes != 0)) {
+            return false;
+        }
         layer & l = layers[il];
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        if (placement && placement->overlap && has_cpu) {
+            // The resident split does not read the separate cold bank. The hot map readback waited for older users.
+            GGML_ASSERT(pending_layer == il);
+            if (!fills.empty() && pending_upload_bytes == 0) {
+                if (packed_scratch_reuse) {
+                    // A failed upload can leave the old cold slot only partly intact.
+                    for (const auto & fill : fills) {
+                        l.packed_scratch[fill.slot] = -1;
+                    }
+                }
+                const int64_t start = ggml_time_us();
+                pending_upload_bytes = upload_packed(backend, l, il, true);
+                packed_wait_us += ggml_time_us() - start;
+                ++packed_wait_count;
+                packed_early_upload_steps += early;
+            }
+            if (early) {
+                // Input copies can reuse memory. Publish the map in the normal callback.
+                return true;
+            }
+            pending_layer = -1;
+            l.packed_scratch.swap(packed_cold_scratch);
+            ggml_backend_tensor_set(dst, packed_cold_slots.data(), 0, ggml_nbytes(dst));
+            stats_small.hits += pending_permanent_hits + pending_scratch_hits;
+            packed_scratch_hits += pending_scratch_hits;
+            stats_small.misses += fills.size();
+            stats_small.bytes += pending_upload_bytes;
+            LLAMA_LOG_DEBUG("packed experts: layer %d: %zu permanent hits, %zu scratch hits, %zu RAM uploads, %zu bytes\n",
+                    il, pending_permanent_hits, pending_scratch_hits, fills.size(), pending_upload_bytes);
+            return true;
+        }
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -791,13 +1072,176 @@ struct llama_moe_cache::impl {
             }
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
-        GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_moe_cache_slots
-
-        const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+        // A cross-device split receives a plain tensor copy of the reshaped IDs.
+        GGML_ASSERT(placement || sel->op == GGML_OP_RESHAPE);
+        const int32_t n_used = placement ? n_expert_used : (int32_t) sel->src[0]->ne[0];
 
         ids.resize(ggml_nelements(sel));
+        const int64_t router_start_us = profile ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        if (profile) {
+            profile_router_us += ggml_time_us() - router_start_us;
+            profile_router_reads++;
+        }
+
+        if (placement) {
+            const auto & map = placement->maps[il];
+            auto slots = map.resident;
+            int32_t n_uploads = 0;
+            size_t bytes = 0;
+            size_t hits = 0;
+            size_t scratch_hits = 0;
+            const int64_t start = ggml_time_us();
+            int64_t upload_start_us = 0;
+            const bool batch = packed_staging != nullptr;
+            if (batch) {
+                fills.clear();
+            }
+            if (placement->overlap) {
+                // An interrupted graph can leave an unconsumed plan.
+                pending_layer = -1;
+                pending_upload_bytes = 0;
+                packed_cold_scratch = l.packed_scratch;
+                packed_cold_slots.fill(placement->n_slots);
+            }
+            for (const int32_t expert : ids) {
+                if (expert < 0 || static_cast<size_t>(expert) >= slots.size()) {
+                    GGML_ABORT("invalid packed expert ID in layer %d", il);
+                }
+            }
+            if (placement->dynamic_resident) {
+                ++l.packed_lookups;
+                for (const int32_t expert : ids) {
+                    l.packed_last_used[expert] = l.packed_lookups;
+                }
+            }
+            int32_t promote_index = -1;
+            auto & scratch = placement->overlap ? packed_cold_scratch : l.packed_scratch;
+            // Mark all selected scratch residents before choosing any slot to replace.
+            for (size_t i = 0; i < scratch.size(); ++i) {
+                const int32_t expert = scratch[i];
+                if (expert >= 0 && std::find(ids.begin(), ids.end(), expert) != ids.end()) {
+                    slots[expert] = packed_slot(l, static_cast<int32_t>(i));
+                    if (promote_index < 0) {
+                        promote_index = static_cast<int32_t>(i);
+                    }
+                    ++scratch_hits;
+                }
+            }
+            // Count requests before fills turn repeated misses into slot-map hits.
+            size_t request_misses = 0;
+            if (placement->max_ubatch > 1) {
+                scratch_hits = 0;
+                for (const int32_t expert : ids) {
+                    if (map.resident[expert] < 0) {
+                        if (slots[expert] >= 0) {
+                            ++scratch_hits;
+                        } else {
+                            ++request_misses;
+                        }
+                    }
+                }
+            }
+            for (const int32_t expert : ids) {
+                if (slots[expert] >= 0) {
+                    hits += map.resident[expert] >= 0;
+                    continue;
+                }
+                if (n_uploads == placement->n_slots) {
+                    GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
+                }
+                int32_t scratch_index = n_uploads;
+                auto victim = scratch.end();
+                if (packed_scratch_reuse) {
+                    victim = std::find(scratch.begin(), scratch.end(), -1);
+                    if (victim == scratch.end()) {
+                        victim = std::find_if(scratch.begin(), scratch.end(), [&](int32_t resident) {
+                            return slots[resident] < 0;
+                        });
+                    }
+                    if (victim == scratch.end()) {
+                        GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
+                    }
+                    scratch_index = static_cast<int32_t>(victim - scratch.begin());
+                    // A partial upload must not leave the slot mapped to the evicted expert.
+                    *victim = -1;
+                }
+                ++n_uploads;
+                if (profile && n_uploads == 1) {
+                    upload_start_us = ggml_time_us();
+                }
+                const int32_t slot = packed_slot(l, scratch_index);
+                if (batch) {
+                    fills.push_back({expert, scratch_index});
+                } else {
+                    for (ggml_tensor * host : l.experts) {
+                        ggml_tensor * bank = bindings.at(host).cached;
+                        const size_t stride = host->nb[2];
+                        const auto * data = static_cast<const uint8_t *>(host->data) + map.host[expert] * stride;
+                        ggml_backend_tensor_set(bank, data, slot * stride, stride);
+                        bytes += stride;
+                    }
+                }
+                if (packed_scratch_reuse) {
+                    *victim = expert;
+                }
+                slots[expert] = slot;
+            }
+            if (placement->overlap) {
+                // RAM experts use their cold slot and the zero slot in the resident bank.
+                auto resident_slots = map.resident;
+                for (const int32_t expert : ids) {
+                    if (map.resident[expert] < 0) {
+                        packed_cold_slots[expert] = slots[expert] - llama_expert_profile::n_resident;
+                        resident_slots[expert] = llama_expert_profile::n_resident;
+                    }
+                }
+                ggml_backend_tensor_set(dst, resident_slots.data(), 0, ggml_nbytes(dst));
+                pending_layer = il;
+                pending_permanent_hits = hits;
+                pending_scratch_hits = scratch_hits;
+                return true;
+            }
+            if (batch && !fills.empty()) {
+                try {
+                    bytes = upload_packed(backend, l, il, false);
+                } catch (...) {
+                    if (packed_scratch_reuse) {
+                        for (const auto & fill : fills) {
+                            scratch[fill.slot] = -1;
+                        }
+                    }
+                    throw;
+                }
+            }
+            // Publish the slot map only after all selected weights have been copied.
+            if (n_uploads > 0) {
+                if (!batch) {
+                    ggml_backend_synchronize(backend);
+                }
+                const int64_t end_us = ggml_time_us();
+                packed_wait_us += end_us - start;
+                ++packed_wait_count;
+                if (profile) {
+                    profile_upload_us += end_us - upload_start_us;
+                    profile_upload_steps++;
+                    profile_upload_bytes += bytes;
+                }
+            }
+            if (placement->dynamic_resident && promote_index >= 0) {
+                promote_packed(l, il, promote_index);
+            }
+            ggml_backend_tensor_set(dst, slots.data(), 0, ggml_nbytes(dst));
+            stats_small.hits += hits + scratch_hits;
+            packed_scratch_hits += scratch_hits;
+            stats_small.misses += n_uploads;
+            packed_request_misses += request_misses;
+            stats_small.bytes += bytes;
+            LLAMA_LOG_DEBUG("packed experts: layer %d: %zu permanent hits, %zu scratch hits, %d RAM uploads, %zu bytes\n",
+                    il, hits, scratch_hits, n_uploads, bytes);
+            return true;
+        }
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -856,6 +1300,32 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (profile_router_reads > 0) {
+            LLAMA_LOG_INFO("decode_profile: expert_router_readback_ms=%.3f router_reads=%zu expert_upload_ms=%.3f upload_steps=%zu uploaded_MiB=%.3f\n",
+                    profile_router_us / 1000.0, profile_router_reads, profile_upload_us / 1000.0,
+                    profile_upload_steps, profile_upload_bytes / (1024.0 * 1024.0));
+        }
+        if (placement) {
+            LLAMA_LOG_INFO("packed expert transfer phase (%s): %.3f ms across %zu layer steps\n",
+                    placement->overlap ? "overlap" : "sync", packed_wait_us / 1000.0, packed_wait_count);
+            if (placement->overlap) {
+                LLAMA_LOG_INFO("packed expert overlap uploads: early_steps=%zu waited_steps=%zu\n",
+                        packed_early_upload_steps, packed_wait_count - packed_early_upload_steps);
+            }
+            LLAMA_LOG_INFO("packed expert slots: reuse=%s permanent_hits=%zu scratch_hits=%zu ram_uploads=%zu upload_mode=%s\n",
+                    packed_scratch_reuse ? "on" : "off", stats_small.hits - packed_scratch_hits, packed_scratch_hits, stats_small.misses,
+                    placement->overlap ? "overlap" : packed_staging ? "batch" : "serial");
+            if (placement->max_ubatch > 1) {
+                LLAMA_LOG_INFO("packed expert requests: total=%zu misses=%zu hit_rate=%.2f%%\n",
+                        stats_small.hits + packed_request_misses, packed_request_misses,
+                        stats_small.hits ? 100.0 * stats_small.hits / (stats_small.hits + packed_request_misses) : 0.0);
+            }
+            if (placement->dynamic_resident) {
+                LLAMA_LOG_INFO("packed expert dynamic residency: promotions=%zu evictions=%zu writeback_bytes=%zu writeback_ms=%.3f uploaded_bytes=%zu total_transfer_bytes=%zu total_transfer_ms=%.3f\n",
+                        packed_promotions, packed_promotions, packed_writeback_bytes, packed_writeback_us / 1000.0,
+                        stats_small.bytes, stats_small.bytes + packed_writeback_bytes, (packed_wait_us + packed_writeback_us) / 1000.0);
+            }
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -864,7 +1334,13 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
                 name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
-        log("ubatch <= 8", stats_small);
+        if (placement && placement->max_ubatch > 1) {
+            auto requests = stats_small;
+            requests.misses = packed_request_misses;
+            log("ubatch <= 8", requests);
+        } else {
+            log("ubatch <= 8", stats_small);
+        }
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -882,20 +1358,32 @@ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
 }
 
+bool llama_moe_cache::requires_slots(int32_t il) const {
+    return pimpl->placement && il >= 0 && static_cast<size_t>(il) < pimpl->placement->maps.size();
+}
+
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
     return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part);
 }
 
-ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
-    return pimpl->get_experts(w);
+ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w, bool cold) const {
+    return pimpl->get_experts(w, cold);
+}
+
+ggml_tensor * llama_moe_cache::get_cold_slot_map(int32_t il) const {
+    return requires_slots(il) ? pimpl->layers[il].cold_slot_map : nullptr;
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
     return pimpl->get_cpu_map(il, n_tokens);
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
-    return pimpl->copy(backend, src, dst, graph);
+bool llama_moe_cache::early_copy_enabled() const {
+    return pimpl->packed_early_copy;
+}
+
+bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early) {
+    return pimpl->copy(backend, src, dst, graph, profile, early);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -911,6 +1399,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     if (pimpl->buf_host) {
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
+    }
+    if (pimpl->packed_staging) {
+        const auto buffer = pimpl->packed_staging.get();
+        res[ggml_backend_buffer_get_type(buffer)] += ggml_backend_buffer_get_size(buffer);
     }
     return res;
 }

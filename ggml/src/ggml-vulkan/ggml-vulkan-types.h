@@ -1370,6 +1370,7 @@ struct ggml_backend_vk_buffer_context {
 struct vk_host_allocation {
     void *    base = nullptr;
     size_t    size = 0;
+    bool      importable = false;
     vk_buffer views[GGML_VK_MAX_DEVICES];  // indexed by device->idx; null = not (yet) mapped here
 };
 
