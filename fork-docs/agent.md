@@ -11,6 +11,7 @@
 - 並列作業を依頼された場合は変更範囲とワークツリーを分離する。統合はレビュー後、ユーザーが許可した範囲で行う。
 - フルビルド、モデル実行、速度比較はユーザーが行う。こちらは必要最小限のコンパイル確認、小規模な正確性確認、スクリプト確認までとし、ビルド・実行コマンドを渡す。
 - 改善ごとにON/OFFを切り替え、他の条件を揃えて比較する。機能実装と採用判断を区別する。
+- 性能調査では、親エージェントが中間データの生成先から最終利用先までをコードとログで追い、GPU内・GPU間・GPU/RAM間で省けるコピー、再変換、転送専用Submitを先に提案する。候補の発生条件、回数、既存の再利用、上書きと同期の制約を確認し、待ちの位置が移る場合は前後を含む時間で評価する。
 - コミット・pushは明示的な指示がある場合のみ。未コミットの他作業差分を消さない。
 
 ## テストと評価
@@ -97,3 +98,9 @@
 
 The fixed validation checkout is `C:/Users/kamui/.codex/worktrees/rtx-expert-validation/llama-hetero-moe`. Reuse `G:/AI/build-rtx-validation` only with this source directory. Development stays in separate worktrees; validate committed branch tips sequentially in this checkout, preferably detached so development branches remain usable in their own worktrees. Never switch during inference/build, and require a clean checkout before switching. Stop at configure/build failure; never benchmark an old executable after failure. Commit and record the exact experiment tip before each validation. No push needed.
 Historical tested changes and opt-in experiments may share a baseline commit where file boundaries overlap; do not reconstruct artificial historical commits. In-progress Recurrent and transfer-tail changes remain separate. User authorized these local commits, not push/main integration. CLI comparisons keep all HC experiments and RTX sharing OFF unless explicitly testing them.
+
+## 30 tok/sに到達した検証設定（2026-11-17）
+
+- 検証ブランチは `codex/recurrent-conv-validation`。`-Mode speed -ExpertRamRotation -SharedHostExpertInput -SharedHostExpertReturn -MtpDevicePending -RecurrentConvHistory` を指定する。Q8再利用、戻り2枠化、HC実験、RTX Expert分担はOFF。
+- 固定5回答は生成40.53秒、30.00 tok/s。既存の検証フォルダと `G:/AI/build-rtx-validation` を使用する。増分ビルドでQwen4exp側のUnityコンパイルが省かれた場合は、該当するUnity単位を再コンパイルしてDLLと発動ログを確認する。
+- 保留・不採用の実験は作業ワークツリーのアーカイブから復元できる。生ログやプロファイルはGit外に保管する。

@@ -109,3 +109,14 @@ Parent reviews only; no commit/push/main integration. Full model builds/runs by 
 - Recurrent development: C:/Users/kamui/.codex/worktrees/recurrent-tuning/llama-hetero-moe, codex/recurrent-tuning. Sol hc_up_pair_sol. GDN warp trial not adopted, backed up in Git stash named recurrent: unadopted GDN warp experiment backup. Next investigation is QKV.
 - Transfer development: C:/Users/kamui/.codex/worktrees/transfer-tail-review/llama-hetero-moe, codex/transfer-tail. Sol transfer_tail_sol. Copied baseline backed up in a separate stash before alignment.
 - Both development branches start from 787460224. Agents resumed there; no writes to fixed validation source. No push, no main integration, no full build/model run during organization. Logs remain outside Git.
+## MTP RTX内保持の採用（2026-11-17）
+
+- 検証コミット `ac39f6f79`。固定5回答のON実行は正常終了。ユーザー判断で今後の検証設定に `-MtpDevicePending` を採用。RAM回転と共通RAMの行き戻りを併用。Q8再利用と戻り2枠化はOFF。
+- 生成合計47.64秒・25.52 tok/s。第2回答30.88 tok/s、第4回答17.18 tok/s。生成トークン数とMTP受理数は従来の固定5回答と一致。第4回答の受理率91.43%。同一ビルドのOFF比較は未実施。
+- MTPログはD2D 901、D2H 9、H2D 1、ホストからのdraft入力0。生ログはGit外。
+
+## Recurrent履歴直接書き込みの採用（2026-11-17）
+
+- 現在の検証基準は `cb7235b20`。ユーザー判断で `-RecurrentConvHistory` を採用。 `-ExpertRamRotation -SharedHostExpertInput -SharedHostExpertReturn -MtpDevicePending` と併用する。Q8再利用と戻り2枠化はOFF。
+- 固定5回答で40.53秒、30.00 tok/s。第4回答29.45 tok/s。未発動の比較ログは41.46秒、29.33 tok/s。生成数と受理数は一致。同一バイナリでの反復測定は未実施。
+- Windowsの増分ビルドではNinjaがQwen4expのUnity依存を拾わず、CUDA側だけ更新されたことがあった。発動マーカー `CUDA SSM convolution history applied` と `exit_code=0` を確認。ソース切替後にモデル側の変更が入らなければ、対象Unity単位を再コンパイルする。
