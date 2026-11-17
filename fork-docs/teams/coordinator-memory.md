@@ -101,3 +101,11 @@ Latest user instructions supersede prior HC adoption: all three HC improvements 
 - `/root/hc_up_pair_sol`: Recurrent investigation and evidence-backed limited implementation, current rtx-expert-validation worktree, primary file gated_delta_net.cu. Recurrent8.2s is not all GDN; investigate with realistic shapes and CUDA Graph fixture. Avoid shared files during investigation.
 - `/root/transfer_tail_sol`: separate worktree required, investigate exposed Expert promotion/writeback/activation return waits and implement justified opt-in improvement. Uses create_worktree, preserve current uncommitted baseline and record delta. Worktree location pending agent report.
 Parent reviews only; no commit/push/main integration. Full model builds/runs by user, raw logs outside Git, complete notifications instead of repeated status polling. Need review and separate build/ON/OFF commands when each completes; do not combine experiments before validating independently.
+
+## Validation branch organization (2026-11-17)
+
+- Baseline implementation snapshot: 787460224, branch codex/hetero-validation-base. Historical changes grouped with opt-in experiments; HC experiments and RTX sharing remain OFF in ordinary comparisons.
+- Fixed validation source: C:/Users/kamui/.codex/worktrees/rtx-expert-validation/llama-hetero-moe; build: G:/AI/build-rtx-validation. See research/shared-validation-build.md. Switch only clean committed tips; configure and build must succeed before measurements.
+- Recurrent development: C:/Users/kamui/.codex/worktrees/recurrent-tuning/llama-hetero-moe, codex/recurrent-tuning. Sol hc_up_pair_sol. GDN warp trial not adopted, backed up in Git stash named recurrent: unadopted GDN warp experiment backup. Next investigation is QKV.
+- Transfer development: C:/Users/kamui/.codex/worktrees/transfer-tail-review/llama-hetero-moe, codex/transfer-tail. Sol transfer_tail_sol. Copied baseline backed up in a separate stash before alignment.
+- Both development branches start from 787460224. Agents resumed there; no writes to fixed validation source. No push, no main integration, no full build/model run during organization. Logs remain outside Git.
