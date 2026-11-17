@@ -205,6 +205,12 @@ LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64
 // Returns whether decode accepts batches with state rows.
 LLAMA_API bool llama_set_embd_state_src(struct llama_context * ctx, struct llama_context * src);
 
+// Enable same-CUDA-device ordering for a draft context already attached to its target's state rows.
+LLAMA_API bool llama_enable_mtp_device_pending(struct llama_context * draft);
+
+// Queue a copy from a target's last decode to its reserved single-sequence row.
+LLAMA_API bool llama_copy_mtp_pending_row(struct llama_context * draft, int64_t row);
+
 // The state of entry idx is row `row` of the h_nextn device buffer of the context set with llama_set_embd_state_src().
 // All entries of a batch have a state row, or none.
 LLAMA_API bool llama_batch_ext_set_embd_state_row(struct llama_batch_ext * batch, int32_t idx, int32_t row);

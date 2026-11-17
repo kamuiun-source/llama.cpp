@@ -1690,8 +1690,56 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     return true;
 }
 
+bool llama_context::copy_mtp_pending_row(int64_t row) {
+    auto * target = cparams.ctx_state_src;
+    if (!mtp_device_pending || !target || !target->h_nextn_dev || !target->ev_h_nextn_written_recorded ||
+            row < 0 || row >= target->cparams.n_batch || target->h_nextn_dev->ne[1] != (int64_t) target->cparams.n_batch + 1) {
+        return false;
+    }
+
+    auto * backend = target->h_nextn_backend;
+    if (target->ev_h_nextn_read_recorded) {
+        ggml_backend_event_wait(backend, target->ev_h_nextn_read.get());
+    }
+
+    // CUDA enqueues the copy using the data addresses; it does not retain these row descriptors.
+    ggml_tensor src = *target->h_nextn_dev;
+    src.ne[1] = 1;
+    ggml_tensor dst = src;
+    auto * base = static_cast<char *>(src.data);
+    src.data = base + row * src.nb[1];
+    dst.data = base + target->cparams.n_batch * dst.nb[1];
+    ggml_backend_tensor_copy_async(backend, backend, &src, &dst);
+    ggml_backend_event_record(target->ev_h_nextn_written.get(), backend);
+    return true;
+}
+
+bool llama_context::enable_mtp_device_pending() {
+    auto * src = cparams.ctx_state_src;
+    if (!supports_state_row() || !src->h_nextn_backend || src->cparams.n_seq_max != 1 || cparams.n_seq_max != 1 ||
+            src->h_nextn_dev_dev != model.dev_output() || !backend_from_dev(src->h_nextn_dev_dev)) {
+        return false;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(src->h_nextn_dev_dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+    for (const auto & backend : backends) {
+        const auto dev = ggml_backend_get_device(backend.get());
+        if (dev != src->h_nextn_dev_dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+    }
+    mtp_device_pending = true;
+    return true;
+}
+
 bool llama_context::set_state_src(llama_context * src) {
     if (cparams.ctx_state_src != src) {
+        if (mtp_device_pending) {
+            synchronize();
+            mtp_device_pending = false;
+        }
         sched_need_reserve = true;
     }
     cparams.ctx_state_src = src;
@@ -2380,7 +2428,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (state_src) {
         state_backend = backend_from_dev(state_src->h_nextn_dev_dev);
         if (state_src->ev_h_nextn_written_recorded) {
-            ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
+            if (mtp_device_pending && state_backend) {
+                ggml_backend_event_wait(state_backend, state_src->ev_h_nextn_written.get());
+            } else {
+                ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
+            }
         } else {
             state_src->synchronize();
         }
@@ -2415,6 +2467,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 decode_profile && n_tokens_all == 1);
 
         if (!res) {
+            if (mtp_device_pending && state_backend) {
+                ggml_backend_event_record(state_src->ev_h_nextn_read.get(), state_backend);
+                state_src->ev_h_nextn_read_recorded = true;
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -4831,6 +4887,14 @@ bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
 
 bool llama_set_embd_state_src(llama_context * ctx, llama_context * src) {
     return ctx->set_state_src(src);
+}
+
+bool llama_enable_mtp_device_pending(llama_context * draft) {
+    return draft->enable_mtp_device_pending();
+}
+
+bool llama_copy_mtp_pending_row(llama_context * draft, int64_t row) {
+    return draft->copy_mtp_pending_row(row);
 }
 
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {

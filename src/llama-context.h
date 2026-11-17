@@ -136,6 +136,8 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);
     bool supports_state_row() const;
+    bool enable_mtp_device_pending();
+    bool copy_mtp_pending_row(int64_t row);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -477,7 +479,7 @@ private:
     bool ev_layer_inp_read_recorded = false;
 
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
-    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+    // Row r < n_batch is the token at batch index r of the last decode; row n_batch + s is reserved for seq s.
     // ordered with the reader context like the layer input buffer
     ggml_context_ptr        ctx_h_nextn_dev;
     ggml_backend_buffer_ptr buf_h_nextn_dev;
@@ -488,6 +490,7 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+    bool mtp_device_pending         = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

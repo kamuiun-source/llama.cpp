@@ -1568,11 +1568,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> chain_h;
 
     // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
-    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
-    // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
+    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id.
     bool    dev_rows    = false;
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+
+    bool device_pending = false;
+    bool device_pending_valid = false;
+    size_t pending_copies = 0;
+    size_t pending_h2d = 0;
+    mutable size_t pending_d2h = 0;
+    size_t draft_host_rows = 0;
 
     bool reuse_draft_anchor = false;
     struct draft_anchor {
@@ -1669,16 +1675,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
         }
-        const char * reuse = std::getenv("LLAMA_MTP_REUSE_DRAFT_ANCHOR");
-        if (reuse && std::strcmp(reuse, "1") == 0 && n_seq == 1 && n_mtp_layers == 1 && n_max == 1 &&
+        const auto is_qwen4exp = [](const llama_model * model) {
+            char arch[32];
+            return llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                    std::strcmp(arch, "qwen4exp") == 0;
+        };
+        const bool single_candidate = n_seq == 1 && n_mtp_layers == 1 && n_max == 1 &&
                 dev_rows && llama_n_ubatch(ctx_tgt) == 2 && llama_n_rs_seq(ctx_tgt) == 1 &&
-                llama_n_ubatch(ctx_dft) == 1 && llama_get_model(ctx_tgt) != llama_get_model(ctx_dft)) {
-            auto is_qwen4exp = [](const llama_model * model) {
-                char arch[32];
-                return llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
-                        std::strcmp(arch, "qwen4exp") == 0;
-            };
-            reuse_draft_anchor = is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
+                llama_n_ubatch(ctx_dft) == 1 && llama_get_model(ctx_tgt) != llama_get_model(ctx_dft) &&
+                is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
+        const char * reuse = std::getenv("LLAMA_MTP_REUSE_DRAFT_ANCHOR");
+        reuse_draft_anchor = single_candidate && reuse && std::strcmp(reuse, "1") == 0;
+        const char * pending = std::getenv("LLAMA_MTP_DEVICE_PENDING");
+        if (pending && std::strcmp(pending, "1") == 0) {
+            device_pending = single_candidate && !reuse_draft_anchor && llama_enable_mtp_device_pending(ctx_dft);
+            if (device_pending) {
+                // There is no second draft step to consume this output.
+                llama_set_embeddings_nextn(ctx_dft, false, /*masked*/ true);
+            } else {
+                SPC_WRN("%s", "MTP device pending unavailable; using the existing hidden-row path\n");
+            }
         }
 
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
@@ -1687,6 +1703,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     ~common_speculative_impl_draft_mtp() override {
         if (reuse_draft_anchor) {
             SPC_INF("MTP draft anchor: reused=%zu\n", n_reused_anchors);
+        }
+        if (dev_rows) {
+            SPC_INF("MTP device pending: enabled=%d copies=%zu d2h=%zu h2d=%zu draft_host_rows=%zu\n",
+                    device_pending, pending_copies, pending_d2h, pending_h2d, draft_host_rows);
         }
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
@@ -1703,6 +1723,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+    }
+
+    bool ensure_pending_device_row() {
+        if (!device_pending_valid) {
+            device_pending_valid = llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt, 1, pending_h[0].data());
+            pending_h2d += device_pending_valid;
+        }
+        return device_pending_valid;
+    }
+
+    bool save_pending_device_row(int32_t row) {
+        if (!llama_copy_mtp_pending_row(params.ctx_dft, row)) {
+            return false;
+        }
+        ++pending_copies;
+        device_pending_valid = true;
+        return true;
     }
 
     bool keep_mtp_anchor(llama_seq_id seq_id, llama_pos pos, llama_token token) override {
@@ -1811,7 +1848,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0 && !reuse_anchor) {
-                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                        if (device_pending) {
+                            if (!ensure_pending_device_row()) {
+                                return false;
+                            }
+                        } else {
+                            pending_h2d += llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                        }
                     }
                 }
             }
@@ -1893,9 +1936,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = h_rows;
 
             if (dev_rows) {
-                // the rows stay on the device until the next target decode, only the pending row comes to the host
                 verify_row0[seq_id] = h_offset;
-                llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
+                if (device_pending) {
+                    if (!save_pending_device_row(h_offset + h_rows - 1)) {
+                        return false;
+                    }
+                } else {
+                    pending_d2h += llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
+                }
                 continue;
             }
 
@@ -1957,7 +2005,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            if (device_pending && ensure_pending_device_row()) {
+                batch.set_embd_state_row(idx, n_batch_tgt);
+            } else {
+                batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+                ++draft_host_rows;
+            }
 
             i_last[seq_id] = idx;
 
@@ -2004,7 +2057,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const float * h_row = device_pending ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2045,6 +2098,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                GGML_ASSERT(!device_pending);
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
@@ -2104,9 +2158,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         if (dev_rows) {
-            // process() already fetched the last row
+            // process() already saved the last row.
             if (i_h != n_rows - 1) {
-                llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
+                if (device_pending) {
+                    GGML_ASSERT(save_pending_device_row(verify_row0[seq_id] + i_h));
+                } else {
+                    pending_d2h += llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
+                }
             }
             return;
         }
@@ -2120,6 +2178,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (device_pending && device_pending_valid) {
+            std::vector<float> row(n_embd);
+            if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt, 1, row.data())) {
+                return false;
+            }
+            ++pending_d2h;
+            data.resize(row_bytes);
+            std::memcpy(data.data(), row.data(), row_bytes);
+            return true;
+        }
         data.resize(row_bytes);
         std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
         return true;
@@ -2135,6 +2203,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        device_pending_valid = false;
         anchor = {};
     }
 };
