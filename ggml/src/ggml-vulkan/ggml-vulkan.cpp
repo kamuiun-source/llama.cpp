@@ -15676,8 +15676,62 @@ static bool ggml_vk_compact_expert_graph(const ggml_backend_vk_context * ctx, co
 #endif
 }
 
+static bool ggml_backend_vk_supports_graph_upload(ggml_backend_t backend, const ggml_backend_graph_upload * upload) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(backend);
+    GGML_UNUSED(upload);
+    return false;
+#else
+    const auto * ctx = static_cast<const ggml_backend_vk_context *>(backend->context);
+    const auto buft = &ctx->device->buffer_type;
+    if (!ctx->device->support_async || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
+            vk_perf_logger_enabled || !upload->staging || upload->staging->buft != buft) {
+        return false;
+    }
+    const auto & staging = static_cast<const ggml_backend_vk_buffer_context *>(upload->staging->context)->dev_buffer;
+    if (!staging || staging->device != ctx->device ||
+            !(staging->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+        return false;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        const auto * dst = upload->dst[i];
+        if (!dst || !dst->buffer || dst->buffer->buft != buft || dst->view_src || !dst->data || !ggml_is_contiguous(dst)) {
+            return false;
+        }
+        const auto & buffer = static_cast<const ggml_backend_vk_buffer_context *>(dst->buffer->context)->dev_buffer;
+        const size_t bytes = ggml_nbytes(dst);
+        const size_t offset = vk_tensor_offset(dst);
+        const size_t src_offset = upload->offsets[i];
+        if (!buffer || buffer == staging || buffer->device != ctx->device || !bytes || bytes % 4 || offset % 4 || src_offset % 4 ||
+                offset > buffer->size || bytes > buffer->size - offset ||
+                src_offset > staging->size || bytes > staging->size - src_offset) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+static void ggml_vk_record_graph_upload(ggml_backend_vk_context * ctx, const ggml_backend_graph_upload & upload) {
+    auto compute = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_gpu_telemetry_start(compute);
+    auto & cmd = compute->s->buffer->buf;
+    const auto & staging = static_cast<const ggml_backend_vk_buffer_context *>(upload.staging->context)->dev_buffer;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eTransfer, {},
+            { { vk::AccessFlagBits::eHostWrite, vk::AccessFlagBits::eTransferRead } }, {}, {});
+    for (size_t i = 0; i < 3; ++i) {
+        const auto * dst = upload.dst[i];
+        const auto & buffer = static_cast<const ggml_backend_vk_buffer_context *>(dst->buffer->context)->dev_buffer;
+        cmd.copyBuffer(staging->buffer, buffer->buffer, { vk::BufferCopy{ upload.offsets[i], vk_tensor_offset(dst), ggml_nbytes(dst) } });
+    }
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {},
+            { { vk::AccessFlagBits::eTransferWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead } }, {}, {});
+}
+
 static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph,
-        const ggml_tensor * output, ggml_vk_graph_readback * readback) {
+        const ggml_tensor * output, ggml_vk_graph_readback * readback, const ggml_backend_graph_upload * upload) {
     vk_telemetry_scope scope(VK_TEL_GRAPH_COMPUTE);
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -15725,6 +15779,10 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         ++overlap.fallback_joins;
     }
     ggml_vk_submit_transfer_ctx(ctx);
+    if (upload) {
+        // Record after the Expert callback selects and submits any independent weight transfers.
+        ggml_vk_record_graph_upload(ctx, *upload);
+    }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
@@ -16244,14 +16302,17 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    return ggml_backend_vk_graph_compute_impl(backend, cgraph, nullptr, nullptr);
+    return ggml_backend_vk_graph_compute_impl(backend, cgraph, nullptr, nullptr, nullptr);
 }
 
-static ggml_status ggml_backend_vk_graph_readback(ggml_backend_t backend, ggml_cgraph * graph,
-        const ggml_tensor * output, ggml_backend_buffer_t staging, bool * recorded) {
+static ggml_status ggml_backend_vk_graph_handoff(ggml_backend_t backend, ggml_cgraph * graph,
+        const ggml_backend_graph_upload * upload, const ggml_tensor * output, ggml_backend_buffer_t staging, bool * recorded) {
     *recorded = false;
 #ifndef GGML_VULKAN_CHECK_RESULTS
     auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!output) {
+        return ggml_backend_vk_graph_compute_impl(backend, graph, nullptr, nullptr, upload);
+    }
     const size_t bytes = ggml_nbytes(output);
     if (!ctx->device->support_async || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
             ctx->device->has_internally_synchronized_queues || ctx->final_fence_pending ||
@@ -16259,7 +16320,7 @@ static ggml_status ggml_backend_vk_graph_readback(ggml_backend_t backend, ggml_c
             output->type != GGML_TYPE_F32 || !ggml_is_contiguous(output) || output->view_src || !output->buffer ||
             !output->data || output->buffer->buft != &ctx->device->buffer_type || !staging ||
             staging->buft != &ctx->device->buffer_type || !bytes) {
-        return ggml_backend_vk_graph_compute(backend, graph);
+        return ggml_backend_vk_graph_compute_impl(backend, graph, nullptr, nullptr, upload);
     }
 
     auto source = static_cast<ggml_backend_vk_buffer_context *>(output->buffer->context)->dev_buffer;
@@ -16268,18 +16329,29 @@ static ggml_status ggml_backend_vk_graph_readback(ggml_backend_t backend, ggml_c
     if (!source || !target || source == target || target->device != ctx->device || source->device != ctx->device ||
             offset % 4 || bytes % 4 || offset > source->size || bytes > source->size - offset || bytes > target->size ||
             !(target->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
-        return ggml_backend_vk_graph_compute(backend, graph);
+        return ggml_backend_vk_graph_compute_impl(backend, graph, nullptr, nullptr, upload);
     }
 
     ggml_vk_graph_readback readback{source, target, offset, bytes};
-    const auto status = ggml_backend_vk_graph_compute_impl(backend, graph, output, &readback);
+    const auto status = ggml_backend_vk_graph_compute_impl(backend, graph, output, &readback, upload);
     *recorded = readback.recorded;
     return status;
 #else
+    GGML_ASSERT(!upload);
     GGML_UNUSED(output);
     GGML_UNUSED(staging);
-    return ggml_backend_vk_graph_compute(backend, graph);
+    return ggml_backend_vk_graph_compute_impl(backend, graph, nullptr, nullptr, upload);
 #endif
+}
+
+static ggml_status ggml_backend_vk_graph_readback(ggml_backend_t backend, ggml_cgraph * graph,
+        const ggml_tensor * output, ggml_backend_buffer_t staging, bool * recorded) {
+    return ggml_backend_vk_graph_handoff(backend, graph, nullptr, output, staging, recorded);
+}
+
+static ggml_status ggml_backend_vk_graph_upload(ggml_backend_t backend, ggml_cgraph * graph, const ggml_backend_graph_upload * upload,
+        const ggml_tensor * output, ggml_backend_buffer_t staging, bool * recorded) {
+    return ggml_backend_vk_graph_handoff(backend, graph, upload, output, staging, recorded);
 }
 
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
@@ -18156,6 +18228,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_get_telemetry") == 0) {
         return (void *) ggml_backend_vk_get_telemetry;
+    }
+    if (strcmp(name, "ggml_backend_vk_supports_graph_upload") == 0) {
+        return (void *) ggml_backend_vk_supports_graph_upload;
+    }
+    if (strcmp(name, "ggml_backend_vk_graph_upload") == 0) {
+        return (void *) ggml_backend_vk_graph_upload;
     }
     if (strcmp(name, "ggml_backend_vk_graph_readback") == 0) {
         return (void *) ggml_backend_vk_graph_readback;
