@@ -3516,6 +3516,8 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    // The shared input upload is complete, so cleanup no longer needs its backend.
+    sched->shared_input_pending = false;
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
