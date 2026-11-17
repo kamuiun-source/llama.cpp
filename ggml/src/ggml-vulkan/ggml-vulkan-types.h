@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-vulkan.h"
+#include "ggml-cpp.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -328,6 +329,9 @@ struct vk_queue_handle {
     vk::Queue queue;
     vk_device_ref device;
     std::mutex * device_submit_mutex = nullptr;
+    bool transfer_only = false;
+    // Only the externally synchronized queue tracks its latest successful submit.
+    vk::Fence last_submit_fence;
     virtual void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) = 0;
     virtual void lock()   {}   // no-op by default (internally synchronized case)
     virtual void unlock() {}
@@ -824,6 +828,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[DMMV_WG_SIZE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1078,6 +1083,7 @@ struct vk_buffer_struct {
     void * ptr;
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
+    bool expert_concurrent = false;
 
     vk_device device;
 
@@ -1120,6 +1126,46 @@ struct vk_event {
     uint64_t cmd_buffer_use_counter = 0;
 };
 
+struct vk_gpu_telemetry {
+    static constexpr uint32_t capacity = 128;
+    enum sample_state : uint8_t { free, recording, submitted };
+
+    vk::QueryPool pool;
+    uint32_t valid_bits = 0;
+    std::array<sample_state, capacity> samples{};
+};
+
+struct vk_expert_overlap {
+    const ggml_tensor * projection = nullptr;
+    uint32_t hot_masks[2] = {};
+    uint32_t excluded_masks[2] = {};
+    ggml_backend_buffer_ptr ffn_scratch;
+    std::vector<ggml_backend_buffer_ptr> ffn_retired_scratch;
+    uint64_t split_ffns = 0;
+    uint64_t split_ffn_scratch = 0;
+    uint64_t split_ffn_fallbacks = 0;
+    uint64_t split_ffn_fallback_down_q8 = 0;
+    bool enabled = false;
+    bool transfer_pending = false;
+    bool wait_recorded = false;
+    bool wait_submitted = false;
+    uint64_t transfer_submits = 0;
+    uint64_t transfer_bytes = 0;
+    uint64_t split_projections = 0;
+    uint64_t hot_positions = 0;
+    uint64_t cold_positions = 0;
+    uint64_t fallback_joins = 0;
+    uint64_t paired_submits = 0;
+    uint64_t transfer_pending_at_compute_submit = 0;
+    void (*promotion_commit)(void *) = nullptr;
+    void * promotion_userdata = nullptr;
+    bool promotion_compute_submitted = false;
+    uint64_t promotion_submits = 0;
+    uint64_t promotion_writeback_bytes = 0;
+    uint64_t promotion_commits = 0;
+    uint64_t promotion_pending_at_compute_submit = 0;
+};
+
 struct vk_submission {
     vk_command_buffer* buffer = nullptr;
     std::vector<vk_semaphore> wait_semaphores;
@@ -1127,6 +1173,9 @@ struct vk_submission {
     // submit waits until *ready >= ready_value
     const std::atomic<uint64_t> * ready = nullptr;
     uint64_t ready_value = 0;
+    int32_t gpu_sample = -1;
+    bool expert_hot = false;
+    bool expert_wait = false;
 };
 
 typedef std::vector<vk_submission> vk_sequence;
@@ -1183,6 +1232,8 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+    vk_gpu_telemetry * gpu_telemetry = nullptr;
+    struct ggml_backend_vk_context * expert_overlap_owner = nullptr;
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1287,6 +1338,10 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    bool final_fence_pending {};
+    vk::Fence completion_fallback_fence;
+    bool final_fence_reuse_logged {};
+    bool compact_expert_logged {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -1324,8 +1379,11 @@ struct ggml_backend_vk_context {
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
+    vk_gpu_telemetry gpu_telemetry;
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+    vk_expert_overlap expert_overlap;
+    uint64_t expert_pair_dispatches = 0;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed

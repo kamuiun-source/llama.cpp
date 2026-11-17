@@ -44,6 +44,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 // buffers
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0));
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
+extern thread_local bool ggml_vk_alloc_overlap_expert_buffer;
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(size_t size, int device_idx = -1);
 void ggml_vk_host_free(void * ptr);
@@ -72,7 +73,28 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
 // pipelines
 uint64_t vk_tensor_offset(const ggml_tensor * tensor);
 uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);
-void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx);
+enum vk_telemetry_cause {
+    VK_TEL_UNCLASSIFIED,
+    VK_TEL_GRAPH_COMPUTE,
+    VK_TEL_BACKEND_SYNC,
+    VK_TEL_SYNC_WRITE,
+    VK_TEL_SYNC_READ,
+    VK_TEL_SYNC_COPY,
+    VK_TEL_SLOT_MAP,
+    VK_TEL_EXPERT_UPLOAD,
+    VK_TEL_EXPERT_WRITEBACK,
+    VK_TEL_CAUSES,
+};
+
+class vk_telemetry_scope {
+    vk_telemetry_cause previous;
+public:
+    explicit vk_telemetry_scope(vk_telemetry_cause cause);
+    ~vk_telemetry_scope();
+};
+
+void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx, vk::Fence fence);
+vk::Result ggml_vk_wait_for_fences(vk::Device device, vk::Fence fence);
 void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n);
 void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence);

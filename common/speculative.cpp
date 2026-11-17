@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -211,6 +212,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    virtual bool keep_mtp_anchor(llama_seq_id, llama_pos, llama_token) { return false; }
+    virtual void discard_mtp_anchor(llama_seq_id) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1570,6 +1574,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    bool reuse_draft_anchor = false;
+    struct draft_anchor {
+        llama_pos pos = -1;
+        llama_token token = LLAMA_TOKEN_NULL;
+        llama_token candidate = LLAMA_TOKEN_NULL;
+        bool kept = false;
+    } anchor;
+    size_t n_reused_anchors = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1656,10 +1669,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
         }
+        const char * reuse = std::getenv("LLAMA_MTP_REUSE_DRAFT_ANCHOR");
+        if (reuse && std::strcmp(reuse, "1") == 0 && n_seq == 1 && n_mtp_layers == 1 && n_max == 1 &&
+                dev_rows && llama_n_ubatch(ctx_tgt) == 2 && llama_n_rs_seq(ctx_tgt) == 1 &&
+                llama_n_ubatch(ctx_dft) == 1 && llama_get_model(ctx_tgt) != llama_get_model(ctx_dft)) {
+            auto is_qwen4exp = [](const llama_model * model) {
+                char arch[32];
+                return llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                        std::strcmp(arch, "qwen4exp") == 0;
+            };
+            reuse_draft_anchor = is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
+        }
+
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (reuse_draft_anchor) {
+            SPC_INF("MTP draft anchor: reused=%zu\n", n_reused_anchors);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
             llama_set_embd_state_src(ctx_dft, nullptr);
@@ -1677,7 +1705,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.clear();
     }
 
+    bool keep_mtp_anchor(llama_seq_id seq_id, llama_pos pos, llama_token token) override {
+        if (!reuse_draft_anchor || seq_id != 0 || anchor.pos != pos || anchor.token != token ||
+                llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id) != pos) {
+            return false;
+        }
+        anchor.kept = true;
+        return true;
+    }
+
+    void discard_mtp_anchor(llama_seq_id seq_id) override {
+        if (seq_id != 0) {
+            return;
+        }
+        if (anchor.kept) {
+            auto * mem = llama_get_memory(params.ctx_dft);
+            if (llama_memory_seq_pos_max(mem, seq_id) >= anchor.pos &&
+                    !llama_memory_seq_rm(mem, seq_id, anchor.pos, -1)) {
+                GGML_ABORT("failed to discard the retained MTP draft anchor");
+            }
+        }
+        anchor = {};
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (reuse_draft_anchor) {
+            discard_mtp_anchor(seq_id);
+        }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -1699,11 +1753,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
-        if (batch_in.size() <= 0) {
-            return true;
-        }
-
-        if (!batch_in.has_token() && !batch_in.has_embd()) {
+        if (batch_in.size() <= 0 || (!batch_in.has_token() && !batch_in.has_embd())) {
+            if (anchor.kept) {
+                discard_mtp_anchor(0);
+            }
             return true;
         }
 
@@ -1729,6 +1782,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        bool reuse_anchor = false;
+        if (anchor.kept) {
+            if (n_tokens == 2) {
+                const auto & first = batch_in.tokens[0];
+                const auto & second = batch_in.tokens[1];
+                reuse_anchor = first.seq_id == 0 && second.seq_id == 0 && first.output && second.output &&
+                        first.id == anchor.token && first.pos[0] == anchor.pos && second.id == anchor.candidate &&
+                        second.pos[0] == anchor.pos + 1 &&
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) == anchor.pos;
+            }
+            if (!reuse_anchor) {
+                discard_mtp_anchor(0);
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1742,7 +1810,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dev_rows) {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    if (i_batch_beg[seq_id] >= 0) {
+                    if (i_batch_beg[seq_id] >= 0 && !reuse_anchor) {
                         llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
                     }
                 }
@@ -1750,7 +1818,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; k < n_tokens; ++k) {
+            for (int k = reuse_anchor ? 1 : 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
@@ -1842,11 +1910,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
         }
 
+        if (reuse_anchor) {
+            anchor = {};
+            ++n_reused_anchors;
+        }
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (reuse_draft_anchor) {
+            discard_mtp_anchor(0);
+        }
+        const bool anchor_has_prefix = reuse_draft_anchor && dparams[0].drafting && dparams[0].pos0 > 0 &&
+                llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) == dparams[0].pos0 - 1;
 
         batch.clear();
 
@@ -1953,7 +2031,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
-
+                // A one-token MTP draft decodes the sampled token, not the candidate it produces.
+                if (anchor_has_prefix && params.n_min <= 1) {
+                    anchor = {dp.pos0, dp.id_last, id, false};
+                }
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
@@ -2054,6 +2135,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        anchor = {};
     }
 };
 
@@ -3186,6 +3268,16 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+    }
+}
+
+bool common_speculative_keep_mtp_anchor(common_speculative * spec, llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    return spec && spec->impls.size() == 1 && spec->impls.front()->keep_mtp_anchor(seq_id, pos, token);
+}
+
+void common_speculative_discard_mtp_anchor(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec && spec->impls.size() == 1) {
+        spec->impls.front()->discard_mtp_anchor(seq_id);
     }
 }
 

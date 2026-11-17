@@ -199,6 +199,14 @@ static __global__ void hc_mix_up(
     }
 }
 
+static __global__ void hc_scale_silu(const float * src, float * dst, int n, float scale, float bias) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float value = scale * src[i] + bias;
+        dst[i] = ggml_cuda_op_silu_single(value);
+    }
+}
+
 static __global__ void hc_mix_silu_q8_1(const float * down, block_q8_1 * low, float scale) {
     const int k = blockIdx.x * QK8_1 + threadIdx.x;
     const float scaled = scale * down[k] + 0.0f;
@@ -462,6 +470,97 @@ static int hc_mix_fuse_at(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
 }
 
 #endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static constexpr int hc_inject_width = 10240;
+static constexpr int hc_inject_rows = 4;
+static constexpr int hc_inject_splits = 32;
+
+template<int tokens>
+static __global__ void hc_inject_partials(const float * weights, const float * input, float * partials) {
+    constexpr int lanes = ggml_cuda_get_physical_warp_size();
+    constexpr int width_per_split = hc_inject_width / hc_inject_splits;
+    const int split = blockIdx.x;
+    const int row = blockIdx.y;
+    const int offset = split * width_per_split + threadIdx.x;
+    float sums[tokens] = {};
+    for (int k = offset; k < (split + 1) * width_per_split; k += lanes) {
+        const float w = weights[row * hc_inject_width + k];
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+            sums[t] = fmaf(w, input[t * hc_inject_width + k], sums[t]);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+        const float sum = warp_reduce_sum(sums[t]);
+        if (threadIdx.x == 0) {
+            partials[(t * hc_inject_rows + row) * hc_inject_splits + split] = sum;
+        }
+    }
+}
+
+static __global__ void hc_inject_reduce(const float * partials, float * dst) {
+    const float sum = warp_reduce_sum(partials[blockIdx.x * hc_inject_splits + threadIdx.x]);
+    if (threadIdx.x == 0) {
+        dst[blockIdx.x] = sum;
+    }
+}
+#endif
+
+bool ggml_cuda_hc_inject_split(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    return false;
+#else
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            device.cc != GGML_CUDA_CC_ADA_LOVELACE || device.warp_size != hc_inject_splits ||
+            src0->ne[0] != hc_inject_width || src0->ne[1] != hc_inject_rows || src1->ne[0] != hc_inject_width ||
+            src1->ne[1] < 1 || src1->ne[1] > 2 || !ggml_is_matrix(src0) || !ggml_is_matrix(src1) ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+            ggml_cuda_hc_projection_for_weight(src0->name) != GGML_CUDA_HC_INJECT) {
+        return false;
+    }
+    const int tokens = src1->ne[1];
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), tokens * hc_inject_rows * hc_inject_splits);
+    const ggml_cuda_kernel_launch_params first(dim3(hc_inject_splits, hc_inject_rows), dim3(device.warp_size), 0, ctx.stream());
+    const float * weights = (const float *) src0->data;
+    const float * input = (const float *) src1->data;
+    if (tokens == 1) {
+        ggml_cuda_kernel_launch(hc_inject_partials<1>, first, weights, input, partials.get());
+    } else {
+        ggml_cuda_kernel_launch(hc_inject_partials<2>, first, weights, input, partials.get());
+    }
+    const ggml_cuda_kernel_launch_params last(dim3(tokens * hc_inject_rows), dim3(device.warp_size), 0, ctx.stream());
+    ggml_cuda_kernel_launch(hc_inject_reduce, last, partials.get(), (float *) dst->data);
+    static const bool logged = (GGML_LOG_INFO("CUDA HC inject split applied\n"), true);
+    GGML_UNUSED(logged);
+    return true;
+#endif
+}
+
+void ggml_cuda_hc_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(scale);
+    GGML_UNUSED(dst);
+#else
+    const int n = (int) ggml_nelements(dst);
+    hc_scale_silu<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
+            static_cast<const float *>(scale->src[0]->data), static_cast<float *>(dst->data), n,
+            ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1));
+    CUDA_CHECK(cudaGetLastError());
+    static const bool logged = [] {
+        GGML_LOG_INFO("CUDA HC scale SiLU fusion applied\n");
+        return true;
+    }();
+    GGML_UNUSED(logged);
+#endif
+}
 
 int ggml_cuda_hc_mix_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)

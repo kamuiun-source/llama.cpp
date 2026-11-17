@@ -179,6 +179,18 @@ LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, l
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+LLAMA_API void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uint64_t & splits);
+
+// Cumulative packed Expert upload counts and H2D bytes on the calling thread.
+LLAMA_API void llama_get_expert_miss_telemetry(uint64_t * bins, size_t n_bins, uint64_t & bytes, uint64_t & bytes_3plus);
+struct llama_expert_transfer_telemetry {
+    uint64_t requests = 0;
+    uint64_t misses = 0;
+    uint64_t promotions = 0;
+    uint64_t writeback_bytes = 0;
+};
+LLAMA_API llama_expert_transfer_telemetry llama_get_expert_transfer_telemetry();
+
 // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
 // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
 // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).

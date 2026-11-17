@@ -7,6 +7,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_rtx_expert;
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -28,6 +29,7 @@ public:
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w, bool cold = false) const;
     ggml_tensor * get_cold_slot_map(int32_t il) const;
+    llama_rtx_expert * get_rtx_expert() const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
@@ -35,7 +37,9 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool early_copy_enabled() const;
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early = false);
+    bool router_host_ids_enabled() const;
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile,
+            bool early = false, ggml_backend_sched_t sched = nullptr);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

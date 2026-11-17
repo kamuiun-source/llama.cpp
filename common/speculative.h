@@ -92,6 +92,10 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// A retained draft anchor must be consumed by process or discarded before releasing the slot.
+bool common_speculative_keep_mtp_anchor(common_speculative * spec, llama_seq_id seq_id, llama_pos pos, llama_token token);
+void common_speculative_discard_mtp_anchor(common_speculative * spec, llama_seq_id seq_id);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

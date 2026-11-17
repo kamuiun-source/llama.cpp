@@ -809,6 +809,9 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    if (moe_cache && moe_cache->router_host_ids_enabled()) {
+        ggml_backend_sched_set_host_copy_capture(sched.get(), true);
+    }
     if (moe_cache && moe_cache->early_copy_enabled()) {
         ggml_backend_sched_set_early_copy_callback(sched.get(),
                 [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -3207,16 +3210,28 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    static const bool telemetry = [] {
+        const char * env = std::getenv("LLAMA_DECODE_TELEMETRY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (telemetry && status == GGML_STATUS_SUCCESS) {
+        ++telemetry_graphs;
+        telemetry_splits += ggml_backend_sched_get_n_splits(sched.get());
+    }
 
     return status;
+}
+
+void llama_context::get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const {
+    graphs = telemetry_graphs;
+    splits = telemetry_splits;
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active)) {
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active, false, lctx->sched.get())) {
         return true;
     }
 
@@ -5285,4 +5300,8 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uint64_t & splits) {
+    ctx->get_sched_telemetry(graphs, splits);
 }

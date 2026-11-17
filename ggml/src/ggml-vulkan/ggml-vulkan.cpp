@@ -1,5 +1,243 @@
 #include "ggml-vulkan-common.h"
 
+#include <cinttypes>
+
+enum vk_telemetry_field {
+    VK_TEL_COMPUTE_SUBMITS,
+    VK_TEL_TRANSFER_SUBMITS,
+    VK_TEL_SUBMIT_NS,
+    VK_TEL_FENCE_WAITS,
+    VK_TEL_FENCE_WAIT_NS,
+    VK_TEL_RECORD_NS,
+    VK_TEL_FENCE_SPINS,
+    VK_TEL_FENCE_SPIN_NS,
+    VK_TEL_SEMAPHORE_WAITS,
+    VK_TEL_SEMAPHORE_WAIT_NS,
+    VK_TEL_FIELDS,
+};
+
+static thread_local std::array<uint64_t, VK_TEL_FIELDS> vk_telemetry_totals{};
+static thread_local std::array<uint64_t, VK_TEL_CAUSES * VK_TEL_FIELDS> vk_telemetry_detail{};
+enum vk_gpu_telemetry_field {
+    VK_GPU_SEGMENTS,
+    VK_GPU_SEGMENT_NS,
+    VK_GPU_DROPPED,
+    VK_GPU_QUERY_READ_NS,
+    VK_GPU_FIELDS,
+};
+static thread_local std::array<uint64_t, VK_GPU_FIELDS> vk_gpu_telemetry_totals{};
+static thread_local vk_telemetry_cause vk_telemetry_current = VK_TEL_UNCLASSIFIED;
+
+static constexpr const char * vk_telemetry_cause_names[] = {
+    "unclassified", "graph_compute", "backend_sync", "sync_write", "sync_read", "sync_copy",
+    "slot_map", "expert_upload", "expert_writeback",
+};
+static_assert(sizeof(vk_telemetry_cause_names) / sizeof(*vk_telemetry_cause_names) == VK_TEL_CAUSES);
+
+static bool ggml_vk_telemetry_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_DECODE_TELEMETRY");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+vk_telemetry_scope::vk_telemetry_scope(vk_telemetry_cause cause) : previous(VK_TEL_CAUSES) {
+    if (ggml_vk_telemetry_enabled() && vk_telemetry_current == VK_TEL_UNCLASSIFIED) {
+        previous = vk_telemetry_current;
+        vk_telemetry_current = cause;
+    }
+}
+
+vk_telemetry_scope::~vk_telemetry_scope() {
+    if (previous != VK_TEL_CAUSES) {
+        vk_telemetry_current = previous;
+    }
+}
+
+static const char * ggml_backend_vk_set_telemetry_cause(const char * name) {
+    if (!name || !ggml_vk_telemetry_enabled()) {
+        return nullptr;
+    }
+    const auto previous = vk_telemetry_current;
+    for (int i = 0; i < VK_TEL_CAUSES; ++i) {
+        if (strcmp(name, vk_telemetry_cause_names[i]) == 0) {
+            vk_telemetry_current = static_cast<vk_telemetry_cause>(i);
+            break;
+        }
+    }
+    return vk_telemetry_cause_names[previous];
+}
+
+static void ggml_backend_vk_get_telemetry_detail(uint64_t * cpu, uint64_t * gpu) {
+    std::copy(vk_telemetry_detail.begin(), vk_telemetry_detail.end(), cpu);
+    std::copy(vk_gpu_telemetry_totals.begin(), vk_gpu_telemetry_totals.end(), gpu);
+}
+
+thread_local bool ggml_vk_alloc_overlap_expert_buffer = false;
+
+static bool ggml_vk_expert_overlap_requested() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_EXPERT_VK_OVERLAP_UPLOAD");
+        return env && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_expert_full_hot_requested() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_EXPERT_VK_FULL_HOT_OVERLAP");
+        return env && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_expert_pair_requested() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_EXPERT_VK_PAIR_IQ4_NL");
+        return env && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_expert_overlap_supported(const vk_device & device) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(device);
+    return false;
+#else
+    return ggml_vk_expert_overlap_requested() && device->compute_queue && device->transfer_queue &&
+           device->compute_queue->queue_family_index != device->transfer_queue->queue_family_index &&
+           !device->async_use_transfer_queue && !device->serialize_submissions;
+#endif
+}
+
+static bool ggml_vk_reuse_graph_fence_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_REUSE_GRAPH_FENCE");
+        return env && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static uint64_t ggml_vk_submit_wait_ns() {
+    return vk_telemetry_totals[VK_TEL_SUBMIT_NS] + vk_telemetry_totals[VK_TEL_FENCE_WAIT_NS] +
+           vk_telemetry_totals[VK_TEL_FENCE_SPIN_NS] + vk_telemetry_totals[VK_TEL_SEMAPHORE_WAIT_NS];
+}
+
+class vk_telemetry_timer {
+    using clock = std::chrono::steady_clock;
+
+    vk_telemetry_field time_field;
+    bool active;
+    vk_telemetry_cause cause = VK_TEL_UNCLASSIFIED;
+    clock::time_point start;
+    uint64_t submit_wait_before = 0;
+
+public:
+    explicit vk_telemetry_timer(vk_telemetry_field time_field, vk_telemetry_field count_field = VK_TEL_FIELDS) :
+            time_field(time_field), active(ggml_vk_telemetry_enabled()) {
+        if (active) {
+            cause = vk_telemetry_current;
+            start = clock::now();
+            if (count_field != VK_TEL_FIELDS) {
+                ++vk_telemetry_totals[count_field];
+                ++vk_telemetry_detail[cause * VK_TEL_FIELDS + count_field];
+            }
+            if (time_field == VK_TEL_RECORD_NS) {
+                submit_wait_before = ggml_vk_submit_wait_ns();
+            }
+        }
+    }
+
+    ~vk_telemetry_timer() {
+        stop();
+    }
+
+    void stop() {
+        if (!active) {
+            return;
+        }
+        active = false;
+        auto ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count());
+        if (time_field == VK_TEL_RECORD_NS) {
+            // Buffer growth during graph recording can submit and wait.
+            ns -= std::min(ns, ggml_vk_submit_wait_ns() - submit_wait_before);
+        }
+        vk_telemetry_totals[time_field] += ns;
+        vk_telemetry_detail[cause * VK_TEL_FIELDS + time_field] += ns;
+    }
+};
+
+static void ggml_backend_vk_get_telemetry(uint64_t * totals) {
+    std::copy(vk_telemetry_totals.begin(), vk_telemetry_totals.end(), totals);
+}
+
+vk::Result ggml_vk_wait_for_fences(vk::Device device, vk::Fence fence) {
+    vk_telemetry_timer timer(VK_TEL_FENCE_WAIT_NS, VK_TEL_FENCE_WAITS);
+    return device.waitForFences({ fence }, true, UINT64_MAX);
+}
+
+static void ggml_vk_gpu_telemetry_start(vk_context & ctx) {
+    auto * timing = ctx->gpu_telemetry;
+    if (!timing || !ctx->s || ctx->s->gpu_sample != -1) {
+        return;
+    }
+    auto & sub = *ctx->s;
+    const auto slot = std::find(timing->samples.begin(), timing->samples.end(), vk_gpu_telemetry::free);
+    if (slot == timing->samples.end()) {
+        sub.gpu_sample = -2;
+        ++vk_gpu_telemetry_totals[VK_GPU_DROPPED];
+        return;
+    }
+    *slot = vk_gpu_telemetry::recording;
+    sub.gpu_sample = int32_t(slot - timing->samples.begin());
+    const uint32_t query = 2 * sub.gpu_sample;
+    sub.buffer->buf.resetQueryPool(timing->pool, query, 2);
+    sub.buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, timing->pool, query);
+}
+
+static void ggml_vk_gpu_telemetry_read(ggml_backend_vk_context * ctx) {
+    auto & timing = ctx->gpu_telemetry;
+    if (!timing.pool) {
+        return;
+    }
+    const uint64_t mask = UINT64_MAX >> (64 - timing.valid_bits);
+    const double period = ctx->device->properties.limits.timestampPeriod;
+    const auto read_start = std::chrono::steady_clock::now();
+    // Only submitted pairs are covered by the compute fence.
+    for (uint32_t first = 0; first < timing.samples.size();) {
+        if (timing.samples[first] != vk_gpu_telemetry::submitted) {
+            ++first;
+            continue;
+        }
+        uint32_t end = first + 1;
+        while (end < timing.samples.size() && timing.samples[end] == vk_gpu_telemetry::submitted) {
+            ++end;
+        }
+        const uint32_t count = end - first;
+        std::array<uint64_t, 2 * vk_gpu_telemetry::capacity> ticks;
+        const auto res = ctx->device->device.getQueryPoolResults(timing.pool, 2 * first, 2 * count,
+                2 * count * sizeof(uint64_t), ticks.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+        if (res == vk::Result::eSuccess) {
+            for (uint32_t j = 0; j < count; ++j) {
+                const double ns = double((ticks[2*j + 1] - ticks[2*j]) & mask) * period;
+                if (ns >= double(UINT64_MAX)) {
+                    ++vk_gpu_telemetry_totals[VK_GPU_DROPPED];
+                    continue;
+                }
+                ++vk_gpu_telemetry_totals[VK_GPU_SEGMENTS];
+                vk_gpu_telemetry_totals[VK_GPU_SEGMENT_NS] += uint64_t(ns);
+            }
+        } else {
+            vk_gpu_telemetry_totals[VK_GPU_DROPPED] += count;
+        }
+        std::fill(timing.samples.begin() + first, timing.samples.begin() + end, vk_gpu_telemetry::free);
+        first = end;
+    }
+    vk_gpu_telemetry_totals[VK_GPU_QUERY_READ_NS] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - read_start).count();
+}
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -338,20 +576,21 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
-void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx, vk::Fence fence) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
+        VK_CHECK(ggml_vk_wait_for_fences(ctx->device->device, ctx->almost_ready_fence), "almost_ready_fence", ctx->device);
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
     }
 
     // Spin (w/pause) waiting for the graph to finish executing.
+    vk_telemetry_timer spin(VK_TEL_FENCE_SPIN_NS, VK_TEL_FENCE_SPINS);
     vk::Result result;
     for (;;) {
         try {
-            result = ctx->device->device.getFenceStatus(ctx->fence);
+            result = ctx->device->device.getFenceStatus(fence);
         } catch (vk::DeviceLostError &) {
             ggml_vk_print_device_lost_info(ctx->device);
             GGML_LOG_ERROR("ggml_vulkan: getFenceStatus at %s:%d\n", __FILE__, __LINE__);
@@ -377,7 +616,8 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             YIELD();
         }
     }
-    ctx->device->device.resetFences({ ctx->fence });
+    spin.stop();
+    ctx->device->device.resetFences({ fence });
 }
 
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
@@ -978,8 +1218,42 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    auto * owner = ctx->expert_overlap_owner;
+    bool hot = false;
+    bool wait = false;
+    if (owner && owner->expert_overlap.transfer_pending) {
+        for (const auto & sequence : ctx->seqs) {
+            for (const auto & submission : sequence) {
+                hot |= submission.expert_hot;
+                wait |= submission.expert_wait;
+            }
+        }
+    }
     ctx->p->q->handle->submit(submit_infos, fence);
+    if (owner) {
+        auto & overlap = owner->expert_overlap;
+        overlap.wait_submitted |= wait;
+        if (hot && wait) {
+            ++overlap.paired_submits;
+            if (ggml_vk_telemetry_enabled()) {
+                uint64_t value = 0;
+                if (owner->device->device.getSemaphoreCounterValue(owner->transfer_semaphore.s, &value) == vk::Result::eSuccess &&
+                        value < owner->transfer_semaphore.value) {
+                    ++overlap.transfer_pending_at_compute_submit;
+                }
+            }
+        }
+    }
 
+    if (ctx->gpu_telemetry) {
+        for (const auto & sequence : ctx->seqs) {
+            for (const auto & submission : sequence) {
+                if (submission.gpu_sample >= 0) {
+                    ctx->gpu_telemetry->samples[submission.gpu_sample] = vk_gpu_telemetry::submitted;
+                }
+            }
+        }
+    }
     ctx->seqs.clear();
 }
 
@@ -1051,6 +1325,7 @@ std::unique_ptr<vk_queue> ggml_vk_create_queue(vk_device& device, uint32_t queue
 
     h->queue = device->device.getQueue2(queue_info2);
     h->device = device;
+    h->transfer_only = transfer_only;
     // Avoid concurrent submissions on NVIDIA due to driver bug.
     if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
         h->device_submit_mutex = &device->queue_submit_mutex;
@@ -1079,6 +1354,14 @@ vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_command_pool
     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
     ctx->gc.contexts.emplace_back(result);
     result->p = &p;
+    if (&p == &ctx->compute_cmd_pool) {
+        if (ctx->gpu_telemetry.pool) {
+            result->gpu_telemetry = &ctx->gpu_telemetry;
+        }
+        if (ctx->expert_overlap.enabled) {
+            result->expert_overlap_owner = ctx;
+        }
+    }
     return result;
 }
 
@@ -3246,6 +3529,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+        if (ggml_vk_expert_pair_requested()) {
+            const uint64_t pair_len[] = {mul_mat_vec_id_iq4_nl_pair_len, mul_mat_vec_id_iq4_nl_pair_subgroup_len,
+                                         mul_mat_vec_id_iq4_nl_pair_subgroup_no_shmem_len};
+            const void * pair_data[] = {mul_mat_vec_id_iq4_nl_pair_data, mul_mat_vec_id_iq4_nl_pair_subgroup_data,
+                                        mul_mat_vec_id_iq4_nl_pair_subgroup_no_shmem_data};
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[w], "mul_mat_vec_id_iq4_nl_pair",
+                pair_len[reduc16], pair_data[reduc16], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_pair_push_constants),
+                {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_MXFP4],   "mul_mat_vec_id_mxfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_NVFP4],   "mul_mat_vec_id_nvfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
 
@@ -5194,6 +5486,11 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->idx = idx;
 
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
+        if (ggml_vk_telemetry_enabled()) {
+            GGML_LOG_INFO("ggml_vulkan: %s queue topology compute_family=%u transfer_family=%u shared_queue=%d async_transfer=%d serialize_submissions=%d\n",
+                    device->name.c_str(), compute_queue_family_index, transfer_queue_family_index, device->single_queue,
+                    device->async_use_transfer_queue, device->serialize_submissions);
+        }
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
 
@@ -5775,7 +6072,31 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
     ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
-    if (ctx->device->async_use_transfer_queue) {
+#ifndef GGML_VULKAN_CHECK_RESULTS
+    const char * timing_device = getenv("GGML_VK_GPU_TIMESTAMPS_DEVICE");
+    if (ggml_vk_telemetry_enabled() && timing_device && ctx->name == timing_device &&
+            !ctx->device->async_use_transfer_queue && !ctx->device->serialize_submissions && !vk_perf_logger_enabled) {
+        const uint32_t family = ctx->device->compute_queue->queue_family_index;
+        const uint32_t bits = ctx->device->physical_device.getQueueFamilyProperties()[family].timestampValidBits;
+        const float period = ctx->device->properties.limits.timestampPeriod;
+        if (bits > 0 && bits <= 64 && std::isfinite(period) && period > 0.0f) {
+            try {
+                ctx->gpu_telemetry.pool = ctx->device->device.createQueryPool({
+                    {}, vk::QueryType::eTimestamp, 2 * vk_gpu_telemetry::capacity
+                });
+                ctx->gpu_telemetry.valid_bits = bits;
+                GGML_LOG_INFO("ggml_vulkan: %s compute timestamps family=%u valid_bits=%u period_ns=%.6g\n",
+                        ctx->name.c_str(), family, bits, double(period));
+            } catch (const vk::SystemError & e) {
+                GGML_LOG_WARN("ggml_vulkan: %s compute timestamps unavailable: %s\n", ctx->name.c_str(), e.what());
+            }
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: %s compute timestamps unsupported for family %u\n", ctx->name.c_str(), family);
+        }
+    }
+#endif
+    ctx->expert_overlap.enabled = ggml_vk_expert_overlap_supported(ctx->device) && !vk_perf_logger_enabled;
+    if (ctx->device->async_use_transfer_queue || ctx->expert_overlap.enabled) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
         vk::SemaphoreCreateInfo ci{};
         ci.setPNext(&tci);
@@ -5923,7 +6244,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
 }
 
-static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k) {
+static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k, bool pair = false) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec_id()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_Q8_1);
 
@@ -6008,7 +6329,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         return ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];
     }
 
-    return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
+    return pair ? ctx->device->pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[dmmv_wg] :
+                  ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
 vk_subbuffer ggml_vk_tensor_subbuffer(
@@ -6084,6 +6406,10 @@ void ggml_vk_ctx_end(vk_context& ctx) {
         vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT(ctx->s->buffer->buf);
     }
 
+    if (ctx->s->gpu_sample >= 0) {
+        ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands,
+                ctx->gpu_telemetry->pool, 2 * ctx->s->gpu_sample + 1);
+    }
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -8056,7 +8382,31 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+static uint32_t ggml_vk_expert_position_count(uint32_t mask) {
+    uint32_t count = 0;
+    while (mask) {
+        mask &= mask - 1;
+        ++count;
+    }
+    return count;
+}
+
+static void ggml_vk_expert_overlap_join(ggml_backend_vk_context * ctx, vk_context & subctx) {
+    subctx->s->wait_semaphores.push_back(ctx->transfer_semaphore);
+    subctx->s->expert_wait = true;
+    ctx->expert_overlap.wait_recorded = true;
+}
+
+static bool ggml_vk_mmv_id_quantize_y(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const auto * src0 = dst->src[0];
+    const auto * src1 = dst->src[1];
+    return ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+        (src1->ne[1] * src1->ne[0]) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) &&
+        ggml_vk_should_use_mmvq(ctx->device, src0->ne[1], src1->ne[2], src1->ne[0], src0->type);
+}
+
+static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph,
+                                        int node_idx, const uint32_t * expert_masks = nullptr) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
@@ -8077,7 +8427,6 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint64_t ne10 = src1->ne[0];
     const uint64_t ne11 = src1->ne[1];
-    const uint64_t ne12 = src1->ne[2];
     // const uint64_t ne13 = src1->ne[3];
 
     const uint64_t nei0 = ids->ne[0];
@@ -8093,7 +8442,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = !y_non_contig && ggml_vk_mmv_id_quantize_y(ctx, dst);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -8166,7 +8515,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1 * (ctx->expert_overlap.projection == dst ? 2 : 1));
     }
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
@@ -8265,13 +8614,24 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
-    // Loop over the batch dimension
-    for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+    vk_pipeline pair;
+    if (ggml_vk_expert_pair_requested() && src0->type == GGML_TYPE_IQ4_NL &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !quantize_y &&
+            ctx->num_additional_fused_ops == 0 && nei1 == 2 && nei0 > 0 && nei0 <= 32 &&
+            ne11 == nei0 && src1->ne[2] == 2 && src1->ne[3] == 1 &&
+            ne21 == nei0 && dst->ne[2] == 2 && dst->ne[3] == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(ids) && ggml_is_contiguous(dst) &&
+            ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+            x_ne <= UINT32_MAX && y_ne <= UINT32_MAX && ggml_nelements(dst) <= UINT32_MAX) {
+        pair = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00, true);
+    }
+
+    const auto dispatch = [&](uint32_t expert_i1, uint32_t expert_mask, uint32_t positions) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
-            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1, expert_mask
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
@@ -8282,7 +8642,68 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_F1,
                 d_ids,
             },
-            pc, { groups_x, (uint32_t)nei0, groups_z });
+            pc, { groups_x, positions, groups_z });
+    };
+
+    const auto dispatch_masks = [&](const uint32_t * masks) {
+        if (pair && masks[0] && masks[1]) {
+            const uint32_t count = ggml_vk_expert_position_count(masks[0]) + ggml_vk_expert_position_count(masks[1]);
+            const vk_mat_vec_id_pair_push_constants pc = {
+                {
+                    (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                    stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
+                    0, (uint32_t)nei0, (uint32_t)ne11, 0, nbi1, masks[0]
+                },
+                masks[1], (uint32_t)src0->ne[2],
+            };
+            // The descriptor sets reserved for the single-token dispatches also cover this dispatch.
+            ggml_pipeline_request_descriptor_sets(ctx, pair, 0);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pair, { d_X, d_Y, d_D, d_F0, d_F1, d_ids },
+                                      pc, { groups_x, count, groups_z });
+            ++ctx->expert_pair_dispatches;
+            return;
+        }
+        for (uint32_t token = 0; token < nei1; ++token) {
+            const uint32_t count = ggml_vk_expert_position_count(masks[token]);
+            if (count) {
+                dispatch(token, masks[token], count);
+            }
+        }
+    };
+
+    auto & overlap = ctx->expert_overlap;
+    if (expert_masks) {
+        dispatch_masks(expert_masks);
+    } else if (overlap.projection == dst) {
+        GGML_ASSERT(overlap.transfer_pending && !overlap.wait_recorded);
+        const uint32_t full = UINT32_MAX >> (32 - nei0);
+        subctx->s->expert_hot = true;
+        uint32_t hot_masks[2] = {};
+        uint32_t cold_masks[2] = {};
+        for (uint32_t token = 0; token < nei1; ++token) {
+            hot_masks[token] = overlap.hot_masks[token] | overlap.excluded_masks[token];
+            cold_masks[token] = full & ~hot_masks[token];
+            overlap.hot_positions += ggml_vk_expert_position_count(overlap.hot_masks[token]);
+            overlap.cold_positions += ggml_vk_expert_position_count(cold_masks[token]);
+        }
+        dispatch_masks(hot_masks);
+
+        // The wait belongs to the second VkSubmitInfo, after the hot work.
+        ggml_vk_ctx_begin(ctx->device, subctx);
+        ggml_vk_expert_overlap_join(ctx, subctx);
+        ggml_vk_gpu_telemetry_start(subctx);
+        ggml_vk_sync_buffers(nullptr, subctx);
+        dispatch_masks(cold_masks);
+        overlap.projection = nullptr;
+        ++overlap.split_projections;
+    } else if (pair) {
+        const uint32_t full = UINT32_MAX >> (32 - nei0);
+        const uint32_t masks[2] = { full, full };
+        dispatch_masks(masks);
+    } else {
+        for (uint32_t token = 0; token < nei1; ++token) {
+            dispatch(token, 0, (uint32_t)nei0);
+        }
     }
 
     if (x_non_contig) {
@@ -8312,6 +8733,11 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
+        if (ctx->expert_overlap.projection == dst) {
+            ggml_vk_expert_overlap_join(ctx, subctx);
+            ctx->expert_overlap.projection = nullptr;
+            ++ctx->expert_overlap.fallback_joins;
+        }
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
     }
 }
@@ -11521,7 +11947,9 @@ void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, std::move(p));
 }
 
-void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_vk_glu_masked(ggml_backend_vk_context * ctx, vk_context & subctx,
+                               const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                               const uint32_t * expert_masks) {
     const float * op_params_f = (const float *)dst->op_params;
 
     const bool swapped = (bool)dst->op_params[1];
@@ -11566,7 +11994,13 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
             (uint32_t)dst->ne[2],
             0,
             0, 0, 0, 0, 0, 0,
+            {expert_masks ? expert_masks[0] : 0, expert_masks ? expert_masks[1] : 0},
         });
+}
+
+void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                 ggml_tensor * dst) {
+    ggml_vk_glu_masked(ctx, subctx, src0, src1, dst, nullptr);
 }
 
 void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -12741,7 +13175,200 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
-bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+static constexpr int vk_expert_ffn_max_nodes = 5;
+
+static int ggml_vk_expert_full_hot_count(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int start) {
+    if (ctx->expert_overlap.excluded_masks[0] || ctx->expert_overlap.excluded_masks[1]) {
+        return 0;
+    }
+
+    const auto * first = graph->nodes[start];
+    const auto * ids = first->src[2];
+    if (!ids->buffer || ids->buffer->buft != &ctx->device->buffer_type) {
+        return 0;
+    }
+    const ggml_op mm = GGML_OP_MUL_MAT_ID;
+    const ggml_op view = GGML_OP_VIEW;
+    const ggml_op glu = GGML_OP_GLU;
+    const bool separate = start + 3 < graph->n_nodes &&
+        ggml_can_fuse_subgraph(graph, start, { mm, mm, glu, mm }, { start + 3 });
+    if (!separate && (start + 4 >= graph->n_nodes ||
+            !ggml_can_fuse_subgraph(graph, start, { mm, view, view, glu, mm }, { start + 4 }))) {
+        return 0;
+    }
+    const int count = separate ? 4 : 5;
+    const auto * second = graph->nodes[start + 1];
+    const auto * third = graph->nodes[start + 2];
+    const auto * act = graph->nodes[start + count - 2];
+    const auto * down = graph->nodes[start + count - 1];
+    const auto * gate = separate ? first : second;
+    const auto * up = separate ? second : third;
+    if (ggml_get_glu_op(act) != GGML_GLU_OP_SWIGLU ||
+            !((act->src[0] == gate && act->src[1] == up) || (act->src[0] == up && act->src[1] == gate)) ||
+            down->src[1] != act || (separate && second->src[1] != first->src[1]) ||
+            (!separate && (second->view_src != first || third->view_src != first))) {
+        return 0;
+    }
+    for (int j = 0; j < count; ++j) {
+        const auto * t = graph->nodes[start + j];
+        if (!t->buffer || t->buffer->buft != &ctx->device->buffer_type ||
+                t->type != GGML_TYPE_F32 || t->ne[1] != ids->ne[0] || t->ne[2] != ids->ne[1] || t->ne[3] != 1) {
+            return 0;
+        }
+        if (t->op == view) {
+            continue;
+        }
+        if (t->view_src || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+        if (t->op == mm) {
+            const auto * w = t->src[0];
+            const auto * x = t->src[1];
+            if (t->src[2] != ids || !w->buffer || w->buffer->buft != &ctx->device->buffer_type ||
+                    w->view_src || !static_cast<const ggml_backend_vk_buffer_context *>(w->buffer->context)->dev_buffer->expert_concurrent ||
+                    !ggml_is_contiguous(w) || !x->buffer || x->buffer->buft != &ctx->device->buffer_type ||
+                    x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+                    !ggml_vk_use_mul_mat_vec_id(t)) {
+                return 0;
+            }
+            if (ggml_vk_mmv_id_quantize_y(ctx, t) &&
+                    ggml_vk_get_dequantize_mul_mat_vec_id(ctx, w->type, GGML_TYPE_Q8_1, t->ne[0], w->ne[0])) {
+                if (t == down) {
+                    // The Q8 converter would read activation rows from the other phase.
+                    ++ctx->expert_overlap.split_ffn_fallback_down_q8;
+                    return 0;
+                }
+                const size_t bytes = ggml_row_size(GGML_TYPE_Q8_1, ggml_vk_align_size(ggml_nelements(x), 128));
+                // Do not grow prealloc_y during a pending transfer.
+                if (!ctx->prealloc_y || ctx->prealloc_size_y < bytes) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
+
+static size_t ggml_vk_expert_full_hot_scratch_size(const ggml_backend_vk_context * ctx, ggml_tensor * const * nodes, int count) {
+    const auto alignment = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    bool need_scratch = false;
+    size_t size = 0;
+    for (int j = 0; j < count; ++j) {
+        const auto * dst = nodes[j];
+        if (dst->op == GGML_OP_VIEW) {
+            continue;
+        }
+        size += ggml_vk_align_size(ggml_nbytes(dst), alignment);
+        for (int i = 0; i < j; ++i) {
+            // Exact in-place GLU is safe because both phases use the same lane offsets.
+            const bool elementwise = dst->op == GGML_OP_GLU && (dst->src[0] == nodes[i] || dst->src[1] == nodes[i]);
+            need_scratch |= ggml_vk_tensors_overlap(dst, nodes[i], elementwise);
+        }
+        for (int i = 0; i < count; ++i) {
+            const auto * mm = nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            for (int s : { 0, 1, 2 }) {
+                const auto * src = mm->src[s];
+                if (i == count - 1 && s == 1) {
+                    continue; // Down reads the internal activation.
+                }
+                need_scratch |= ggml_vk_tensors_overlap(dst, src, false);
+            }
+        }
+    }
+    return need_scratch ? size : 0;
+}
+
+static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * const * nodes,
+                                        int count, bool scratch) {
+    auto & overlap = ctx->expert_overlap;
+    const int act = count - 2;
+    const int down = count - 1;
+    ggml_tensor local[vk_expert_ffn_max_nodes];
+    ggml_tensor * ffn[vk_expert_ffn_max_nodes];
+    auto * buffer = overlap.ffn_scratch.get();
+    const auto alignment = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    size_t offset = 0;
+    for (int j = 0; j < count; ++j) {
+        ffn[j] = nodes[j];
+        if (!scratch) {
+            continue;
+        }
+        local[j] = *nodes[j];
+        auto & t = local[j];
+        for (int i = 0; i < j; ++i) {
+            for (auto & src : t.src) {
+                if (src == nodes[i]) {
+                    src = ffn[i];
+                }
+            }
+            if (t.view_src == nodes[i]) {
+                t.view_src = ffn[i];
+            }
+        }
+        t.buffer = buffer;
+        if (t.view_src) {
+            t.data = static_cast<uint8_t *>(t.view_src->data) + t.view_offs;
+        } else {
+            t.data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer)) + offset;
+            offset += ggml_vk_align_size(ggml_nbytes(&t), alignment);
+        }
+        ffn[j] = &t;
+    }
+    const auto * ids = nodes[0]->src[2];
+    const uint32_t full = UINT32_MAX >> (32 - ids->ne[0]);
+    uint32_t cold_masks[2] = {};
+    for (int token = 0; token < ids->ne[1]; ++token) {
+        cold_masks[token] = full ^ overlap.hot_masks[token];
+        overlap.hot_positions += ggml_vk_expert_position_count(overlap.hot_masks[token]);
+        overlap.cold_positions += ggml_vk_expert_position_count(cold_masks[token]);
+    }
+    const int fused = ctx->num_additional_fused_ops;
+    ctx->num_additional_fused_ops = 0;
+    ggml_cgraph local_graph = {};
+    local_graph.n_nodes = count;
+    local_graph.nodes = ffn;
+    const auto phase = [&](const uint32_t * masks) {
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 0, masks);
+        if (ffn[1]->op == GGML_OP_MUL_MAT_ID) {
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 1, masks);
+        }
+        ggml_vk_sync_buffers(nullptr, subctx);
+        ggml_vk_glu_masked(ctx, subctx, ffn[act]->src[0], ffn[act]->src[1], ffn[act], masks);
+        ggml_vk_sync_buffers(nullptr, subctx);
+        ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, down, masks);
+    };
+    GGML_ASSERT(overlap.transfer_pending && !overlap.wait_recorded);
+    if (scratch) {
+        ggml_vk_sync_buffers(nullptr, subctx);
+    }
+    subctx->s->expert_hot = true;
+    phase(overlap.hot_masks);
+    ggml_vk_ctx_begin(ctx->device, subctx);
+    ggml_vk_expert_overlap_join(ctx, subctx);
+    ggml_vk_gpu_telemetry_start(subctx);
+    ggml_vk_sync_buffers(nullptr, subctx);
+    phase(cold_masks);
+    if (scratch) {
+        ggml_vk_sync_buffers(nullptr, subctx);
+        auto src = ggml_vk_tensor_subbuffer(ctx, ffn[down]);
+        auto dst = ggml_vk_tensor_subbuffer(ctx, nodes[down]);
+        ggml_vk_buffer_copy_async(subctx, dst.buffer, dst.offset, src.buffer, src.offset, ggml_nbytes(nodes[down]));
+        ++overlap.split_ffn_scratch;
+    }
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->num_additional_fused_ops = fused;
+    overlap.projection = nullptr;
+    ++overlap.split_ffns;
+}
+
+bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin,
+                         int node_idx_begin, bool last_node, bool almost_ready, bool submit, int full_hot_count, bool full_hot_scratch) {
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
@@ -12750,6 +13377,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         return false;
     }
 
+    vk_telemetry_timer record(VK_TEL_RECORD_NS);
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
 
@@ -12775,6 +13403,27 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     }
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    auto & overlap = ctx->expert_overlap;
+    if (overlap.projection && node != overlap.projection) {
+        bool reads_bank = false;
+        for (int j = 0; j <= ctx->num_additional_fused_ops && !reads_bank; ++j) {
+            const auto * fused = cgraph->nodes[node_idx + j];
+            reads_bank = fused == overlap.projection;
+            for (const auto * src : fused->src) {
+                if (src && src->buffer && src->buffer->buft == &ctx->device->buffer_type &&
+                        static_cast<const ggml_backend_vk_buffer_context *>(src->buffer->context)->dev_buffer->expert_concurrent) {
+                    reads_bank = true;
+                    break;
+                }
+            }
+        }
+        if (reads_bank) {
+            ggml_vk_expert_overlap_join(ctx, compute_ctx);
+            overlap.projection = nullptr;
+            ++overlap.fallback_joins;
+        }
+    }
+    ggml_vk_gpu_telemetry_start(compute_ctx);
 
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
@@ -12882,7 +13531,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
-    switch (node->op) {
+    if (full_hot_count) {
+        ggml_vk_expert_full_hot_ffn(ctx, compute_ctx, cgraph->nodes + node_idx, full_hot_count, full_hot_scratch);
+    } else switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
 
@@ -13315,6 +13966,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         ctx->compute_ctx.reset();
 
+        record.stop();
         ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
     }
     return true;
@@ -13345,6 +13997,13 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(subctx, ctx->fence);
+#ifndef GGML_VULKAN_CHECK_RESULTS
+        } else if (tensor_idx == subctx->exit_tensor_idx && !ctx->final_fence_pending &&
+                ggml_vk_reuse_graph_fence_enabled() && !ctx->device->async_use_transfer_queue &&
+                !ctx->device->has_internally_synchronized_queues && !vk_perf_logger_enabled) {
+            ggml_vk_submit(subctx, ctx->fence);
+            ctx->final_fence_pending = true;
+#endif
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
@@ -13352,6 +14011,17 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             ggml_vk_submit(subctx, {});
         }
         ctx->submit_pending = true;
+        auto & overlap = ctx->expert_overlap;
+        if (overlap.promotion_commit && !overlap.promotion_compute_submitted) {
+            overlap.promotion_compute_submitted = true;
+            if (ggml_vk_telemetry_enabled()) {
+                uint64_t value = 0;
+                if (ctx->device->device.getSemaphoreCounterValue(ctx->transfer_semaphore.s, &value) == vk::Result::eSuccess &&
+                        value < ctx->transfer_semaphore.value) {
+                    ++overlap.promotion_pending_at_compute_submit;
+                }
+            }
+        }
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
@@ -13381,7 +14051,7 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
 
     ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
-    if (ctx->device->async_use_transfer_queue) {
+    if (ctx->device->async_use_transfer_queue || ctx->expert_overlap.enabled) {
         ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
     }
 
@@ -13401,6 +14071,15 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
+    ctx->expert_overlap.ffn_retired_scratch.clear();
+    if (ctx->gpu_telemetry.pool) {
+        for (auto & sample : ctx->gpu_telemetry.samples) {
+            if (sample == vk_gpu_telemetry::recording) {
+                ++vk_gpu_telemetry_totals[VK_GPU_DROPPED];
+                sample = vk_gpu_telemetry::free;
+            }
+        }
+    }
     ctx->pipeline_descriptor_set_requirements = 0;
     ctx->descriptor_set_idx = 0;
 }
@@ -13413,6 +14092,9 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
+    if (ctx->gpu_telemetry.pool) {
+        ctx->device->device.destroyQueryPool(ctx->gpu_telemetry.pool);
+    }
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -13440,6 +14122,9 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    if (ctx->completion_fallback_fence) {
+        ctx->device->device.destroyFence(ctx->completion_fallback_fence);
+    }
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -13449,10 +14134,34 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_set_bindings.clear();
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
-    if (ctx->device->async_use_transfer_queue) {
+    if (ctx->device->async_use_transfer_queue || ctx->expert_overlap.enabled) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
-
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    }
+    if (ctx->expert_overlap.enabled) {
+        const auto & overlap = ctx->expert_overlap;
+        GGML_LOG_INFO("ggml_vulkan: %s expert overlap transfer_submits=%" PRIu64 " bytes=%" PRIu64
+                " split_projections=%" PRIu64 " hot_positions=%" PRIu64 " cold_positions=%" PRIu64
+                " paired_submits=%" PRIu64 " transfer_pending_at_compute_submit=%" PRIu64 " fallback_joins=%" PRIu64
+                " compute_family=%u transfer_family=%u\n", ctx->name.c_str(),
+                overlap.transfer_submits, overlap.transfer_bytes, overlap.split_projections, overlap.hot_positions,
+                overlap.cold_positions, overlap.paired_submits, overlap.transfer_pending_at_compute_submit, overlap.fallback_joins,
+                ctx->device->compute_queue->queue_family_index, ctx->device->transfer_queue->queue_family_index);
+        if (overlap.promotion_submits) {
+            GGML_LOG_INFO("ggml_vulkan: %s expert promotion overlap submits=%" PRIu64 " commits=%" PRIu64
+                    " writeback_bytes=%" PRIu64 " transfer_pending_at_compute_submit=%" PRIu64 "\n",
+                    ctx->name.c_str(), overlap.promotion_submits, overlap.promotion_commits,
+                    overlap.promotion_writeback_bytes, overlap.promotion_pending_at_compute_submit);
+        }
+        if (ggml_vk_expert_full_hot_requested()) {
+            GGML_LOG_INFO("ggml_vulkan: %s expert full hot overlap split_ffns=%" PRIu64 " scratch_ffns=%" PRIu64
+                    " fallback_ffns=%" PRIu64 " fallback_down_q8=%" PRIu64 "\n", ctx->name.c_str(),
+                    overlap.split_ffns, overlap.split_ffn_scratch, overlap.split_ffn_fallbacks, overlap.split_ffn_fallback_down_q8);
+        }
+    }
+    if (ggml_vk_expert_pair_requested()) {
+        GGML_LOG_INFO("ggml_vulkan: %s expert IQ4_NL pair shader dispatches=%" PRIu64 "\n",
+                      ctx->name.c_str(), ctx->expert_pair_dispatches);
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
@@ -13784,6 +14493,70 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+static bool ggml_backend_vk_submit_expert_upload(ggml_backend_t backend) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(backend);
+    return false;
+#else
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (ctx->device->async_use_transfer_queue || ctx->device->serialize_submissions || vk_perf_logger_enabled) {
+        return false;
+    }
+    auto upload = ctx->compute_ctx.lock();
+    if (!upload || !upload->s || !upload->in_memcpys.empty() || !upload->out_memcpys.empty() || !upload->memsets.empty()) {
+        return false;
+    }
+
+    // The caller keeps the pinned source alive until the next ordinary backend synchronization.
+    ggml_vk_ctx_end(upload);
+    ggml_vk_submit(upload, {});
+    ctx->submit_pending = true;
+    ctx->compute_ctx.reset();
+    return true;
+#endif
+}
+
+static bool ggml_backend_vk_defer_slot_map(ggml_backend_t backend, ggml_tensor * tensor, const int32_t * data) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(backend);
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(data);
+    return false;
+#else
+    if (!ggml_backend_is_vk(backend) || !tensor || !tensor->buffer || !tensor->data || !data ||
+            tensor->type != GGML_TYPE_I32 || tensor->view_src || !ggml_is_contiguous(tensor) ||
+            tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) ||
+            ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    // The GPU profiler requires an empty compute context at graph entry.
+    if (ctx->device->async_use_transfer_queue || ctx->device->serialize_submissions || vk_perf_logger_enabled) {
+        return false;
+    }
+
+    const auto * buf_ctx = static_cast<const ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+    const auto & buf = buf_ctx->dev_buffer;
+    const size_t bytes = ggml_nbytes(tensor);
+    const uint64_t offset = vk_tensor_offset(tensor);
+    if (buf->device != ctx->device || (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) ||
+            bytes == 0 || bytes > 65536 || bytes % 4 != 0 || offset % 4 != 0 ||
+            offset > buf->size || bytes > buf->size - offset) {
+        return false;
+    }
+
+    // vkCmdUpdateBuffer copies the source bytes while recording.
+    auto compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    compute_ctx->s->buffer->buf.updateBuffer(buf->buffer, offset, bytes, data);
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    return true;
+#endif
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -13975,6 +14748,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 }
 
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+    vk_telemetry_scope scope(VK_TEL_BACKEND_SYNC);
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
     bool do_transfer = !ctx->compute_ctx.expired();
@@ -13999,7 +14773,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
-            VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+            VK_CHECK(ggml_vk_wait_for_fences(ctx->device->device, ctx->fence), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
         } else {
             ggml_vk_submit(compute_ctx, {});
@@ -14008,9 +14782,28 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     if (ctx->submit_pending) {
+        auto & overlap = ctx->expert_overlap;
+        const bool join_overlap = overlap.transfer_pending && !overlap.wait_submitted;
+        vk::Fence completion_fence = ctx->fence;
+        bool reuse_final_fence = false;
+        if (ctx->final_fence_pending) {
+            auto & queue = *ctx->device->compute_queue->handle;
+            {
+                std::lock_guard<vk_queue_handle> guard(queue);
+                reuse_final_fence = !join_overlap && queue.last_submit_fence == ctx->fence;
+            }
+            if (!reuse_final_fence) {
+                // The graph fence is still in use. Cover the later queue work with a different fence.
+                if (!ctx->completion_fallback_fence) {
+                    ctx->completion_fallback_fence = ctx->device->device.createFence({});
+                }
+                completion_fence = ctx->completion_fallback_fence;
+            }
+        }
         if (ctx->device->serialize_submissions) {
             ctx->submit_pending = false;
-        } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+        } else if (join_overlap || (ctx->device->async_use_transfer_queue &&
+                        ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value)) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
                 1, &ctx->transfer_semaphore.value,
                 0, nullptr,
@@ -14022,13 +14815,43 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
                 0, nullptr,
             };
             si.setPNext(&tl_info);
-            ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
+            ctx->device->compute_queue->handle->submit({ si }, completion_fence);
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
-        } else {
-            ctx->device->compute_queue->handle->submit({}, ctx->fence);
+            overlap.fallback_joins += join_overlap;
+        } else if (!reuse_final_fence) {
+            ctx->device->compute_queue->handle->submit({}, completion_fence);
         }
         if (!ctx->device->serialize_submissions) {
-            ggml_vk_wait_for_fence(ctx);
+            if (reuse_final_fence && !ctx->almost_ready_fence_pending) {
+                VK_CHECK(ggml_vk_wait_for_fences(ctx->device->device, completion_fence), "final graph fence", ctx->device);
+                ctx->device->device.resetFences({ completion_fence });
+            } else {
+                ggml_vk_wait_for_fence(ctx, completion_fence);
+            }
+            if (ctx->final_fence_pending) {
+                if (!reuse_final_fence) {
+                    // The later fence also covers the earlier graph submit on this queue.
+                    ctx->device->device.resetFences({ ctx->fence });
+                } else if (!ctx->final_fence_reuse_logged) {
+                    GGML_LOG_INFO("ggml_vulkan: %s final graph fence reused\n", ctx->name.c_str());
+                    ctx->final_fence_reuse_logged = true;
+                }
+                ctx->final_fence_pending = false;
+            }
+            ggml_vk_gpu_telemetry_read(ctx);
+            overlap.projection = nullptr;
+            overlap.transfer_pending = false;
+            overlap.wait_recorded = false;
+            overlap.wait_submitted = false;
+            if (overlap.promotion_commit) {
+                const auto commit = overlap.promotion_commit;
+                void * userdata = overlap.promotion_userdata;
+                overlap.promotion_commit = nullptr;
+                overlap.promotion_userdata = nullptr;
+                overlap.promotion_compute_submitted = false;
+                commit(userdata);
+                ++overlap.promotion_commits;
+            }
         }
         ctx->submit_pending = false;
         if (cmd_buf) {
@@ -14795,7 +15618,37 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static bool ggml_vk_compact_expert_graph(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(graph);
+    return false;
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_COMPACT_EXPERT_SUBMITS");
+        return env && strcmp(env, "1") == 0;
+    }();
+    if (!enabled || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
+            vk_perf_logger_enabled || graph->n_nodes > 32) {
+        return false;
+    }
+    bool has_experts = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_tensor * ids = node->src[2];
+            if (!ids || ids->ne[1] < 1 || ids->ne[1] > 2) {
+                return false;
+            }
+            has_experts = true;
+        }
+    }
+    return has_experts;
+#endif
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    vk_telemetry_scope scope(VK_TEL_GRAPH_COMPUTE);
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -14827,7 +15680,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
+    const bool compact_experts = ggml_vk_compact_expert_graph(ctx, cgraph);
 
+    auto & overlap = ctx->expert_overlap;
+    if (overlap.projection && std::find(cgraph->nodes, cgraph->nodes + cgraph->n_nodes, overlap.projection) ==
+            cgraph->nodes + cgraph->n_nodes) {
+        auto join = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_expert_overlap_join(ctx, join);
+        overlap.projection = nullptr;
+        ++overlap.fallback_joins;
+    }
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
@@ -14898,7 +15760,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
-                auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
+                auto res = ggml_vk_wait_for_fences(ctx->device->device, ctx->fence);
                 if (res != vk::Result::eSuccess) {
                     GGML_LOG_ERROR("ggml_vulkan: waitForFences error during serialized submission\n");
                     throw vk::SystemError(vk::make_error_code(res), "ggml_vulkan: waitForFences during serialized submission");
@@ -14960,7 +15822,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        int full_hot_count = 0;
+        size_t full_hot_scratch = 0;
+        if (overlap.projection == cgraph->nodes[i] && ggml_vk_expert_full_hot_requested()) {
+            full_hot_count = ggml_vk_expert_full_hot_count(ctx, cgraph, i);
+            if (full_hot_count) {
+                full_hot_scratch = ggml_vk_expert_full_hot_scratch_size(ctx, cgraph->nodes + i, full_hot_count);
+                if (full_hot_scratch && (!overlap.ffn_scratch || overlap.ffn_scratch->size < full_hot_scratch)) {
+                    ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(&ctx->device->buffer_type, full_hot_scratch));
+                    if (!scratch) {
+                        full_hot_count = 0;
+                    } else {
+                        if (overlap.ffn_scratch) {
+                            overlap.ffn_retired_scratch.push_back(std::move(overlap.ffn_scratch));
+                        }
+                        overlap.ffn_scratch = std::move(scratch);
+                    }
+                }
+            }
+            overlap.split_ffn_fallbacks += full_hot_count == 0;
+        }
+        if (full_hot_count) {
+            ctx->num_additional_fused_ops = full_hot_count - 1;
+            if (!full_hot_scratch) {
+                for (int j = 0; j < full_hot_count - 1; ++j) {
+                    if (cgraph->nodes[i + j]->op != GGML_OP_VIEW) {
+                        ctx->fused_ops_write_mask |= 1 << j;
+                    }
+                }
+            }
+        } else if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -15151,7 +16042,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops && !full_hot_count) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -15206,13 +16097,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
-                      (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
-                      (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending);
+        const bool is_last = i + ctx->num_additional_fused_ops >= last_node;
+        const bool near_end = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        const bool almost_ready = near_end && (!compact_experts || is_last);
+        const bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+                            (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                            is_last || (almost_ready && !ctx->almost_ready_fence_pending);
+        const bool compacted = compact_experts && near_end && !submit && !ctx->almost_ready_fence_pending;
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, is_last, almost_ready, submit,
+                                           full_hot_count, full_hot_scratch != 0);
+        if (enqueued && compacted && !ctx->compact_expert_logged) {
+            GGML_LOG_INFO("ggml_vulkan: %s compact expert submit applied\n", ctx->name.c_str());
+            ctx->compact_expert_logged = true;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -15266,7 +16164,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_ctx_end(compute_ctx);
 
         ggml_vk_submit(compute_ctx, ctx->device->fence);
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
+        VK_CHECK(ggml_vk_wait_for_fences(ctx->device->device, ctx->device->fence), "GGML_VULKAN_PERF waitForFences", ctx->device);
         ctx->device->device.resetFences({ ctx->device->fence });
         ctx->compute_ctx.reset();
 
@@ -16679,6 +17577,7 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 }
 
 static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    vk_telemetry_scope scope(VK_TEL_BACKEND_SYNC);
     VK_LOG_DEBUG("ggml_backend_vk_device_event_synchronize(backend=" << dev << ", event=" << event << ")");
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
@@ -16689,7 +17588,10 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
-        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+        {
+            vk_telemetry_timer timer(VK_TEL_SEMAPHORE_WAIT_NS, VK_TEL_SEMAPHORE_WAITS);
+            VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+        }
 
         // Reset and move submitted events
         for (auto& event : vkev->events_submitted) {
@@ -16802,6 +17704,350 @@ static ggml_backend_buffer_t ggml_backend_vk_alloc_host_upload_buffer(ggml_backe
     return ggml_backend_vk_alloc_host_buffer(ggml_backend_vk_host_buffer_type(), size, device->idx);
 }
 
+struct ggml_vk_expert_allocation_scope {
+    const bool previous = ggml_vk_alloc_overlap_expert_buffer;
+
+    explicit ggml_vk_expert_allocation_scope(bool concurrent) {
+        ggml_vk_alloc_overlap_expert_buffer = concurrent;
+    }
+    ~ggml_vk_expert_allocation_scope() {
+        ggml_vk_alloc_overlap_expert_buffer = previous;
+    }
+};
+
+static ggml_backend_buffer_t ggml_backend_vk_alloc_overlap_expert_bank(ggml_backend_dev_t dev, ggml_context * ctx) {
+    const auto * device_ctx = static_cast<const ggml_backend_vk_device_context *>(dev->context);
+    const auto dev_vk = ggml_vk_get_device(device_ctx->device);
+    ggml_vk_expert_allocation_scope scope(ggml_vk_expert_overlap_supported(dev_vk) && !vk_perf_logger_enabled);
+    return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_alloc_overlap_expert_staging(ggml_backend_dev_t dev, size_t size) {
+    const auto * device_ctx = static_cast<const ggml_backend_vk_device_context *>(dev->context);
+    const auto dev_vk = ggml_vk_get_device(device_ctx->device);
+    if (!ggml_vk_expert_overlap_supported(dev_vk) || vk_perf_logger_enabled) {
+        return nullptr;
+    }
+    ggml_vk_expert_allocation_scope scope(true);
+    return ggml_backend_vk_alloc_host_upload_buffer(dev, size);
+}
+
+static const ggml_tensor * ggml_vk_overlap_first_projection(const ggml_cgraph * graph, const ggml_tensor * map) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        const auto * ids = node->src[2];
+        const auto * lookup = ids && ids->op == GGML_OP_RESHAPE ? ids->src[0] : nullptr;
+        if (!lookup || lookup->op != GGML_OP_GET_ROWS || lookup->src[0] != map ||
+                !ggml_vk_use_mul_mat_vec_id(node) || !ggml_is_contiguous(node->src[0]) ||
+                ids->ne[0] <= 0 || ids->ne[0] > 32 || ids->ne[1] <= 0 || ids->ne[1] > 2) {
+            return nullptr;
+        }
+        // The shared projection is the first reader of any of these routed weight planes.
+        for (int j = 0; j < i; ++j) {
+            const auto * prior = graph->nodes[j];
+            for (const auto * src : prior->src) {
+                if (src && src->buffer == node->src[0]->buffer) {
+                    return nullptr;
+                }
+            }
+        }
+        return node;
+    }
+    return nullptr;
+}
+
+static const ggml_tensor * ggml_backend_vk_rtx_expert_input(
+        ggml_backend_t backend, const ggml_cgraph * graph, const ggml_tensor * map, int n_planes) {
+#if defined(GGML_VULKAN_CHECK_RESULTS)
+    return nullptr;
+#else
+    if (!ggml_backend_is_vk(backend) || !graph || !map || n_planes < 2 || n_planes > 3) {
+        return nullptr;
+    }
+    const auto * projection = ggml_vk_overlap_first_projection(graph, map);
+    if (!projection) {
+        return nullptr;
+    }
+    const auto * ids = projection->src[2];
+    int matched = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * op = graph->nodes[i];
+        if (op->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        if (op->src[2] != ids || !ggml_vk_use_mul_mat_vec_id(op) ||
+                !ggml_is_contiguous(op->src[0]) || !ggml_is_quantized(op->src[0]->type)) {
+            return nullptr;
+        }
+        ++matched;
+    }
+    return matched == n_planes ? projection->src[1] : nullptr;
+#endif
+}
+
+static bool ggml_backend_vk_overlap_expert_transfer(
+        ggml_backend_t backend, const ggml_cgraph * graph, ggml_tensor * map, const int32_t * slots,
+        const int32_t * used_slots, const uint32_t * hot_masks, ggml_tensor * const * weights,
+        const void * staging, const size_t * offsets, const size_t * sizes, const size_t * staging_offsets, size_t n,
+        int32_t victim_slot, ggml_tensor * const * writeback_weights, const size_t * writeback_staging_offsets,
+        size_t n_writeback, void (*commit)(void *), void * userdata) {
+    const bool promotion = n_writeback != 0;
+    if (!ggml_backend_is_vk(backend) || !graph || !map || !slots || !used_slots || !hot_masks || !staging ||
+            (!n && !promotion) || n > 3*2*32 || (n && (!weights || !offsets || !sizes || !staging_offsets)) ||
+            (promotion && (n_writeback > 3 || !writeback_weights || !writeback_staging_offsets || !commit || !userdata))) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    auto & overlap = ctx->expert_overlap;
+    if (!overlap.enabled || overlap.transfer_pending || ctx->submit_pending || !ctx->compute_ctx.expired()) {
+        return false;
+    }
+    const auto * projection = ggml_vk_overlap_first_projection(graph, map);
+    if (!projection) {
+        return false;
+    }
+    const auto * ids = projection->src[2];
+    const uint32_t k = ids->ne[0];
+    const uint32_t nt = ids->ne[1];
+    const uint32_t full = UINT32_MAX >> (32 - k);
+    const int64_t bank_slots = projection->src[0]->ne[2];
+    bool any_hot = false;
+    bool any_cold = false;
+    uint32_t excluded_masks[2] = {};
+    for (uint32_t t = 0; t < nt; ++t) {
+        if (hot_masks[t] & ~full) {
+            return false;
+        }
+        any_hot |= hot_masks[t] != 0;
+        for (uint32_t pos = 0; pos < k; ++pos) {
+            const int32_t slot = used_slots[t*k + pos];
+            const uint32_t bit = UINT32_C(1) << pos;
+            if (slot == -1 && !(hot_masks[t] & bit)) {
+                excluded_masks[t] |= bit;
+                continue;
+            }
+            if (slot < 0 || slot >= bank_slots || (promotion && slot == victim_slot)) {
+                return false;
+            }
+        }
+        any_cold |= (hot_masks[t] | excluded_masks[t]) != full;
+    }
+    if (!any_hot || any_cold != (n != 0) || (promotion && (victim_slot < 0 || victim_slot >= bank_slots))) {
+        return false;
+    }
+
+    vk_buffer pinned;
+    size_t pinned_offset = 0;
+    ggml_vk_host_get(ctx->device, staging, pinned, pinned_offset);
+    if (!pinned || !pinned->expert_concurrent || pinned->device != ctx->device || pinned_offset > pinned->size) {
+        return false;
+    }
+    std::vector<vk_buffer_region> regions;
+    regions.reserve(n);
+    uint64_t bytes = 0;
+    uint32_t covered_cold[2] = {};
+    for (size_t i = 0; i < n; ++i) {
+        const auto * weight = weights[i];
+        if (!weight || !weight->buffer || weight->view_src || !weight->data ||
+                weight->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) ||
+                weight->ne[2] != bank_slots || !weight->nb[2] || sizes[i] != weight->nb[2] ||
+                offsets[i] % weight->nb[2] || offsets[i] / weight->nb[2] >= (uint64_t) bank_slots ||
+                staging_offsets[i] > pinned->size - pinned_offset ||
+                sizes[i] > pinned->size - pinned_offset - staging_offsets[i]) {
+            return false;
+        }
+        const auto & dst = static_cast<const ggml_backend_vk_buffer_context *>(weight->buffer->context)->dev_buffer;
+        const uint64_t base = vk_tensor_offset(weight);
+        if (!dst->expert_concurrent || dst->device != ctx->device || base > dst->size ||
+                offsets[i] > dst->size - base || sizes[i] > dst->size - base - offsets[i] ||
+                (base + offsets[i]) % 4 || (pinned_offset + staging_offsets[i]) % 4 || sizes[i] % 4) {
+            return false;
+        }
+        // Match each upload to a routed plane and reject earlier readers of its buffer.
+        bool routed_plane = false;
+        bool prior = true;
+        for (int j = 0; j < graph->n_nodes; ++j) {
+            const auto * node = graph->nodes[j];
+            prior &= node != projection;
+            if (prior) {
+                for (const auto * src : node->src) {
+                    if (src && src->buffer == weight->buffer) {
+                        return false;
+                    }
+                }
+            }
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == weight && node->src[2] == ids) {
+                routed_plane = true;
+                break;
+            }
+        }
+        if (!routed_plane) {
+            return false;
+        }
+        const uint64_t written = base + offsets[i];
+        bool used_cold = false;
+        for (uint32_t t = 0; t < nt; ++t) {
+            for (uint32_t pos = 0; pos < k; ++pos) {
+                if (offsets[i] / weight->nb[2] != (uint32_t) used_slots[t*k + pos]) {
+                    continue;
+                }
+                const uint32_t bit = UINT32_C(1) << pos;
+                if (hot_masks[t] & bit) {
+                    return false;
+                }
+                used_cold = true;
+                if (weight == projection->src[0]) {
+                    covered_cold[t] |= bit;
+                }
+            }
+        }
+        if (!used_cold) {
+            return false;
+        }
+        // Reject overlapping destinations, including an alias between distinct weight tensors.
+        for (const auto & region : regions) {
+            if (region.buf == dst && (written <= region.offset ? region.offset - written < sizes[i] :
+                    written - region.offset < region.size)) {
+                return false;
+            }
+        }
+        const auto * first_weight = projection->src[0];
+        const auto * first_buf = first_weight->buffer;
+        if (first_buf != weight->buffer &&
+                (!first_buf || first_buf->buft != ggml_backend_vk_get_default_buffer_type(backend) ||
+                 static_cast<const ggml_backend_vk_buffer_context *>(first_buf->context)->dev_buffer == dst)) {
+            return false;
+        }
+        if (first_buf == weight->buffer && weight != first_weight) {
+            const uint64_t first_base = vk_tensor_offset(first_weight);
+            if (written <= first_base ? first_base - written < sizes[i] : written - first_base < ggml_nbytes(first_weight)) {
+                return false;
+            }
+        }
+        regions.push_back({dst, written, const_cast<uint8_t *>(static_cast<const uint8_t *>(staging)) + staging_offsets[i], sizes[i]});
+        bytes += sizes[i];
+    }
+    for (uint32_t t = 0; t < nt; ++t) {
+        if (covered_cold[t] != (full & ~(hot_masks[t] | excluded_masks[t]))) {
+            return false;
+        }
+    }
+
+    std::array<vk_buffer_region, 3> writebacks{};
+    size_t writeback_bytes = 0;
+    if (promotion && !(pinned->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+        return false;
+    }
+    for (size_t i = 0; i < n_writeback; ++i) {
+        const auto * weight = writeback_weights[i];
+        if (!weight || !weight->buffer || weight->view_src || !weight->data ||
+                weight->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) ||
+                weight->ne[2] != bank_slots || !ggml_is_contiguous(weight)) {
+            return false;
+        }
+        bool is_routed_plane = false;
+        for (int j = 0; j < graph->n_nodes; ++j) {
+            const auto * node = graph->nodes[j];
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == weight && node->src[2] == ids) {
+                is_routed_plane = true;
+                break;
+            }
+        }
+        if (!is_routed_plane) {
+            return false;
+        }
+        const auto & src = static_cast<const ggml_backend_vk_buffer_context *>(weight->buffer->context)->dev_buffer;
+        const uint64_t base = vk_tensor_offset(weight);
+        const size_t stride = weight->nb[2];
+        const size_t host_offset = writeback_staging_offsets[i];
+        if (!src || !src->expert_concurrent || src->device != ctx->device || base > src->size || !stride ||
+                size_t(victim_slot) >= (src->size - base) / stride ||
+                host_offset > pinned->size - pinned_offset || stride > pinned->size - pinned_offset - host_offset) {
+            return false;
+        }
+        const size_t offset = base + size_t(victim_slot) * stride;
+        if (offset % 4 || (pinned_offset + host_offset) % 4 || stride % 4) {
+            return false;
+        }
+        const auto overlaps = [](size_t a, size_t a_size, size_t b, size_t b_size) {
+            return a <= b ? b - a < a_size : a - b < b_size;
+        };
+        for (size_t j = 0; j < n; ++j) {
+            if (overlaps(host_offset, stride, staging_offsets[j], sizes[j]) ||
+                    (src == regions[j].buf && overlaps(offset, stride, regions[j].offset, regions[j].size))) {
+                return false;
+            }
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (overlaps(host_offset, stride, writeback_staging_offsets[j], writebacks[j].size) ||
+                    (src == writebacks[j].buf && overlaps(offset, stride, writebacks[j].offset, writebacks[j].size))) {
+                return false;
+            }
+        }
+        auto * host = const_cast<uint8_t *>(static_cast<const uint8_t *>(staging)) + host_offset;
+        writebacks[i] = {src, offset, host, stride};
+        writeback_bytes += stride;
+    }
+
+    if (!ggml_backend_vk_defer_slot_map(backend, map, slots)) {
+        return false;
+    }
+
+    auto transfer = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+    ggml_vk_ctx_begin(ctx->device, transfer);
+    if (n) {
+        GGML_ASSERT(ggml_vk_buffer_write_n_async(transfer, regions.data(), regions.size()) == regions.size());
+    }
+    if (promotion) {
+        GGML_ASSERT(ggml_vk_buffer_read_n_async(transfer, writebacks.data(), n_writeback) == n_writeback);
+        transfer->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                {}, {{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead }}, {}, {});
+    }
+    ++ctx->transfer_semaphore.value;
+    transfer->s->signal_semaphores.push_back(ctx->transfer_semaphore);
+    ggml_vk_ctx_end(transfer);
+    {
+        vk_telemetry_scope scope(n ? VK_TEL_EXPERT_UPLOAD : VK_TEL_EXPERT_WRITEBACK);
+        ggml_vk_submit(transfer, {});
+    }
+    ctx->submit_pending = true;
+    overlap.transfer_pending = true;
+    overlap.projection = n ? projection : nullptr;
+    std::copy(hot_masks, hot_masks + nt, overlap.hot_masks);
+    std::copy(std::begin(excluded_masks), std::end(excluded_masks), overlap.excluded_masks);
+    ++overlap.transfer_submits;
+    overlap.transfer_bytes += bytes;
+    if (promotion) {
+        overlap.promotion_commit = commit;
+        overlap.promotion_userdata = userdata;
+        ++overlap.promotion_submits;
+        overlap.promotion_writeback_bytes += writeback_bytes;
+    }
+    return true;
+}
+
+static bool ggml_backend_vk_overlap_expert_upload(
+        ggml_backend_t backend, const ggml_cgraph * graph, ggml_tensor * map, const int32_t * slots,
+        const int32_t * used_slots, const uint32_t * hot_masks, ggml_tensor * const * weights,
+        const void * staging, const size_t * offsets, const size_t * sizes, const size_t * staging_offsets, size_t n) {
+    return ggml_backend_vk_overlap_expert_transfer(backend, graph, map, slots, used_slots, hot_masks, weights,
+            staging, offsets, sizes, staging_offsets, n, -1, nullptr, nullptr, 0, nullptr, nullptr);
+}
+
+static bool ggml_backend_vk_overlap_expert_promotion(
+        ggml_backend_t backend, const ggml_cgraph * graph, ggml_tensor * map, const int32_t * slots,
+        const int32_t * used_slots, const uint32_t * hot_masks, ggml_tensor * const * weights,
+        const void * staging, const size_t * offsets, const size_t * sizes, const size_t * staging_offsets, size_t n,
+        int32_t victim_slot, ggml_tensor * const * writeback_weights, const size_t * writeback_staging_offsets,
+        size_t n_writeback, void (*commit)(void *), void * userdata) {
+    return n_writeback && ggml_backend_vk_overlap_expert_transfer(backend, graph, map, slots, used_slots, hot_masks, weights,
+            staging, offsets, sizes, staging_offsets, n, victim_slot, writeback_weights, writeback_staging_offsets,
+            n_writeback, commit, userdata);
+}
+
 static ggml_backend_buffer_t ggml_backend_vk_alloc_transfer_host_upload_buffer(ggml_backend_dev_t dev, size_t size) {
     auto * ctx = (ggml_backend_vk_device_context *) dev->context;
     if (!ggml_vk_get_device(ctx->device)->async_use_transfer_queue) {
@@ -16823,6 +18069,36 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         return (void *) ggml_backend_vk_comm_allreduce_tensor;
     }
 #endif
+    if (strcmp(name, "ggml_backend_vk_submit_expert_upload") == 0) {
+        return (void *) ggml_backend_vk_submit_expert_upload;
+    }
+    if (strcmp(name, "ggml_backend_vk_defer_slot_map") == 0) {
+        return (void *) ggml_backend_vk_defer_slot_map;
+    }
+    if (strcmp(name, "ggml_backend_vk_get_telemetry_detail") == 0) {
+        return (void *) ggml_backend_vk_get_telemetry_detail;
+    }
+    if (strcmp(name, "ggml_backend_vk_set_telemetry_cause") == 0) {
+        return (void *) ggml_backend_vk_set_telemetry_cause;
+    }
+    if (strcmp(name, "ggml_backend_vk_get_telemetry") == 0) {
+        return (void *) ggml_backend_vk_get_telemetry;
+    }
+    if (strcmp(name, "ggml_backend_vk_alloc_overlap_expert_bank") == 0) {
+        return (void *) ggml_backend_vk_alloc_overlap_expert_bank;
+    }
+    if (strcmp(name, "ggml_backend_vk_alloc_overlap_expert_staging") == 0) {
+        return (void *) ggml_backend_vk_alloc_overlap_expert_staging;
+    }
+    if (strcmp(name, "ggml_backend_vk_rtx_expert_input") == 0) {
+        return (void *) ggml_backend_vk_rtx_expert_input;
+    }
+    if (strcmp(name, "ggml_backend_vk_overlap_expert_promotion") == 0) {
+        return (void *) ggml_backend_vk_overlap_expert_promotion;
+    }
+    if (strcmp(name, "ggml_backend_vk_overlap_expert_upload") == 0) {
+        return (void *) ggml_backend_vk_overlap_expert_upload;
+    }
     if (strcmp(name, "ggml_backend_vk_alloc_transfer_host_upload_buffer") == 0) {
         return (void *) ggml_backend_vk_alloc_transfer_host_upload_buffer;
     }
@@ -17037,7 +18313,13 @@ void vk_queue_handle_synchronized::submit(vk::ArrayProxy<const vk::SubmitInfo> s
     }
     std::lock_guard<std::mutex> guard(mutex);
     try {
-        queue.submit(submits, fence);
+        {
+            vk_telemetry_timer timer(VK_TEL_SUBMIT_NS, transfer_only ? VK_TEL_TRANSFER_SUBMITS : VK_TEL_COMPUTE_SUBMITS);
+            queue.submit(submits, fence);
+        }
+        if (ggml_vk_reuse_graph_fence_enabled()) {
+            last_submit_fence = fence;
+        }
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {
             ggml_vk_print_device_lost_info(dev);
@@ -17053,6 +18335,7 @@ void vk_queue_handle_unsynchronized::submit(vk::ArrayProxy<const vk::SubmitInfo>
         device_guard = std::unique_lock<std::mutex>(*device_submit_mutex);
     }
     try {
+        vk_telemetry_timer timer(VK_TEL_SUBMIT_NS, transfer_only ? VK_TEL_TRANSFER_SUBMITS : VK_TEL_COMPUTE_SUBMITS);
         queue.submit(submits, fence);
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {

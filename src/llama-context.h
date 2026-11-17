@@ -280,6 +280,7 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool profile = false);
+    void get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const;
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -498,6 +499,8 @@ private:
 
     bool decode_profile = false;
     bool decode_profile_active = false;
+    uint64_t telemetry_graphs = 0;
+    uint64_t telemetry_splits = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

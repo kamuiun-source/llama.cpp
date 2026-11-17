@@ -123,7 +123,18 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     if (!cpu) {
         throw std::runtime_error("packed experts require a CPU backend");
     }
-    bank_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(bank_ctx.get(), ggml_backend_dev_buffer_type(target)));
+    using alloc_overlap_bank_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, ggml_context *);
+    alloc_overlap_bank_t alloc_overlap_bank = nullptr;
+    const char * overlap_upload = std::getenv("LLAMA_EXPERT_VK_OVERLAP_UPLOAD");
+    if (!overlap && dynamic_resident && max_ubatch == 2 && overlap_upload && std::strcmp(overlap_upload, "1") == 0) {
+        const auto reg = ggml_backend_dev_backend_reg(target);
+        if (reg) {
+            alloc_overlap_bank = reinterpret_cast<alloc_overlap_bank_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_alloc_overlap_expert_bank"));
+        }
+    }
+    bank_buf.reset(alloc_overlap_bank ? alloc_overlap_bank(target, bank_ctx.get()) :
+            ggml_backend_alloc_ctx_tensors_from_buft(bank_ctx.get(), ggml_backend_dev_buffer_type(target)));
     host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), ggml_backend_dev_buffer_type(cpu)));
     if (!host_buf || !ggml_backend_buffer_is_host(host_buf.get()) || !bank_buf || ggml_backend_buffer_is_host(bank_buf.get())) {
         throw std::runtime_error("could not allocate packed expert buffers");

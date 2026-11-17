@@ -812,6 +812,14 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        if (tname == "iq4_nl") {
+            const auto pair = merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_PAIR", "1"}, {data_a_key, "1"},
+                                                      {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+            string_to_spv("mul_mat_vec_id_iq4_nl_pair", shader, pair);
+            string_to_spv("mul_mat_vec_id_iq4_nl_pair_subgroup", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_iq4_nl_pair_subgroup_no_shmem", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {

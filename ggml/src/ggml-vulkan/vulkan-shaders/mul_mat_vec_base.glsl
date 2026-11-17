@@ -31,6 +31,11 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    uint expert_mask;
+#ifdef MUL_MAT_ID_PAIR
+    uint expert_mask_1;
+    uint n_experts;
+#endif
 #else
     uint base_work_group_y;
     uint ne02;
@@ -43,11 +48,23 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID
 uint expert_id;
 bool expert_skip; // an id of -1 skips the slot, the result row is zeroed
+
+uint get_expert_i0() {
+    uint mask = p.expert_mask;
+    if (mask == 0) {
+        return gl_WorkGroupID.y;
+    }
+    // Dispatch only selected positions. Keep their original offsets.
+    for (uint i = 0; i < gl_WorkGroupID.y; ++i) {
+        mask &= mask - 1;
+    }
+    return uint(findLSB(mask));
+}
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
-    const uint expert_i0 = gl_WorkGroupID.y;
+    const uint expert_i0 = get_expert_i0();
 #else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 #endif
@@ -91,7 +108,44 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
+#ifdef MUL_MAT_ID_PAIR
+const uint NUM_COLS = 2;
+#else
 layout (constant_id = 2) const uint NUM_COLS = 1;
+#endif
+
+#ifdef MUL_MAT_ID_PAIR
+bool pair_active;
+uint pair_d_offset;
+#endif
+
+void store_mat_vec_result(uint j, uint d_offset, uint row, FLOAT_TYPE value) {
+#ifdef MUL_MAT_ID_PAIR
+    if (j == 0) {
+        data_d[d_offset + row] = D_TYPE(value);
+    } else if (pair_active) {
+        data_d[pair_d_offset + row] = D_TYPE(value);
+    }
+#else
+    data_d[j*p.batch_stride_d + d_offset + row] = D_TYPE(value);
+#endif
+}
+
+#ifdef MUL_MAT_ID
+bool zero_skipped_expert(uint d_offset, uint first_row, uint num_rows) {
+    if (!expert_skip) {
+        return false;
+    }
+    if (gl_LocalInvocationID.x == 0) {
+        for (uint j = 0; j < NUM_COLS; ++j) {
+            for (uint n = 0; n < num_rows; ++n) {
+                store_mat_vec_result(j, d_offset, first_row + n, FLOAT_TYPE(0));
+            }
+        }
+    }
+    return true;
+}
+#endif
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
@@ -109,11 +163,11 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
                 }
                 if (expert_skip) {
@@ -127,7 +181,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                store_mat_vec_result(j, d_offset, first_row + n, temp[j][n]);
             }
         }
     }
@@ -167,11 +221,11 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
                 }
                 if (expert_skip) {
@@ -185,7 +239,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                store_mat_vec_result(j, d_offset, first_row + n, temp[j][n]);
             }
         }
     }
@@ -215,11 +269,11 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_i0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
+                    const uint expert_i0 = get_expert_i0();
                     tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[expert_i0]);
                 }
                 if (expert_skip) {
@@ -233,7 +287,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                store_mat_vec_result(j, d_offset, first_row + n, tmpsh[j][n][0]);
             }
         }
     }

@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-rtx-expert.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2624,6 +2625,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, experts);
         experts = ggml_add(ctx0, experts, build_experts(cur, selected_experts, cache.cpu_ids, false));
         cb(experts, "ffn_moe_down_merged", il);
+    }
+
+    if (moe_cache && il >= 0 && cache.slots && !cache.cpu_ids && !moe_cache->get_cold_slot_map(il) &&
+            can_cpu_share && type_op == LLM_FFN_SILU && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
+            !gate_up_exps_b && !gate_exps_b && !up_exps_b && !down_exps_b &&
+            !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm) {
+        auto * rtx = moe_cache->get_rtx_expert();
+        if (rtx) {
+            const bool custom_precision = prec_policy && std::any_of(exps.begin(), exps.end(), [&](ggml_tensor * w) {
+                return w && (prec_policy->prec_src1.count(w) || prec_policy->prec_acc.count(w));
+            });
+            auto * contribution = custom_precision ? nullptr : rtx->output(il, cache.slots, cur,
+                    up_exps, gate_exps, down_exps, gate_up_exps, selected_experts->ne[0], n_tokens);
+            if (contribution) {
+                experts = ggml_add(ctx0, experts, contribution);
+                ggml_backend_sched_set_tensor_backend(sched, experts, rtx->backend());
+                cb(experts, "ffn_moe_rtx_merged", il);
+            }
+        }
     }
 
     if (down_exps_s) {

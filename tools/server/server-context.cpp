@@ -16,6 +16,9 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
+#include "../../src/llama-expert-profile.h"
+#include "ggml-backend.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -24,11 +27,15 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <cstring>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -44,6 +51,353 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+struct server_decode_telemetry {
+    enum phase { prefill, decode, verify, mixed, draft, catchup, server_step, phase_count };
+
+    using read_fn = void (*)(uint64_t *);
+    using set_cuda_stream_fn = void (*)(void ** state, int phase);
+    using finish_cuda_stream_fn = void (*)(void * state, uint64_t * totals);
+    using read_vk_detail_fn = void (*)(uint64_t * cpu, uint64_t * gpu);
+    // These rows and field counts match the Vulkan backend's detail proc.
+    static constexpr const char * vk_causes[] = {
+        "unclassified", "graph_compute", "backend_sync", "sync_write", "sync_read",
+        "sync_copy", "slot_map", "expert_upload", "expert_writeback",
+    };
+    static constexpr size_t vk_cpu_fields = 10;
+    static constexpr size_t vk_gpu_fields = 4;
+    static constexpr size_t expert_miss_bins = llama_expert_profile::n_experts - llama_expert_profile::n_resident + 1;
+    struct expert_misses {
+        std::array<uint64_t, expert_miss_bins> bins{};
+        uint64_t bytes = 0;
+        uint64_t bytes_3plus = 0;
+        llama_expert_transfer_telemetry transfer;
+    };
+    struct snapshot {
+        uint64_t graphs = 0;
+        uint64_t splits = 0;
+        std::array<uint64_t, 4> cuda{};
+        std::array<uint64_t, 4> cuda_wait_ns{};
+        std::array<uint64_t, vk_cpu_fields> vk{};
+        std::array<uint64_t, std::size(vk_causes) * vk_cpu_fields> vk_cpu_detail{};
+        std::array<uint64_t, vk_gpu_fields> vk_gpu_detail{};
+        std::optional<expert_misses> packed_misses;
+    };
+    struct summary {
+        snapshot totals;
+        uint64_t calls = 0;
+        uint64_t wall_us = 0;
+        uint64_t target_tokens = 0;
+    };
+
+    const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_DECODE_TELEMETRY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const bool expert_miss_histogram = [] {
+        const char * env = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    bool initialized = false;
+    const bool per_response = [] {
+        const char * env = std::getenv("LLAMA_DECODE_TELEMETRY_PER_RESPONSE");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    uint64_t response_index = 0;
+    std::string pending_response;
+    read_fn read_cuda = nullptr;
+    read_fn read_cuda_wait = nullptr;
+    set_cuda_stream_fn set_cuda_stream = nullptr;
+    finish_cuda_stream_fn finish_cuda_stream = nullptr;
+    finish_cuda_stream_fn read_cuda_components = nullptr;
+    finish_cuda_stream_fn read_cuda_component_ops = nullptr;
+    finish_cuda_stream_fn read_cuda_hc_projections = nullptr;
+    void * cuda_stream_state = nullptr;
+    int cuda_stream_phase = -1;
+    read_fn read_vk = nullptr;
+    read_vk_detail_fn read_vk_detail = nullptr;
+    std::array<summary, phase_count> phases{};
+
+    snapshot read(llama_context * ctx) {
+        if (!initialized) {
+            if (auto * reg = ggml_backend_reg_by_name("CUDA")) {
+                read_cuda = reinterpret_cast<read_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_telemetry"));
+                read_cuda_wait = reinterpret_cast<read_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_wait_telemetry"));
+                set_cuda_stream = reinterpret_cast<set_cuda_stream_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_stream_telemetry"));
+                finish_cuda_stream = reinterpret_cast<finish_cuda_stream_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_finish_stream_telemetry"));
+                read_cuda_components = reinterpret_cast<finish_cuda_stream_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_read_component_telemetry"));
+                read_cuda_component_ops = reinterpret_cast<finish_cuda_stream_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_read_component_ops"));
+                read_cuda_hc_projections = reinterpret_cast<finish_cuda_stream_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_read_hc_projections"));
+            }
+            if (auto * reg = ggml_backend_reg_by_name("Vulkan")) {
+                read_vk = reinterpret_cast<read_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_telemetry"));
+                read_vk_detail = reinterpret_cast<read_vk_detail_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_telemetry_detail"));
+            }
+            initialized = true;
+        }
+        snapshot now;
+        if (ctx) {
+            llama_get_sched_telemetry(ctx, now.graphs, now.splits);
+        }
+        if (read_cuda) {
+            read_cuda(now.cuda.data());
+        }
+        if (read_cuda_wait) {
+            read_cuda_wait(now.cuda_wait_ns.data());
+        }
+        if (read_vk) {
+            read_vk(now.vk.data());
+        }
+        if (read_vk_detail) {
+            read_vk_detail(now.vk_cpu_detail.data(), now.vk_gpu_detail.data());
+        }
+        if (expert_miss_histogram) {
+            auto & misses = now.packed_misses.emplace();
+            llama_get_expert_miss_telemetry(misses.bins.data(), misses.bins.size(), misses.bytes, misses.bytes_3plus);
+            misses.transfer = llama_get_expert_transfer_telemetry();
+        }
+        return now;
+    }
+
+    struct scope {
+        server_decode_telemetry & owner;
+        llama_context * ctx;
+        phase kind;
+        uint64_t target_tokens;
+        std::optional<snapshot> before;
+        int64_t wall_start_us = 0;
+        int previous_cuda_phase = -1;
+
+        scope(server_decode_telemetry & owner, llama_context * ctx, phase kind, uint64_t tokens = 0)
+            : owner(owner), ctx(ctx), kind(kind), target_tokens(tokens) {
+            if (owner.enabled) {
+                before.emplace(owner.read(ctx));
+                if (owner.set_cuda_stream && owner.finish_cuda_stream) {
+                    previous_cuda_phase = owner.cuda_stream_phase;
+                    owner.cuda_stream_phase = kind;
+                    owner.set_cuda_stream(&owner.cuda_stream_state, kind);
+                }
+                wall_start_us = ggml_time_us();
+            }
+        }
+
+        ~scope() {
+            if (!before) {
+                return;
+            }
+            const auto elapsed_us = ggml_time_us() - wall_start_us;
+            if (owner.set_cuda_stream && owner.finish_cuda_stream) {
+                owner.cuda_stream_phase = previous_cuda_phase;
+                owner.set_cuda_stream(&owner.cuda_stream_state, previous_cuda_phase);
+            }
+            const snapshot after = owner.read(ctx);
+            auto & item = owner.phases[kind];
+            ++item.calls;
+            item.wall_us += elapsed_us;
+            item.target_tokens += target_tokens;
+            item.totals.graphs += after.graphs - before->graphs;
+            item.totals.splits += after.splits - before->splits;
+            for (size_t i = 0; i < after.cuda.size(); ++i) {
+                item.totals.cuda[i] += after.cuda[i] - before->cuda[i];
+                item.totals.cuda_wait_ns[i] += after.cuda_wait_ns[i] - before->cuda_wait_ns[i];
+            }
+            for (size_t i = 0; i < after.vk.size(); ++i) {
+                item.totals.vk[i] += after.vk[i] - before->vk[i];
+            }
+            if (after.packed_misses) {
+                if (!item.totals.packed_misses) {
+                    item.totals.packed_misses.emplace();
+                }
+                auto & total = *item.totals.packed_misses;
+                for (size_t i = 0; i < total.bins.size(); ++i) {
+                    total.bins[i] += after.packed_misses->bins[i] - before->packed_misses->bins[i];
+                }
+                total.bytes += after.packed_misses->bytes - before->packed_misses->bytes;
+                total.bytes_3plus += after.packed_misses->bytes_3plus - before->packed_misses->bytes_3plus;
+                const auto & prev = before->packed_misses->transfer;
+                const auto & next = after.packed_misses->transfer;
+                total.transfer.requests += next.requests - prev.requests;
+                total.transfer.misses += next.misses - prev.misses;
+                total.transfer.promotions += next.promotions - prev.promotions;
+                total.transfer.writeback_bytes += next.writeback_bytes - prev.writeback_bytes;
+            }
+            if (owner.read_vk_detail) {
+                for (size_t i = 0; i < after.vk_cpu_detail.size(); ++i) {
+                    item.totals.vk_cpu_detail[i] += after.vk_cpu_detail[i] - before->vk_cpu_detail[i];
+                }
+                for (size_t i = 0; i < after.vk_gpu_detail.size(); ++i) {
+                    item.totals.vk_gpu_detail[i] += after.vk_gpu_detail[i] - before->vk_gpu_detail[i];
+                }
+            }
+            // Flush after the outer scope accounts for the final decode step.
+            if (kind == server_step && !owner.pending_response.empty()) {
+                SRV_INF("decode_response_begin: %s\n", owner.pending_response.c_str());
+                owner.log_and_reset();
+                SRV_INF("decode_response_end: response=%" PRIu64 "\n", owner.response_index);
+                owner.pending_response.clear();
+            }
+        }
+    };
+
+    void log_and_reset() {
+        // CUDA stores each span under its submission phase, even if completed later.
+        constexpr size_t cuda_gpu_fields = 4;
+        std::array<uint64_t, phase_count * cuda_gpu_fields> cuda_gpu{};
+        // Keep the order and field count in sync with ggml_cuda_component_telemetry.
+        constexpr const char * cuda_components[] = {
+            "other", "attention", "recurrent", "shared_expert", "hc",
+            "router", "output", "routed_expert", "ple", "mixed",
+        };
+        constexpr size_t cuda_component_fields = 6;
+        constexpr size_t cuda_component_phase_fields = std::size(cuda_components) * cuda_component_fields;
+        std::array<uint64_t, phase_count * cuda_component_phase_fields> cuda_component_totals{};
+        constexpr size_t op_phase_fields = 2 * (GGML_OP_COUNT + 1) * cuda_component_fields;
+        std::vector<uint64_t> op_totals(phase_count * op_phase_fields, 0);
+        // Same order as ggml_cuda_hc_projection.
+        constexpr const char * hc_projections[] = { "down", "up", "inject" };
+        constexpr size_t hc_phase_fields = std::size(hc_projections) * cuda_component_fields;
+        std::array<uint64_t, phase_count * hc_phase_fields> hc_totals{};
+        if (cuda_stream_state) {
+            if (read_cuda_hc_projections) {
+                read_cuda_hc_projections(cuda_stream_state, hc_totals.data());
+            }
+            if (read_cuda_component_ops) {
+                read_cuda_component_ops(cuda_stream_state, op_totals.data());
+            }
+            if (read_cuda_components) {
+                read_cuda_components(cuda_stream_state, cuda_component_totals.data());
+                for (size_t i = 0; i < server_step * cuda_component_phase_fields; ++i) {
+                    cuda_component_totals[server_step * cuda_component_phase_fields + i % cuda_component_phase_fields] += cuda_component_totals[i];
+                }
+            }
+            finish_cuda_stream(cuda_stream_state, cuda_gpu.data());
+            cuda_stream_state = nullptr;
+            for (size_t i = 0; i < server_step * cuda_gpu_fields; ++i) {
+                cuda_gpu[server_step * cuda_gpu_fields + i % cuda_gpu_fields] += cuda_gpu[i];
+            }
+        }
+        static constexpr const char * names[] = {"target_prefill", "target_decode", "target_verify", "target_mixed", "draft", "draft_catchup", "server_step_total"};
+        for (size_t i = 0; i < phases.size(); ++i) {
+            const auto & item = phases[i];
+            if (item.calls == 0) {
+                continue;
+            }
+            const auto & totals = item.totals;
+            SRV_INF("decode_telemetry: phase=%s calls=%" PRIu64 " target_tokens=%" PRIu64 " graphs=%" PRIu64 " scheduled_splits=%" PRIu64 " wall_ms=%.3f\n",
+                    names[i], item.calls, item.target_tokens, totals.graphs, totals.splits, item.wall_us / 1e3);
+            if (totals.packed_misses) {
+                const auto & h = *totals.packed_misses;
+                uint64_t steps = 0;
+                uint64_t uploads = 0;
+                uint64_t steps_5plus = 0;
+                size_t max_unique = 0;
+                for (size_t n = 0; n < h.bins.size(); ++n) {
+                    const auto count = h.bins[n];
+                    steps += count;
+                    uploads += n * count;
+                    if (n >= 5) {
+                        steps_5plus += count;
+                    }
+                    if (count) {
+                        max_unique = n;
+                    }
+                }
+                if (steps) {
+                    SRV_INF("decode_telemetry: phase=%s expert_requests=%" PRIu64 " expert_request_misses=%" PRIu64
+                            " expert_promotions=%" PRIu64 " expert_writeback_bytes=%" PRIu64 "\n",
+                            names[i], h.transfer.requests, h.transfer.misses, h.transfer.promotions, h.transfer.writeback_bytes);
+                    SRV_INF("decode_telemetry: phase=%s expert_miss_histogram steps=%" PRIu64 " miss_0=%" PRIu64
+                            " miss_1=%" PRIu64 " miss_2=%" PRIu64 " miss_3=%" PRIu64 " miss_4=%" PRIu64
+                            " miss_5plus=%" PRIu64 " max_unique=%zu unique_uploads=%" PRIu64
+                            " uploaded_bytes=%" PRIu64 " uploaded_bytes_3plus=%" PRIu64 "\n",
+                            names[i], steps, h.bins[0], h.bins[1], h.bins[2], h.bins[3], h.bins[4],
+                            steps_5plus, max_unique, uploads, h.bytes, h.bytes_3plus);
+                }
+            }
+            if (read_cuda) {
+                const auto & c = totals.cuda;
+                SRV_INF("decode_telemetry: phase=%s cuda_stream_synchronize=%" PRIu64 " cuda_event_synchronize=%" PRIu64
+                        " cuda_stream_wait_event=%" PRIu64 " cuda_device_synchronize=%" PRIu64 "\n",
+                        names[i], c[0], c[1], c[2], c[3]);
+            }
+            if (read_cuda_wait) {
+                const auto & c = totals.cuda_wait_ns;
+                SRV_INF("decode_telemetry: phase=%s cuda_stream_synchronize_cpu_ms=%.3f cuda_event_synchronize_cpu_ms=%.3f"
+                        " cuda_stream_wait_event_cpu_ms=%.3f cuda_device_synchronize_cpu_ms=%.3f\n",
+                        names[i], c[0] / 1e6, c[1] / 1e6, c[2] / 1e6, c[3] / 1e6);
+            }
+            const uint64_t * cuda_spans = cuda_gpu.data() + i * cuda_gpu_fields;
+            if (cuda_spans[0] || cuda_spans[2] || cuda_spans[3]) {
+                SRV_INF("decode_telemetry: phase=%s cuda_gpu_stream_span_samples=%" PRIu64 " cuda_gpu_stream_span_ms=%.3f"
+                        " cuda_gpu_stream_span_dropped=%" PRIu64 " cuda_gpu_stream_span_pending=%" PRIu64 "\n",
+                        names[i], cuda_spans[0], cuda_spans[1] / 1e6, cuda_spans[2], cuda_spans[3]);
+            }
+            for (size_t c = 0; c < std::size(cuda_components); ++c) {
+                const uint64_t * row = cuda_component_totals.data() + i * cuda_component_phase_fields + c * cuda_component_fields;
+                if (!row[0]) {
+                    continue;
+                }
+                SRV_INF("decode_telemetry: phase=%s cuda_component=%s cuda_component_dispatches=%" PRIu64 " cuda_component_samples=%" PRIu64
+                        " cuda_component_stream_ms=%.3f cuda_component_cpu_submit_ms=%.3f cuda_component_cpu_wait_ms=%.3f cuda_component_dropped=%" PRIu64 "\n",
+                        names[i], cuda_components[c], row[0], row[1], row[2] / 1e6, row[3] / 1e3, row[4] / 1e3, row[5]);
+            }
+            for (size_t group = 0; group < 2; ++group) {
+                for (int op = 0; op <= GGML_OP_COUNT; ++op) {
+                    const uint64_t * row = op_totals.data() + i * op_phase_fields +
+                        (group * (GGML_OP_COUNT + 1) + op) * cuda_component_fields;
+                    if (!row[0]) {
+                        continue;
+                    }
+                    SRV_INF("decode_telemetry: phase=%s cuda_component=%s cuda_op=%s cuda_op_dispatches=%" PRIu64
+                            " cuda_op_samples=%" PRIu64 " cuda_op_stream_ms=%.3f cuda_op_cpu_submit_ms=%.3f"
+                            " cuda_op_cpu_wait_ms=%.3f cuda_op_dropped=%" PRIu64 "\n",
+                            names[i], group == 0 ? "other" : "hc", op == GGML_OP_COUNT ? "FUSED_GROUP" : ggml_op_name((ggml_op) op),
+                            row[0], row[1], row[2] / 1e6, row[3] / 1e3, row[4] / 1e3, row[5]);
+                }
+            }
+            for (size_t p = 0; p < std::size(hc_projections); ++p) {
+                const uint64_t * row = hc_totals.data() + i * hc_phase_fields + p * cuda_component_fields;
+                if (!row[0]) {
+                    continue;
+                }
+                SRV_INF("decode_telemetry: phase=%s cuda_component=hc cuda_op=MUL_MAT hc_projection=%s hc_projection_dispatches=%" PRIu64
+                        " hc_projection_samples=%" PRIu64 " hc_projection_stream_ms=%.3f hc_projection_cpu_submit_ms=%.3f"
+                        " hc_projection_cpu_wait_ms=%.3f hc_projection_dropped=%" PRIu64 "\n",
+                        names[i], hc_projections[p], row[0], row[1], row[2] / 1e6, row[3] / 1e3, row[4] / 1e3, row[5]);
+            }
+            if (read_vk) {
+                const auto & v = totals.vk;
+                SRV_INF("decode_telemetry: phase=%s vk_compute_submits=%" PRIu64 " vk_transfer_submits=%" PRIu64
+                        " vk_submit_cpu_ms=%.3f vk_fence_wait_calls=%" PRIu64 " vk_fence_wait_cpu_ms=%.3f"
+                        " vk_record_cpu_ms=%.3f vk_fence_poll_episodes=%" PRIu64 " vk_fence_poll_cpu_ms=%.3f"
+                        " vk_semaphore_wait_calls=%" PRIu64 " vk_semaphore_wait_cpu_ms=%.3f\n",
+                        names[i], v[0], v[1], v[2] / 1e6, v[3], v[4] / 1e6,
+                        v[5] / 1e6, v[6], v[7] / 1e6, v[8], v[9] / 1e6);
+            }
+            if (read_vk_detail) {
+                for (size_t cause = 0; cause < std::size(vk_causes); ++cause) {
+                    const uint64_t * v = totals.vk_cpu_detail.data() + cause * vk_cpu_fields;
+                    if (std::none_of(v, v + vk_cpu_fields, [](uint64_t value) { return value != 0; })) {
+                        continue;
+                    }
+                    SRV_INF("decode_telemetry: phase=%s vk_cause=%s vk_compute_submits=%" PRIu64 " vk_transfer_submits=%" PRIu64
+                            " vk_submit_cpu_ms=%.3f vk_fence_wait_calls=%" PRIu64 " vk_fence_wait_cpu_ms=%.3f"
+                            " vk_record_cpu_ms=%.3f vk_fence_poll_episodes=%" PRIu64 " vk_fence_poll_cpu_ms=%.3f"
+                            " vk_semaphore_wait_calls=%" PRIu64 " vk_semaphore_wait_cpu_ms=%.3f\n",
+                            names[i], vk_causes[cause], v[0], v[1], v[2] / 1e6, v[3], v[4] / 1e6,
+                            v[5] / 1e6, v[6], v[7] / 1e6, v[8], v[9] / 1e6);
+                }
+                const auto & v = totals.vk_gpu_detail;
+                if (std::any_of(v.begin(), v.end(), [](uint64_t value) { return value != 0; })) {
+                    SRV_INF("decode_telemetry: phase=%s vk_gpu_compute_segment_samples=%" PRIu64 " vk_gpu_compute_segment_ms=%.3f"
+                            " vk_gpu_compute_segment_dropped=%" PRIu64 " vk_gpu_query_read_cpu_ms=%.3f\n",
+                            names[i], v[0], v[1] / 1e6, v[2], v[3] / 1e6);
+                }
+            }
+        }
+        phases = {};
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -659,6 +1013,7 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+            common_speculative_discard_mtp_anchor(spec, id);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1134,8 +1489,12 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+    server_decode_telemetry decode_telemetry;
 
     void destroy() {
+        if (decode_telemetry.enabled) {
+            decode_telemetry.log_and_reset();
+        }
         spec.reset();
         spec_init.reset();
 
@@ -2405,6 +2764,15 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (decode_telemetry.enabled && decode_telemetry.per_response && slots.size() == 1) {
+            decode_telemetry.pending_response = string_format(
+                "response=%" PRIu64 " task=%d slot=%d prompt_tokens=%d cached_tokens=%d context_tokens=%d generated_tokens=%d"
+                " prompt_ms=%.3f decode_ms=%.3f generation_tps=%.3f draft_accepted=%d draft_generated=%d truncated=%d",
+                ++decode_telemetry.response_index, slot.task->id, slot.id,
+                (int) slot.stats.n_prompt_processed, (int) slot.stats.n_prompt_cached, (int) slot.prompt.n_tokens(),
+                (int) slot.stats.n_gen, slot.stats.t_prompt_ms(), slot.stats.t_gen_ms(), slot.stats.n_gen_tps(),
+                (int) slot.stats.n_draft_accepted, (int) slot.stats.n_draft_tokens, (int) slot.truncated);
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3597,6 +3965,8 @@ private:
             }
         }
 
+        // The total also includes checkpoint and sampler waits outside the decode phase scopes.
+        server_decode_telemetry::scope measure(decode_telemetry, ctx_tgt, server_decode_telemetry::server_step);
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3933,6 +4303,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                server_decode_telemetry::scope measure(decode_telemetry, ctx_dft, server_decode_telemetry::draft);
                 common_speculative_draft(spec.get());
             });
         }
@@ -3944,10 +4315,12 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
-            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-            if (ctx_dft) {
+            const llama_pos pos = slot.prompt.tokens.pos_next();
+            const bool keep_anchor = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && draft.size() == 1 &&
+                    pos > 0 && pos - 1 == ckpt.pos_max && common_speculative_keep_mtp_anchor(spec.get(), slot.id, pos, slot.sampled);
+            if (ctx_dft && !keep_anchor) {
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
@@ -4714,10 +5087,37 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        auto phase = server_decode_telemetry::decode;
+        if (decode_telemetry.enabled) {
+            bool prefill = false;
+            bool decode = false;
+            bool verify = false;
+            for (int i = off; i < off + batch.view.size(); ++i) {
+                const auto & token = batch.tokens[i];
+                if (token.is_prompt) {
+                    prefill = true;
+                } else {
+                    const auto & indices = slots[token.id_slot].spec_i_batch;
+                    const bool is_verify = std::find(indices.begin(), indices.end(), i) != indices.end();
+                    decode |= !is_verify;
+                    verify |= is_verify;
+                }
+            }
+            const int n_phases = int(prefill) + int(decode) + int(verify);
+            if (n_phases > 1) {
+                phase = server_decode_telemetry::mixed;
+            } else if (prefill) {
+                phase = server_decode_telemetry::prefill;
+            } else if (verify) {
+                phase = server_decode_telemetry::verify;
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            server_decode_telemetry::scope measure(decode_telemetry, ctx_tgt, phase, batch.view.size());
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4777,12 +5177,11 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        // Re-evaluate the draft context with the target's hidden rows.
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                server_decode_telemetry::scope measure(decode_telemetry, ctx_dft, server_decode_telemetry::catchup);
                 ok = common_speculative_process(spec.get(), batch.view);
             });
 
