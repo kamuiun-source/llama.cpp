@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -1145,17 +1147,61 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    auto * history = build_conv_history(inp, conv_states_all, conv_kernel_size - 1, conv_channels, il);
+    ggml_tensor * conv_output_silu = nullptr;
+    static const bool conv_history_enabled = [] {
+        const auto * env = std::getenv("GGML_CUDA_SSM_CONV_HISTORY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (conv_history_enabled && cparams.n_rs_seq == 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
+            conv_kernel_size == 4 && conv_states_all->buffer && conv_kernel->buffer && conv_states_all->type == GGML_TYPE_F32 &&
+            conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_states_all->ne[0])) {
+        auto * dev = model.dev_layer(il);
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        const size_t cells = mctx_cur->get_size();
+        const size_t head = mctx_cur->get_head();
+        if (reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+                ggml_backend_buffer_get_type(conv_states_all->buffer) == buft &&
+                ggml_backend_buffer_get_type(conv_kernel->buffer) == buft && head < cells &&
+                cells <= size_t(conv_states_all->ne[1]) / 2) {
+            using make_history_t = ggml_tensor * (*)(ggml_backend_dev_t, ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
+            auto make_history = reinterpret_cast<make_history_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_make_ssm_conv_history"));
+            if (make_history) {
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+                    auto * backend = ggml_backend_sched_get_backend(sched, b);
+                    if (ggml_backend_get_device(backend) != dev) {
+                        continue;
+                    }
+                    const size_t row_size = conv_states_all->nb[1];
+                    auto * slots = ggml_view_2d(ctx0, conv_states_all,
+                            conv_states_all->ne[0], 2, cells * row_size, head * row_size);
+                    conv_output_silu = make_history(dev, ctx0, history, qkv_mixed, conv_kernel, slots);
+                    if (conv_output_silu) {
+                        ggml_backend_sched_set_tensor_backend(sched, conv_output_silu, backend);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    ggml_tensor * conv_input = nullptr;
+    if (!conv_output_silu) {
+        conv_input = ggml_concat(ctx0, history, ggml_transpose(ctx0, qkv_mixed), 0);
+        build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    if (conv_input) {
+        auto * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
@@ -1363,12 +1409,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
-// Read a conv history out of its own recurrent row and write the new tail back.
-// The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
-ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+// Qwen4exp keeps independent recurrent rows for GDN and PLE.
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_history(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
-        ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
         int                  il) {
@@ -1386,7 +1430,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
+    return state;
+}
 
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        int64_t              state_cols,
+        int64_t              channels,
+        int                  il) {
+    auto * state = build_conv_history(inp, conv_states_all, state_cols, channels, il);
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
     build_conv_state_store(inp, conv_states_all, conv_input, state_cols, 0);

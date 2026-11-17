@@ -3013,6 +3013,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MEAN:
             ggml_cuda_op_mean(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (!ggml_cuda_is_ssm_conv_history(dst)) {
+                return false;
+            }
+            ggml_cuda_op_ssm_conv_history(ctx, dst);
+            break;
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
@@ -7004,6 +7010,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->src[0]->ne[0] == 16 && op->src[0]->ne[1] == 1 && op->src[0]->ne[2] % 128 == 0 && op->src[4]->ne[1] == 1;
             }
         }
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE && ggml_cuda_is_ssm_conv_history(op);
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
@@ -7304,7 +7312,21 @@ static void ggml_backend_cuda_expert_zero(ggml_backend_t backend, ggml_tensor * 
     CUDA_CHECK(cudaMemsetAsync(tensor->data, 0, ggml_nbytes(tensor), ctx->stream()));
 }
 
+static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t dev, ggml_context * ctx,
+        ggml_tensor * history, ggml_tensor * x, ggml_tensor * weights, ggml_tensor * slots) {
+    const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+    const auto graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+    if (cc != GGML_CUDA_CC_ADA_LOVELACE || ggml_cuda_fusion_disabled() || (graph_opt && atoi(graph_opt) == 1)) {
+        return nullptr;
+    }
+    return ggml_cuda_make_ssm_conv_history(ctx, history, x, weights, slots);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cuda_make_ssm_conv_history") == 0) {
+        return (void *) ggml_backend_cuda_make_ssm_conv_history;
+    }
     if (strcmp(name, "ggml_backend_cuda_expert_event_ready") == 0) {
         return (void *) ggml_backend_cuda_expert_event_ready;
     }
