@@ -362,6 +362,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> packed_scratch; // original expert ID per scratch slot, -1 if empty
         std::vector<int32_t> packed_scratch_slots; // physical slots when the permanent map can change
         std::vector<uint64_t> packed_last_used;
+        std::vector<int32_t> packed_ram_slots; // pinned tuple index per logical host slot, -1 for normal RAM
         uint64_t packed_lookups = 0;
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
@@ -373,6 +374,7 @@ struct llama_moe_cache::impl {
         int32_t ip;           // index of the bank
         ggml_tensor * cached; // view of the bank used in place of the host experts
         ggml_tensor * cold = nullptr;
+        size_t packed_offset = 0;
     };
 
     struct stats {
@@ -464,6 +466,7 @@ struct llama_moe_cache::impl {
         int32_t host_slot;
         int32_t old_gpu_slot;
         int32_t new_gpu_slot;
+        int32_t writeback_slot = -1;
     };
     packed_promotion pending_promotion{};
     const uint8_t * pending_writeback = nullptr;
@@ -486,6 +489,19 @@ struct llama_moe_cache::impl {
     size_t packed_promotions = 0;
     size_t packed_writeback_bytes = 0;
     int64_t packed_writeback_us = 0;
+    bool profile_packed_ram_copy = false;
+    size_t packed_ram_memcpy_calls = 0;
+    size_t packed_ram_memcpy_bytes = 0;
+    int64_t packed_ram_memcpy_us = 0;
+    uint8_t * packed_ram_base = nullptr;
+    size_t packed_ram_stride = 0;
+    size_t packed_ram_offset = 0;
+    int32_t packed_ram_capacity = 0;
+    int32_t packed_ram_spare = 0;
+    int32_t packed_ram_next = 1;
+    size_t packed_ram_rotations = 0;
+    size_t packed_ram_rotated_bytes = 0;
+    size_t packed_ram_restored_bytes = 0;
     int64_t profile_router_us = 0;
     size_t profile_router_reads = 0;
     int64_t profile_upload_us = 0;
@@ -582,8 +598,8 @@ struct llama_moe_cache::impl {
             std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
             for (const auto & w : placement->weights) {
                 layers.at(w.layer).experts.push_back(w.host);
-                bindings.emplace(w.host, binding{w.layer, 0, w.bank, w.cold});
                 auto & bytes = bytes_per_layer.at(w.layer);
+                bindings.emplace(w.host, binding{w.layer, 0, w.bank, w.cold, bytes});
                 if (w.host->nb[2] > SIZE_MAX - bytes) {
                     throw std::runtime_error("packed expert tuple is too large");
                 }
@@ -597,6 +613,8 @@ struct llama_moe_cache::impl {
                         throw std::runtime_error("dynamic expert residency requires gate/up and down weights");
                     }
                 }
+                const char * ram_copy = std::getenv("LLAMA_EXPERT_PROFILE_RAM_COPY");
+                profile_packed_ram_copy = ram_copy && std::strcmp(ram_copy, "1") == 0;
                 packed_writeback.resize(tuple_bytes);
                 LLAMA_LOG_INFO("packed expert dynamic residency: stale_lookups=%" PRIu64 " writeback_buffer_bytes=%zu\n",
                         packed_min_resident_age, packed_writeback.size());
@@ -644,13 +662,21 @@ struct llama_moe_cache::impl {
                     const auto submit_overlap = reinterpret_cast<overlap_expert_upload_t>(
                             ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_overlap_expert_upload"));
                     if (alloc_overlap_staging && submit_overlap) {
-                        packed_staging.reset(alloc_overlap_staging(placement->target, staging_bytes));
+                        if (overlap_promotion_requested) {
+                            overlap_expert_promotion = reinterpret_cast<overlap_expert_promotion_t>(
+                                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_overlap_expert_promotion"));
+                        }
+                        const char * ram_rotate = std::getenv("LLAMA_EXPERT_RAM_ROTATION");
+                        if (overlap_expert_promotion && ram_rotate && std::strcmp(ram_rotate, "1") == 0) {
+                            init_packed_ram_rotation(alloc_overlap_staging, staging_bytes, tuple_bytes);
+                        }
+                        if (!packed_staging) {
+                            packed_staging.reset(alloc_overlap_staging(placement->target, staging_bytes));
+                        }
                         if (packed_staging) {
                             overlap_expert_upload = submit_overlap;
-                            if (overlap_promotion_requested) {
-                                overlap_expert_promotion = reinterpret_cast<overlap_expert_promotion_t>(
-                                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_overlap_expert_promotion"));
-                            }
+                        } else {
+                            overlap_expert_promotion = nullptr;
                         }
                     }
                 }
@@ -967,6 +993,7 @@ struct llama_moe_cache::impl {
     ~impl() {
         // The context synchronizes its backends before destroying the cache.
         GGML_ASSERT(!pending_writeback);
+        restore_packed_ram_slots();
         log_stats();
         if (trace != nullptr) {
             fclose(trace);
@@ -1073,6 +1100,65 @@ struct llama_moe_cache::impl {
         return l.packed_lookups - oldest >= packed_min_resident_age ? evict : -1;
     }
 
+    void init_packed_ram_rotation(ggml_backend_buffer_t (*alloc)(ggml_backend_dev_t, size_t), size_t upload_bytes, size_t tuple_bytes) {
+        // Leave ordinary RAM slots pageable and reserve one pinned tuple for the next writeback.
+        constexpr size_t pool_bytes = 64 * 1024 * 1024;
+        constexpr size_t alignment = 32;
+        if (!tuple_bytes || tuple_bytes > pool_bytes / 2 || upload_bytes > SIZE_MAX - pool_bytes - 2 * alignment) {
+            return;
+        }
+        const size_t stride = (tuple_bytes + alignment - 1) / alignment * alignment;
+        const size_t offset = (upload_bytes + alignment - 1) / alignment * alignment;
+        const int32_t capacity = static_cast<int32_t>(pool_bytes / stride);
+        const size_t bytes = offset + capacity * stride;
+        ggml_backend_buffer_ptr buffer(alloc(placement->target, bytes));
+        if (!buffer || ggml_backend_buffer_get_size(buffer.get()) < bytes) {
+            return;
+        }
+
+        for (size_t il = 0; il < placement->maps.size(); ++il) {
+            auto & l = layers[il];
+            l.packed_ram_slots.assign(llama_expert_profile::n_experts - llama_expert_profile::n_resident, -1);
+        }
+        packed_staging = std::move(buffer);
+        packed_ram_offset = offset;
+        packed_ram_base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get())) + offset;
+        packed_ram_stride = stride;
+        packed_ram_capacity = capacity;
+    }
+
+    uint8_t * packed_host_data(const layer & l, const ggml_tensor * host, int32_t host_slot, size_t plane_offset) const {
+        if (!l.packed_ram_slots.empty()) {
+            const int32_t slot = l.packed_ram_slots[host_slot];
+            if (slot >= 0) {
+                return packed_ram_base + slot * packed_ram_stride + plane_offset;
+            }
+        }
+        return static_cast<uint8_t *>(host->data) + host_slot * host->nb[2];
+    }
+
+    void restore_packed_ram_slots() noexcept {
+        if (!packed_ram_base) {
+            return;
+        }
+        // Placement can outlive this cache and its pinned buffer.
+        for (const auto & l : layers) {
+            for (size_t host_slot = 0; host_slot < l.packed_ram_slots.size(); ++host_slot) {
+                const int32_t slot = l.packed_ram_slots[host_slot];
+                if (slot < 0) {
+                    continue;
+                }
+                const auto * data = packed_ram_base + slot * packed_ram_stride;
+                for (const auto * host : l.experts) {
+                    const size_t stride = host->nb[2];
+                    std::memcpy(static_cast<uint8_t *>(host->data) + host_slot * stride, data, stride);
+                    data += stride;
+                    packed_ram_restored_bytes += stride;
+                }
+            }
+        }
+    }
+
     packed_promotion prepare_packed_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict) const {
         const auto & map = placement->maps[il];
         packed_promotion move{};
@@ -1096,7 +1182,7 @@ struct llama_moe_cache::impl {
                     static_cast<size_t>(move.new_gpu_slot) >= ggml_nbytes(bank) / stride) {
                 throw std::runtime_error("invalid packed expert writeback range");
             }
-            move.planes[i] = {bank, static_cast<uint8_t *>(host->data) + move.host_slot * stride, stride};
+            move.planes[i] = {bank, packed_host_data(l, host, move.host_slot, move.bytes), stride};
             move.bytes += stride;
         }
         return move;
@@ -1107,11 +1193,32 @@ struct llama_moe_cache::impl {
         auto & l = layers[move.il];
         GGML_ASSERT(map.host[move.promote] == move.host_slot && map.resident[move.evict] == move.old_gpu_slot &&
                 l.packed_scratch[move.scratch_index] == move.promote && packed_slot(l, move.scratch_index) == move.new_gpu_slot);
-        // All victim planes are available before changing either original.
-        for (size_t i = 0; i < move.n_planes; ++i) {
-            const auto & p = move.planes[i];
-            std::memcpy(p.host_data, victim_data, p.stride);
-            victim_data += p.stride;
+        // Publish the new RAM owner only after all victim planes are available.
+        if (move.writeback_slot >= 0) {
+            auto & slot = l.packed_ram_slots[move.host_slot];
+            GGML_ASSERT(slot != move.writeback_slot);
+            if (slot >= 0) {
+                GGML_ASSERT(move.writeback_slot == packed_ram_spare);
+                packed_ram_spare = slot;
+            } else {
+                GGML_ASSERT(move.writeback_slot == packed_ram_next && packed_ram_next < packed_ram_capacity);
+                ++packed_ram_next;
+            }
+            slot = move.writeback_slot;
+            ++packed_ram_rotations;
+            packed_ram_rotated_bytes += move.bytes;
+        } else {
+            const int64_t start = profile_packed_ram_copy ? ggml_time_us() : 0;
+            for (size_t i = 0; i < move.n_planes; ++i) {
+                const auto & p = move.planes[i];
+                std::memcpy(p.host_data, victim_data, p.stride);
+                victim_data += p.stride;
+            }
+            if (profile_packed_ram_copy) {
+                packed_ram_memcpy_us += ggml_time_us() - start;
+                packed_ram_memcpy_calls += move.n_planes;
+                packed_ram_memcpy_bytes += move.bytes;
+            }
         }
         map.host[move.evict] = move.host_slot;
         map.host[move.promote] = -1;
@@ -1154,14 +1261,14 @@ struct llama_moe_cache::impl {
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
         const auto & map = placement->maps[il];
         auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
-        const size_t staging_bytes = ggml_backend_buffer_get_size(packed_staging.get());
+        const size_t staging_bytes = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         size_t bytes = 0;
         for (const auto & fill : fills) {
             const int32_t slot = cold ? fill.slot : packed_slot(l, fill.slot);
             for (ggml_tensor * host : l.experts) {
                 const auto & binding = bindings.at(host);
                 const size_t stride = host->nb[2];
-                const auto * data = static_cast<const uint8_t *>(host->data) + map.host[fill.expert] * stride;
+                const auto * data = packed_host_data(l, host, map.host[fill.expert], binding.packed_offset);
                 GGML_ASSERT(stride <= staging_bytes - bytes);
                 std::memcpy(staging + bytes, data, stride);
                 ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, staging + bytes, slot * stride, stride);
@@ -1205,7 +1312,7 @@ struct llama_moe_cache::impl {
         }
 
         auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
-        const size_t staging_bytes = ggml_backend_buffer_get_size(packed_staging.get());
+        const size_t staging_bytes = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         constexpr size_t max_regions = max_lanes * max_planes;
         std::array<ggml_tensor *, max_regions> tensors;
         std::array<size_t, max_regions> offsets, sizes, staging_offsets;
@@ -1215,7 +1322,8 @@ struct llama_moe_cache::impl {
             const int32_t slot = packed_slot(l, fill.slot);
             const int32_t host_slot = map.host[fill.expert];
             for (auto * host : l.experts) {
-                auto * bank = bindings.at(host).cached;
+                const auto & binding = bindings.at(host);
+                auto * bank = binding.cached;
                 const size_t stride = host->nb[2];
                 if (n_regions == max_regions || !stride || stride > staging_bytes - used_bytes ||
                         slot < 0 || static_cast<size_t>(slot) >= ggml_nbytes(bank) / stride ||
@@ -1227,14 +1335,14 @@ struct llama_moe_cache::impl {
                 sizes[n_regions] = stride;
                 staging_offsets[n_regions] = used_bytes;
                 ++n_regions;
-                std::memcpy(staging + used_bytes, static_cast<const uint8_t *>(host->data) + host_slot * stride, stride);
+                std::memcpy(staging + used_bytes, packed_host_data(l, host, host_slot, binding.packed_offset), stride);
                 used_bytes += stride;
             }
         }
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
         if (evict >= 0) {
             GGML_ASSERT(!pending_writeback && overlap_expert_promotion);
-            const auto move = prepare_packed_promotion(l, il, promote_index, evict);
+            auto move = prepare_packed_promotion(l, il, promote_index, evict);
             if (move.bytes > staging_bytes - used_bytes ||
                     std::find(used_slots.begin(), used_slots.begin() + ids.size(), move.old_gpu_slot) != used_slots.begin() + ids.size()) {
                 return false;
@@ -1242,13 +1350,24 @@ struct llama_moe_cache::impl {
             std::array<ggml_tensor *, max_planes> writeback_weights;
             std::array<size_t, max_planes> writeback_offsets;
             size_t offset = used_bytes;
+            if (!l.packed_ram_slots.empty()) {
+                const int32_t old_slot = l.packed_ram_slots[move.host_slot];
+                if (old_slot >= 0) {
+                    move.writeback_slot = packed_ram_spare;
+                } else if (packed_ram_next < packed_ram_capacity) {
+                    move.writeback_slot = packed_ram_next;
+                }
+                if (move.writeback_slot >= 0) {
+                    offset = packed_ram_offset + move.writeback_slot * packed_ram_stride;
+                }
+            }
+            pending_writeback = staging + offset;
             for (size_t i = 0; i < move.n_planes; ++i) {
                 writeback_weights[i] = move.planes[i].bank;
                 writeback_offsets[i] = offset;
                 offset += move.planes[i].stride;
             }
             pending_promotion = move;
-            pending_writeback = staging + used_bytes;
             try {
                 if (!overlap_expert_promotion(backend, graph, slot_map, slots.data(), used_slots.data(), hot_masks.data(),
                         tensors.data(), staging, offsets.data(), sizes.data(), staging_offsets.data(), n_regions,
@@ -1327,7 +1446,7 @@ struct llama_moe_cache::impl {
                         static_cast<size_t>(host_slot) >= ggml_nbytes(host) / stride || stride > SIZE_MAX - rtx_bytes) {
                     return 0;
                 }
-                host_slices[r * planes.size() + p] = static_cast<const uint8_t *>(host->data) + static_cast<size_t>(host_slot) * stride;
+                host_slices[r * planes.size() + p] = packed_host_data(l, host, host_slot, bindings.at(host).packed_offset);
                 rtx_bytes += stride;
             }
         }
@@ -1554,7 +1673,7 @@ struct llama_moe_cache::impl {
                     for (ggml_tensor * host : l.experts) {
                         ggml_tensor * bank = bindings.at(host).cached;
                         const size_t stride = host->nb[2];
-                        const auto * data = static_cast<const uint8_t *>(host->data) + map.host[expert] * stride;
+                        const auto * data = packed_host_data(l, host, map.host[expert], bindings.at(host).packed_offset);
                         ggml_backend_tensor_set(bank, data, slot * stride, stride);
                         bytes += stride;
                     }
@@ -1770,6 +1889,15 @@ struct llama_moe_cache::impl {
             if (rtx_expert) {
                 LLAMA_LOG_INFO("packed expert RTX offload: eligible_steps=%zu submitted_steps=%zu fallback_steps=%zu unique_experts=%zu ranks=%zu uploaded_bytes=%zu\n",
                         rtx_eligible_steps, rtx_steps, rtx_eligible_steps - rtx_steps, rtx_unique_experts, rtx_ranks, rtx_uploaded_bytes);
+            }
+            if (profile_packed_ram_copy) {
+                LLAMA_LOG_INFO("packed expert promotion RAM memcpy: calls=%zu bytes=%zu cpu_ms=%.3f\n",
+                        packed_ram_memcpy_calls, packed_ram_memcpy_bytes, packed_ram_memcpy_us / 1000.0);
+            }
+            if (packed_ram_base) {
+                LLAMA_LOG_INFO("packed expert RAM rotation: rotations=%zu bytes=%zu pool_bytes=%zu live_slots=%d restored_bytes=%zu\n",
+                        packed_ram_rotations, packed_ram_rotated_bytes, packed_ram_capacity * packed_ram_stride,
+                        packed_ram_next - 1, packed_ram_restored_bytes);
             }
             if (placement->dynamic_resident) {
                 LLAMA_LOG_INFO("packed expert dynamic residency: promotions=%zu evictions=%zu writeback_bytes=%zu writeback_ms=%.3f uploaded_bytes=%zu total_transfer_bytes=%zu total_transfer_ms=%.3f\n",

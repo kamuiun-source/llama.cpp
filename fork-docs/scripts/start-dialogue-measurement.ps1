@@ -8,6 +8,8 @@ param(
     [switch]$HcUpReuse,
     [switch]$HcInjectSplit,
     [switch]$HcAll,
+    [switch]$ExpertRamCopyTiming,
+    [switch]$ExpertRamRotation,
     [string]$BuildDirectory = 'G:\AI\build-rtx-validation'
 )
 
@@ -29,14 +31,16 @@ foreach ($path in @($cli, $settingsPath, $model, $draft)) {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing: $path" }
 }
 $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-$keys = @($settings.Environment.PSObject.Properties.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS') + @($projections | ForEach-Object { $_.Key })
+$keys = @($settings.Environment.PSObject.Properties.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'GGML_SCHED_OVERLAP_SHARED_READBACK', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_RAM_ROTATION') + @($projections | ForEach-Object { $_.Key })
 $keys = @($keys | Select-Object -Unique)
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
 $projectionLabel = if ($activeProjections.Count -eq $projections.Count) { 'hc-all-' }
     elseif ($activeProjections.Count) { 'hc-' + (($activeProjections | ForEach-Object { $_.Name }) -join '-') + '-' }
     else { '' }
-$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
+$ramLabel = if ($ExpertRamRotation) { 'ram-rotation-' } else { '' }
+if ($ExpertRamCopyTiming) { $ramLabel += 'ram-timing-' }
+$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
 New-Item -ItemType Directory -Path $runDir | Out-Null
 
 try {
@@ -45,6 +49,9 @@ try {
     }
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RTX_COLD_SLOTS', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('GGML_SCHED_OVERLAP_SHARED_READBACK', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PROFILE_RAM_COPY', $(if ($ExpertRamCopyTiming) { '1' } else { $null }), 'Process')
+    [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RAM_ROTATION', $(if ($ExpertRamRotation) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_DECODE_TELEMETRY_PER_RESPONSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_MIX_FUSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_SCALE_SILU_FUSE', $(if ($HcScaleSilu) { '1' } else { $null }), 'Process')
@@ -67,7 +74,7 @@ try {
     foreach ($key in $keys) {
         if ($key -ne 'PATH') { $effective[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
     }
-    @{ Mode=$Mode; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed') } |
+    @{ Mode=$Mode; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed' -or $ExpertRamCopyTiming) } |
         ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'settings.json') -Encoding UTF8
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\research\dialogue-benchmark-prompts.md') -Destination $runDir
     $runArgs = @('-lv', '4', '--log-file', (Join-Path $runDir 'dialogue.log'), '--simple-io', '--color', 'off',
@@ -88,6 +95,12 @@ try {
     "exit_code=$code" | Set-Content (Join-Path $runDir 'exit.txt')
     if ($code -ne 0) { throw "llama-cli failed: $code" }
     $dialogueLog = Join-Path $runDir 'dialogue.log'
+    if ($ExpertRamCopyTiming -and !(Select-String -LiteralPath $dialogueLog -SimpleMatch 'packed expert promotion RAM memcpy:' -Quiet)) {
+        throw 'Expert RAM copy timing did not activate. Check the binary and dynamic Expert placement.'
+    }
+    if ($ExpertRamRotation -and !(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: rotations=[1-9][0-9]*' -Quiet)) {
+        throw 'Expert RAM rotation did not activate. Check the binary and Expert promotion overlap.'
+    }
     foreach ($projection in $activeProjections) {
         if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch $projection.Marker -Quiet)) {
             throw "HC $($projection.Name) did not activate. Check the binary, tensor type, shape and layout."
