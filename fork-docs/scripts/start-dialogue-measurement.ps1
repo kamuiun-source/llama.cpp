@@ -10,6 +10,7 @@ param(
     [switch]$HcAll,
     [switch]$ExpertRamCopyTiming,
     [switch]$ExpertRamRotation,
+    [switch]$SharedHostExpertReturn,
     [string]$BuildDirectory = 'G:\AI\build-rtx-validation'
 )
 
@@ -31,7 +32,7 @@ foreach ($path in @($cli, $settingsPath, $model, $draft)) {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing: $path" }
 }
 $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-$keys = @($settings.Environment.PSObject.Properties.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'GGML_SCHED_OVERLAP_SHARED_READBACK', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_RAM_ROTATION') + @($projections | ForEach-Object { $_.Key })
+$keys = @($settings.Environment.PSObject.Properties.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'GGML_SCHED_OVERLAP_SHARED_READBACK', 'GGML_SCHED_SHARED_HOST_EXPERT_RETURN', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_RAM_ROTATION') + @($projections | ForEach-Object { $_.Key })
 $keys = @($keys | Select-Object -Unique)
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
@@ -40,6 +41,7 @@ $projectionLabel = if ($activeProjections.Count -eq $projections.Count) { 'hc-al
     else { '' }
 $ramLabel = if ($ExpertRamRotation) { 'ram-rotation-' } else { '' }
 if ($ExpertRamCopyTiming) { $ramLabel += 'ram-timing-' }
+if ($SharedHostExpertReturn) { $ramLabel += 'shared-host-return-' }
 $runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
 New-Item -ItemType Directory -Path $runDir | Out-Null
 
@@ -50,6 +52,7 @@ try {
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RTX_COLD_SLOTS', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_SCHED_OVERLAP_SHARED_READBACK', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('GGML_SCHED_SHARED_HOST_EXPERT_RETURN', $(if ($SharedHostExpertReturn) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PROFILE_RAM_COPY', $(if ($ExpertRamCopyTiming) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RAM_ROTATION', $(if ($ExpertRamRotation) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_DECODE_TELEMETRY_PER_RESPONSE', $null, 'Process')
@@ -95,6 +98,9 @@ try {
     "exit_code=$code" | Set-Content (Join-Path $runDir 'exit.txt')
     if ($code -ne 0) { throw "llama-cli failed: $code" }
     $dialogueLog = Join-Path $runDir 'dialogue.log'
+    if ($SharedHostExpertReturn -and !(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert return: copies=[1-9][0-9]*' -Quiet)) {
+        throw 'Shared host Expert return did not activate. Check the binary, producer graph and host memory import.'
+    }
     if ($ExpertRamCopyTiming -and !(Select-String -LiteralPath $dialogueLog -SimpleMatch 'packed expert promotion RAM memcpy:' -Quiet)) {
         throw 'Expert RAM copy timing did not activate. Check the binary and dynamic Expert placement.'
     }

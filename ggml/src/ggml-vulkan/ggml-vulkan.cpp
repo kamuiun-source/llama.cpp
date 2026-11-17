@@ -13367,8 +13367,34 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
     ++overlap.split_ffns;
 }
 
-bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin,
-                         int node_idx_begin, bool last_node, bool almost_ready, bool submit, int full_hot_count, bool full_hot_scratch) {
+struct ggml_vk_graph_readback {
+    vk_buffer source;
+    vk_buffer target;
+    size_t offset = 0;
+    size_t bytes = 0;
+    bool recorded = false;
+
+    void record(vk_context & compute_ctx) {
+        auto & cmd = compute_ctx->s->buffer->buf;
+        const vk::BufferMemoryBarrier ready{
+            vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferRead,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, source->buffer, offset, bytes,
+        };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+                vk::PipelineStageFlagBits::eTransfer, {}, {}, { ready }, {});
+        cmd.copyBuffer(source->buffer, target->buffer, { vk::BufferCopy{ offset, 0, bytes } });
+        const vk::BufferMemoryBarrier visible{
+            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, target->buffer, 0, bytes,
+        };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, {}, { visible }, {});
+        recorded = true;
+    }
+};
+
+static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin,
+                         int node_idx_begin, bool last_node, bool almost_ready, bool submit, int full_hot_count, bool full_hot_scratch,
+                         ggml_vk_graph_readback * readback) {
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
@@ -13954,6 +13980,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 #endif
 
     if (submit || last_node) {
+        if (last_node && readback) {
+            readback->record(compute_ctx);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -15647,7 +15676,8 @@ static bool ggml_vk_compact_expert_graph(const ggml_backend_vk_context * ctx, co
 #endif
 }
 
-static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph,
+        const ggml_tensor * output, ggml_vk_graph_readback * readback) {
     vk_telemetry_scope scope(VK_TEL_GRAPH_COMPUTE);
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -15673,6 +15703,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
     while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) || ((cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0))) {
         last_node -= 1;
+    }
+
+    if (readback && (last_node < 0 || cgraph->nodes[last_node] != output)) {
+        readback = nullptr;
     }
 
     // Reserve tensor context space for all nodes
@@ -16106,7 +16140,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const bool compacted = compact_experts && near_end && !submit && !ctx->almost_ready_fence_pending;
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, is_last, almost_ready, submit,
-                                           full_hot_count, full_hot_scratch != 0);
+                                           full_hot_count, full_hot_scratch != 0, readback);
         if (enqueued && compacted && !ctx->compact_expert_logged) {
             GGML_LOG_INFO("ggml_vulkan: %s compact expert submit applied\n", ctx->name.c_str());
             ctx->compact_expert_logged = true;
@@ -16207,6 +16241,45 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
+}
+
+static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    return ggml_backend_vk_graph_compute_impl(backend, cgraph, nullptr, nullptr);
+}
+
+static ggml_status ggml_backend_vk_graph_readback(ggml_backend_t backend, ggml_cgraph * graph,
+        const ggml_tensor * output, ggml_backend_buffer_t staging, bool * recorded) {
+    *recorded = false;
+#ifndef GGML_VULKAN_CHECK_RESULTS
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    const size_t bytes = ggml_nbytes(output);
+    if (!ctx->device->support_async || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
+            ctx->device->has_internally_synchronized_queues || ctx->final_fence_pending ||
+            !ggml_vk_reuse_graph_fence_enabled() || vk_perf_logger_enabled ||
+            output->type != GGML_TYPE_F32 || !ggml_is_contiguous(output) || output->view_src || !output->buffer ||
+            !output->data || output->buffer->buft != &ctx->device->buffer_type || !staging ||
+            staging->buft != &ctx->device->buffer_type || !bytes) {
+        return ggml_backend_vk_graph_compute(backend, graph);
+    }
+
+    auto source = static_cast<ggml_backend_vk_buffer_context *>(output->buffer->context)->dev_buffer;
+    auto target = static_cast<ggml_backend_vk_buffer_context *>(staging->context)->dev_buffer;
+    const size_t offset = vk_tensor_offset(output);
+    if (!source || !target || source == target || target->device != ctx->device || source->device != ctx->device ||
+            offset % 4 || bytes % 4 || offset > source->size || bytes > source->size - offset || bytes > target->size ||
+            !(target->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+        return ggml_backend_vk_graph_compute(backend, graph);
+    }
+
+    ggml_vk_graph_readback readback{source, target, offset, bytes};
+    const auto status = ggml_backend_vk_graph_compute_impl(backend, graph, output, &readback);
+    *recorded = readback.recorded;
+    return status;
+#else
+    GGML_UNUSED(output);
+    GGML_UNUSED(staging);
+    return ggml_backend_vk_graph_compute(backend, graph);
+#endif
 }
 
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
@@ -18083,6 +18156,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_get_telemetry") == 0) {
         return (void *) ggml_backend_vk_get_telemetry;
+    }
+    if (strcmp(name, "ggml_backend_vk_graph_readback") == 0) {
+        return (void *) ggml_backend_vk_graph_readback;
     }
     if (strcmp(name, "ggml_backend_vk_alloc_overlap_expert_bank") == 0) {
         return (void *) ggml_backend_vk_alloc_overlap_expert_bank;
