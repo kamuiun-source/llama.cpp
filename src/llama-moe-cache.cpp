@@ -744,11 +744,12 @@ struct llama_moe_cache::impl {
                     histogram && std::strcmp(histogram, "1") == 0;
             if (reg && telemetry && std::strcmp(telemetry, "1") == 0) {
                 set_telemetry_cause = (telemetry_cause_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_telemetry_cause");
-                const char * gate_up_diag = std::getenv("GGML_VK_MTP_GATE_UP_TIMING");
-                if (gate_up_diag && std::strcmp(gate_up_diag, "1") == 0) {
-                    gate_up_diag_ids = reinterpret_cast<gate_up_diag_ids_t>(
-                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_gate_up_diagnostic_ids"));
-                }
+            }
+            const char * gate_up_diag = std::getenv("GGML_VK_MTP_GATE_UP_TIMING");
+            if (gate_up_diag && std::strcmp(gate_up_diag, "1") == 0) {
+                gate_up_diag_ids = reg ? reinterpret_cast<gate_up_diag_ids_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_gate_up_diagnostic_ids")) : nullptr;
+                LLAMA_LOG_INFO("mtp gate-up host IDs: callback=%s\n", gate_up_diag_ids ? "available" : "unavailable");
             }
             defer_slot_map_requested = !placement->overlap;
             if (defer_slot_map_requested) {

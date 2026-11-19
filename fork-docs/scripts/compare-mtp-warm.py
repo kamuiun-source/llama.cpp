@@ -316,6 +316,7 @@ def gate_up_metrics(log, routed, require_pair=False):
 
 
 def gate_up_timing_metrics(log):
+    require("mtp gate-up host IDs: callback=available" in log, "missing native gate/up host-ID callback")
     groups = {}
     fields = ("dispatches", "timed", "dropped", "ns", "phases", "proven", "matched", "shared")
     expected = {(quant, phase) for quant in ("IQ2_S", "IQ3_XXS")
@@ -416,6 +417,7 @@ def main():
             require_binary_strings(library.with_name("ggml-vulkan.dll"), ("mtp fast-three Vulkan:", GATE_UP, ROUTED_WEIGHTED))
         if pair_timing:
             require_binary_strings(library.with_name("ggml-vulkan.dll"), ("mtp gate-up timing:",))
+            require_binary_strings(library.with_name("llama.dll"), ("mtp gate-up host IDs:",))
         baseline = COMMON["build_environment"]()
         baseline.update({"LLAMA_EXPERT_PREFILL_512": "1", "LLAMA_EXPERT_PREFILL_512_POLICY": "auto",
                          "LLAMA_EXPERT_PREFILL_LOGICAL_TICKS": "1", "LLAMA_EXPERT_PREFILL_OVERLAP_TEN": "1",
