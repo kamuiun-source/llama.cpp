@@ -61,18 +61,13 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     : target(target), max_ubatch(packed_max_ubatch()), n_slots(packed_scratch_capacity(n_expert_used, max_ubatch)), overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
-    }()), dynamic_resident([] {
-        const char * value = std::getenv("LLAMA_EXPERT_DYNAMIC_RESIDENT");
-        return value && std::strcmp(value, "1") == 0;
-    }()) {
+    }()), dynamic_resident(!overlap &&
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0) {
     if (max_ubatch > 1 && !dynamic_resident) {
-        throw std::runtime_error("packed expert batching requires LLAMA_EXPERT_DYNAMIC_RESIDENT=1");
+        throw std::runtime_error("packed expert batching requires dynamic Vulkan residency");
     }
     if (dynamic_resident) {
-        const char * reuse = std::getenv("LLAMA_EXPERT_SCRATCH_REUSE");
-        if (overlap || (reuse && std::strcmp(reuse, "0") == 0) ||
-                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
-                n_slots <= 0 || n_slots > n_experts - n_resident) {
+        if (n_slots <= 0 || n_slots > n_experts - n_resident) {
             throw std::runtime_error("dynamic expert residency requires synchronous Vulkan placement with scratch reuse");
         }
     }
@@ -125,8 +120,7 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     }
     using alloc_overlap_bank_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, ggml_context *);
     alloc_overlap_bank_t alloc_overlap_bank = nullptr;
-    const char * overlap_upload = std::getenv("LLAMA_EXPERT_VK_OVERLAP_UPLOAD");
-    if (!overlap && dynamic_resident && max_ubatch == 2 && overlap_upload && std::strcmp(overlap_upload, "1") == 0) {
+    if (!overlap && dynamic_resident && max_ubatch == 2) {
         const auto reg = ggml_backend_dev_backend_reg(target);
         if (reg) {
             alloc_overlap_bank = reinterpret_cast<alloc_overlap_bank_t>(

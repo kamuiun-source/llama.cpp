@@ -1149,11 +1149,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     auto * history = build_conv_history(inp, conv_states_all, conv_kernel_size - 1, conv_channels, il);
     ggml_tensor * conv_output_silu = nullptr;
-    static const bool conv_history_enabled = [] {
-        const auto * env = std::getenv("GGML_CUDA_SSM_CONV_HISTORY");
-        return env && std::strcmp(env, "1") == 0;
-    }();
-    if (conv_history_enabled && cparams.n_rs_seq == 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
+    if (cparams.n_rs_seq == 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
             conv_kernel_size == 4 && conv_states_all->buffer && conv_kernel->buffer && conv_states_all->type == GGML_TYPE_F32 &&
             conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_states_all->ne[0])) {
         auto * dev = model.dev_layer(il);

@@ -120,3 +120,8 @@ Parent reviews only; no commit/push/main integration. Full model builds/runs by 
 - 現在の検証基準は `cb7235b20`。ユーザー判断で `-RecurrentConvHistory` を採用。 `-ExpertRamRotation -SharedHostExpertInput -SharedHostExpertReturn -MtpDevicePending` と併用する。Q8再利用と戻り2枠化はOFF。
 - 固定5回答で40.53秒、30.00 tok/s。第4回答29.45 tok/s。未発動の比較ログは41.46秒、29.33 tok/s。生成数と受理数は一致。同一バイナリでの反復測定は未実施。
 - Windowsの増分ビルドではNinjaがQwen4expのUnity依存を拾わず、CUDA側だけ更新されたことがあった。発動マーカー `CUDA SSM convolution history applied` と `exit_code=0` を確認。ソース切替後にモデル側の変更が入らなければ、対象Unity単位を再コンパイルする。
+
+## 採用済みの切り替え削除（2026-11-19）
+
+- 現在の作業ツリーで、検証基準の5スイッチと保存済み設定でONの12項目を整理。配置プロファイル・使用デバイス・対応形状などを条件に自動選択する。通常の計測は start-dialogue-measurement.ps1 -BuildDirectory G:/AI/build-prefill32 -Mode speed。Prefillの実験幅、MTPの指定、観測用のフラグは独立。Prefillの再設計は別作業。フルビルドと実モデルの比較はユーザーが実施。
+- 実機確認 20261119-101723 は8応答・終了0。RAM回転43回、共通RAM入力34,415バッチ・戻り32,264回、MTP device pending 852コピー。256トークンの第3/6応答は16.05/27.19 tok/s。ユーザーによると序盤はブロワー回転設定が低く、固定5問と異なるため性能回帰比較には使わない。

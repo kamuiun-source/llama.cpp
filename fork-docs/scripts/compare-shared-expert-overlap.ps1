@@ -4,14 +4,18 @@ param(
     [string]$Mode = 'speed',
     [ValidateRange(1, 2048)]
     [int]$Tokens = 256,
-    [switch]$FullHot,
+    [string]$BuildDirectory = 'G:\AI\build-prefill32',
     [switch]$PairIQ4NL,
     [switch]$ReverseOrder
 )
 
+if (!$PairIQ4NL) {
+    throw 'This historical comparison requires shared Expert overlap to be configurable. Run the original script with a matching build from 21b588e80, or use -PairIQ4NL for the separate paired-weight comparison.'
+}
+
 $ErrorActionPreference = 'Continue'
-$root = 'G:\AI\llama-hetero-moe'
-$cli = Join-Path $root 'build-win-cuda-vulkan\bin\llama-cli.exe'
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$cli = Join-Path $BuildDirectory 'bin\llama-cli.exe'
 $model = 'G:\AI\share\llm_models\Qwen3.8-Flash-Next-GGUF\UD-IQ3_XXS\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf'
 $placement = 'C:\Users\kamui\.codex\visualizations\2026\11\12\01a1cea8-ae9e-7fc3-a30a-9d8b72f3a31f\flash-next-top300.txt'
 $draft = Join-Path (Split-Path (Split-Path $model)) 'MTP\mtp-Qwen3.8-Flash-Next-Q8_0.gguf'
@@ -20,22 +24,19 @@ foreach ($path in @($cli, $model, $placement, $draft)) {
 }
 
 $stamp = Get-Date -Format yyyyMMdd-HHmmss
-$experiment = if ($PairIQ4NL) { 'vulkan-iq4nl-pair' } else { 'cuda-shared-expert-overlap' }
-$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' "$experiment-$Mode-$stamp"
-$useFullHot = $FullHot -or $PairIQ4NL
+$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' "vulkan-iq4nl-pair-$Mode-$stamp"
 New-Item -ItemType Directory -Path $runDir -ErrorAction Stop | Out-Null
 
-$keys = @('PATH', 'LLAMA_EXPERT_PLACEMENT', 'LLAMA_EXPERT_DEVICE', 'LLAMA_EXPERT_SCRATCH_REUSE',
-    'LLAMA_EXPERT_BATCH_TOKENS', 'LLAMA_EXPERT_DYNAMIC_RESIDENT', 'LLAMA_EXPERT_BATCH_UPLOAD',
-    'LLAMA_EXPERT_OVERLAP', 'LLAMA_EXPERT_OVERLAP_EARLY_COPY', 'LLAMA_EXPERT_ROUTER_HOST_IDS',
+$keys = @('PATH', 'LLAMA_EXPERT_PLACEMENT', 'LLAMA_EXPERT_DEVICE', 'LLAMA_EXPERT_BATCH_TOKENS',
+    'LLAMA_EXPERT_OVERLAP', 'LLAMA_EXPERT_OVERLAP_EARLY_COPY',
     'GGML_VK_GPU_TIMESTAMPS_DEVICE', 'LLAMA_DECODE_TELEMETRY', 'LLAMA_EXPERT_MISS_HISTOGRAM', 'LLAMA_DECODE_PROFILE', 'LLAMA_DECODE_PROFILE_CUDA',
-    'GGML_CUDA_SCHEDULE_SPIN', 'GGML_CUDA_DISABLE_GRAPHS', 'GGML_CUDA_GRAPH_OPT',
+    'GGML_CUDA_DISABLE_GRAPHS', 'GGML_CUDA_GRAPH_OPT',
     'GGML_CUDA_GRAPH_DEBUG', 'GGML_CUDA_GRAPH_CHUNK_SIZE', 'GGML_CUDA_POOL_DEBUG',
-    'LLAMA_EXPERT_VK_DEFER_SLOT_MAP', 'LLAMA_MTP_REUSE_DRAFT_ANCHOR', 'GGML_SCHED_BATCH_DEVICE_INPUTS', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_DISABLE_FUSION', 'GGML_SCHED_BATCH_HOST_INPUTS',
+    'LLAMA_MTP_REUSE_DRAFT_ANCHOR', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_DISABLE_FUSION', 'GGML_SCHED_BATCH_HOST_INPUTS',
     'GGML_VK_ASYNC_USE_TRANSFER_QUEUE', 'GGML_VK_SERIALIZE_SUBMISSIONS', 'GGML_VK_PERF_LOGGER',
     'GGML_VK_PERF_LOGGER_CONCURRENT', 'GGML_VK_PERF_LOGGER_FREQUENCY', 'GGML_VK_SYNC_LOGGER',
     'GGML_VK_MEMORY_LOGGER', 'GGML_VK_PIPELINE_STATS',
-    'GGML_VK_REUSE_GRAPH_FENCE', 'GGML_VK_COMPACT_EXPERT_SUBMITS', 'LLAMA_EXPERT_VK_DEFER_UPLOAD', 'LLAMA_EXPERT_VK_OVERLAP_UPLOAD', 'LLAMA_EXPERT_VK_OVERLAP_PROMOTION', 'LLAMA_EXPERT_VK_FULL_HOT_OVERLAP', 'LLAMA_EXPERT_VK_PAIR_IQ4_NL', 'GGML_SCHED_OVERLAP_SHARED_EXPERT', 'GGML_SCHED_TRACE_EXPERT_HANDOFF',
+    'GGML_VK_COMPACT_EXPERT_SUBMITS', 'LLAMA_EXPERT_VK_DEFER_UPLOAD', 'LLAMA_EXPERT_VK_PAIR_IQ4_NL', 'GGML_SCHED_TRACE_EXPERT_HANDOFF',
     'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_RTX_COLD_VRAM_MIB', 'GGML_CUDA_GPU_TIMESTAMPS_DEVICE', 'GGML_CUDA_PROFILE_COMPONENTS')
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
@@ -47,15 +48,8 @@ try {
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     $env:LLAMA_EXPERT_PLACEMENT = $placement
     $env:LLAMA_EXPERT_DEVICE = 'Vulkan1'
-    $env:LLAMA_EXPERT_SCRATCH_REUSE = '1'
-    $env:LLAMA_EXPERT_BATCH_UPLOAD = '1'
-    $env:LLAMA_EXPERT_DYNAMIC_RESIDENT = '1'
     $env:LLAMA_EXPERT_BATCH_TOKENS = '2'
-    $env:LLAMA_EXPERT_VK_DEFER_SLOT_MAP = '1'
     $env:LLAMA_MTP_REUSE_DRAFT_ANCHOR = '0'
-    $env:GGML_SCHED_BATCH_DEVICE_INPUTS = '1'
-    $env:GGML_CUDA_SCHEDULE_SPIN = '1'
-    $env:LLAMA_EXPERT_ROUTER_HOST_IDS = '1'
     if ($Mode -eq 'telemetry') {
         $env:LLAMA_DECODE_TELEMETRY = '1'
         $env:GGML_SCHED_TRACE_EXPERT_HANDOFF = '1'
@@ -63,21 +57,16 @@ try {
         $env:GGML_VK_GPU_TIMESTAMPS_DEVICE = 'Vulkan1'
     }
 
-    $env:GGML_VK_REUSE_GRAPH_FENCE = '1'
-    $env:LLAMA_EXPERT_VK_OVERLAP_UPLOAD = '1'
-    $env:LLAMA_EXPERT_VK_OVERLAP_PROMOTION = '1'
-    if ($useFullHot) { $env:LLAMA_EXPERT_VK_FULL_HOT_OVERLAP = '1' }
-
     $baseArgs = @('-m', $model, '-dev', 'CUDA0,Vulkan1', '-sm', 'layer', '-ts', '1,0', '-ngl', 'all',
         '--fit', 'off', '--load-mode', 'none', '--lazy-mode', 'on',
         '-c', '2048', '-b', '256', '-ub', '2', '-np', '1', '--reasoning', 'off', '--temp', '0', '--seed', '1234',
         '-n', "$Tokens", '--single-turn', '-p', 'Explain how a bicycle works in detail.',
         '--spec-type', 'draft-mtp', '-md', $draft, '-devd', 'CUDA0', '-ngld', 'all',
         '--spec-draft-n-max', '1', '--spec-draft-n-ubatch', '1')
-    $candidate = if ($PairIQ4NL) { 'pair-iq4nl' } else { 'shared' }
+    $candidate = 'pair-iq4nl'
     $cases = @(
-        @{ Name='baseline'; Shared=[bool]$PairIQ4NL; Pair=$false }
-        @{ Name=$candidate; Shared=$true; Pair=[bool]$PairIQ4NL }
+        @{ Name='baseline'; Pair=$false }
+        @{ Name=$candidate; Pair=$true }
     )
 
     if ($ReverseOrder) { [array]::Reverse($cases) }
@@ -93,14 +82,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Could not record working diff. Logs: $runDir" }
 
     foreach ($case in $cases) {
-        [Environment]::SetEnvironmentVariable('GGML_SCHED_OVERLAP_SHARED_EXPERT', $(if ($case.Shared) { '1' } else { [NullString]::Value }), 'Process')
         [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_VK_PAIR_IQ4_NL', $(if ($case.Pair) { '1' } else { [NullString]::Value }), 'Process')
         $prefix = Join-Path $runDir $case.Name
         $envSettings = [ordered]@{}
         foreach ($key in $keys) {
             if ($key -ne 'PATH') { $envSettings[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
         }
-        [ordered]@{ Name=$case.Name; Mode=$Mode; Tokens=$Tokens; FullHot=$useFullHot; SharedOverlap=$case.Shared; PairIQ4NL=$case.Pair; ReverseOrder=[bool]$ReverseOrder; Environment=$envSettings } |
+        [ordered]@{ Name=$case.Name; Mode=$Mode; Tokens=$Tokens; FullHot=$true; SharedOverlap=$true; PairIQ4NL=$case.Pair; ReverseOrder=[bool]$ReverseOrder; Environment=$envSettings } |
             ConvertTo-Json -Depth 3 | Set-Content "$prefix.settings.json" -Encoding UTF8
         $runArgs = @('-lv', '4', '--log-file', "$prefix.log") + $baseArgs
         $runArgs | ConvertTo-Json | Set-Content "$prefix.arguments.json" -Encoding UTF8
@@ -133,24 +121,19 @@ try {
         if (@(Select-String -LiteralPath $logs -Pattern 'packed expert Vulkan upload overlap: submitted=[1-9][0-9]* bytes=[1-9][0-9]*').Count -eq 0) {
             throw "Existing upload overlap did not activate in $($case.Name). Logs: $runDir"
         }
-        $splitPattern = if ($useFullHot) { 'split_projections=[0-9]+' } else { 'split_projections=[1-9][0-9]*' }
-        if (@(Select-String -LiteralPath $logs -Pattern "expert overlap transfer_submits=[1-9][0-9]* .*$splitPattern .*paired_submits=[1-9][0-9]*").Count -eq 0) {
+        if (@(Select-String -LiteralPath $logs -Pattern "expert overlap transfer_submits=[1-9][0-9]* .*split_projections=[0-9]+ .*paired_submits=[1-9][0-9]*").Count -eq 0) {
             throw "No hot/cold paired dispatch recorded in $($case.Name). Logs: $runDir"
         }
         if (Select-String -LiteralPath "$prefix.log" -Pattern 'packed expert RTX offload:|packed expert CUDA sidecar:' -Quiet) {
             throw "Unexpected RTX Expert assist. Logs: $runDir"
         }
         $sharedApplied = @(Select-String -LiteralPath "$prefix.log" -Pattern 'shared expert overlap: prefix_submits=[1-9][0-9]* tokens=[1-9][0-9]*').Count -gt 0
-        if ($sharedApplied -ne $case.Shared) {
+        if (!$sharedApplied) {
             throw "Unexpected Shared Expert overlap activation in $($case.Name). Logs: $runDir"
         }
         $fullHotMarker = Select-String -LiteralPath $logs -Pattern 'Vulkan1 expert full hot overlap split_ffns=([0-9]+) scratch_ffns=([0-9]+) fallback_ffns=([0-9]+)' | Select-Object -Last 1
-        if ($useFullHot) {
-            if (!$fullHotMarker -or [long]$fullHotMarker.Matches[0].Groups[1].Value -eq 0) {
-                throw "Full hot FFN overlap did not run. Logs: $runDir"
-            }
-        } elseif ($fullHotMarker) {
-            throw "Full hot FFN overlap unexpectedly activated in baseline. Logs: $runDir"
+        if (!$fullHotMarker -or [long]$fullHotMarker.Matches[0].Groups[1].Value -eq 0) {
+            throw "Full hot FFN overlap did not run. Logs: $runDir"
         }
         $pairDispatch = Select-String -LiteralPath $logs -Pattern 'Vulkan1 expert IQ4_NL pair shader dispatches=([0-9]+)' | Select-Object -Last 1
         if ($case.Pair) {

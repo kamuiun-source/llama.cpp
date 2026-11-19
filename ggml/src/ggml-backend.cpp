@@ -3262,24 +3262,28 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
-    const char * overlap_shared = getenv("GGML_SCHED_OVERLAP_SHARED_EXPERT");
+    bool cuda_vulkan = false;
+    for (int src = 0; src < n_backends; ++src) {
+        for (int dst = src + 1; dst < n_backends; ++dst) {
+            cuda_vulkan |= ggml_backend_sched_is_cuda_vulkan_pair(backends[src], backends[dst]);
+        }
+    }
+    const char * placement = getenv("LLAMA_EXPERT_PLACEMENT");
+    cuda_vulkan = cuda_vulkan && placement && *placement;
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
     const char * rtx_slots = getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
-    sched->overlap_shared = sched->n_copies == 1 && overlap_shared && strcmp(overlap_shared, "1") == 0 &&
+    sched->overlap_shared = sched->n_copies == 1 && cuda_vulkan &&
             !(graph_opt && atoi(graph_opt) == 1) && !(rtx_slots && atoi(rtx_slots) > 0);
 #ifdef _WIN32
-    const char * shared_host_return = getenv("GGML_SCHED_SHARED_HOST_EXPERT_RETURN");
-    sched->shared_host_return = sched->overlap_shared && shared_host_return && strcmp(shared_host_return, "1") == 0;
-    const char * shared_host_input = getenv("GGML_SCHED_SHARED_HOST_EXPERT_INPUT");
-    sched->shared_host_input = sched->n_copies == 1 && shared_host_input && strcmp(shared_host_input, "1") == 0 &&
+    sched->shared_host_return = sched->overlap_shared;
+    sched->shared_host_input = sched->n_copies == 1 && cuda_vulkan &&
             !(rtx_slots && atoi(rtx_slots) > 0);
 #endif
     const char * trace_handoff = getenv("GGML_SCHED_TRACE_EXPERT_HANDOFF");
     sched->trace_handoff = trace_handoff && strcmp(trace_handoff, "1") == 0;
     const char * batch_host_inputs = getenv("GGML_SCHED_BATCH_HOST_INPUTS");
     sched->batch_host_inputs = batch_host_inputs && strcmp(batch_host_inputs, "1") == 0;
-    const char * batch_device_inputs = getenv("GGML_SCHED_BATCH_DEVICE_INPUTS");
-    sched->batch_device_inputs = batch_device_inputs && strcmp(batch_device_inputs, "1") == 0;
+    sched->batch_device_inputs = cuda_vulkan;
     if (sched->batch_device_inputs) {
         GGML_LOG_INFO("sched_batch_device_inputs: enabled\n");
     }

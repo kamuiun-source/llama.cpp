@@ -1,16 +1,16 @@
 # MTP pending hidden row on CUDA
 
-`-MtpDevicePending` enables `LLAMA_MTP_DEVICE_PENDING=1`. It applies to the existing Qwen4exp target and separate single-head draft with one sequence, one candidate, two-token target verification, one recurrent rollback slot, and a one-token draft microbatch. Both contexts must use the same CUDA output device, and the draft must accept the target's device rows. Otherwise the existing host or device-row path supplies the hidden state. The separate draft-anchor experiment takes precedence if both flags are set.
+The adopted path is selected automatically. It applies to the existing Qwen4exp target and separate single-head draft with one sequence, one candidate, two-token target verification, one recurrent rollback slot, and a one-token draft microbatch. Both contexts must use the same CUDA output device, and the draft must accept the target's device rows. Otherwise the existing host or device-row path supplies the hidden state. The separate draft-anchor experiment takes precedence when requested.
 
 The target's `h_nextn_dev` buffer already reserves one row per sequence. The catch-up graph reads the previous pending row there. After catch-up, the target stream copies the last verification row to the reserved row. A rejected candidate replaces that row with verification row zero. The next draft reads the reserved row through the existing state-row input. CUDA events order the write before the draft read and protect the previous read before overwriting the reserved row. The draft context drains before releasing its reference to the target buffer.
 
 The one-candidate draft does not extract its own unused hidden output. Initialization and checkpoint restores can upload a host row. Checkpoint serialization reads the reserved row back into the existing host format. The target batch, positions, candidate selection and rollback rules are unchanged.
 
-At shutdown, `MTP device pending: enabled=... copies=... d2h=... h2d=... draft_host_rows=...` reports the device-to-device row copies, pending-row readbacks and uploads, and the number of draft input rows supplied from host memory. The last count is separate from the reserved-row upload count. On the Flash-Next setup a hidden row is 40,960 bytes. The counters do not include logits, sampler output, or other model transfers. The launcher requires a nonzero copy count when the option is enabled.
+At shutdown, `MTP device pending: enabled=... copies=... d2h=... h2d=... draft_host_rows=...` reports the device-to-device row copies, pending-row readbacks and uploads, and the number of draft input rows supplied from host memory. The last count is separate from the reserved-row upload count. On the Flash-Next setup a hidden row is 40,960 bytes. The counters do not include logits, sampler output, or other model transfers. The launcher warns if the fixed Flash-Next benchmark did not record any device-pending copies.
 
-## Comparison
+## Historical comparison (before flag removal)
 
-Build the validated experiment branch in the fixed validation checkout, then run the same five prompts with the same options. Both runs enable Expert RAM rotation and shared RAM in both directions. Omit the HC options and RTX cold Expert sharing.
+These commands reproduce the original A/B on the earlier experiment revision only. Both runs enable Expert RAM rotation and shared RAM in both directions. Omit the HC options and RTX cold Expert sharing.
 
 ```powershell
 cmake --build G:/AI/build-rtx-validation --config Release --target llama-cli

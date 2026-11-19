@@ -76,20 +76,12 @@ static void ggml_backend_vk_get_telemetry_detail(uint64_t * cpu, uint64_t * gpu)
 
 thread_local bool ggml_vk_alloc_overlap_expert_buffer = false;
 
-static bool ggml_vk_expert_overlap_requested() {
-    static const bool enabled = [] {
-        const char * env = getenv("LLAMA_EXPERT_VK_OVERLAP_UPLOAD");
-        return env && strcmp(env, "1") == 0;
+static bool ggml_vk_packed_experts_configured() {
+    static const bool configured = [] {
+        const char * path = getenv("LLAMA_EXPERT_PLACEMENT");
+        return path && *path;
     }();
-    return enabled;
-}
-
-static bool ggml_vk_expert_full_hot_requested() {
-    static const bool enabled = [] {
-        const char * env = getenv("LLAMA_EXPERT_VK_FULL_HOT_OVERLAP");
-        return env && strcmp(env, "1") == 0;
-    }();
-    return enabled;
+    return configured;
 }
 
 static bool ggml_vk_expert_pair_requested() {
@@ -105,18 +97,10 @@ static bool ggml_vk_expert_overlap_supported(const vk_device & device) {
     GGML_UNUSED(device);
     return false;
 #else
-    return ggml_vk_expert_overlap_requested() && device->compute_queue && device->transfer_queue &&
+    return ggml_vk_packed_experts_configured() && device->compute_queue && device->transfer_queue &&
            device->compute_queue->queue_family_index != device->transfer_queue->queue_family_index &&
            !device->async_use_transfer_queue && !device->serialize_submissions;
 #endif
-}
-
-static bool ggml_vk_reuse_graph_fence_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_VK_REUSE_GRAPH_FENCE");
-        return env && strcmp(env, "1") == 0;
-    }();
-    return enabled;
 }
 
 static uint64_t ggml_vk_submit_wait_ns() {
@@ -14028,7 +14012,7 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             ggml_vk_submit(subctx, ctx->fence);
 #ifndef GGML_VULKAN_CHECK_RESULTS
         } else if (tensor_idx == subctx->exit_tensor_idx && !ctx->final_fence_pending &&
-                ggml_vk_reuse_graph_fence_enabled() && !ctx->device->async_use_transfer_queue &&
+                ggml_vk_packed_experts_configured() && !ctx->device->async_use_transfer_queue &&
                 !ctx->device->has_internally_synchronized_queues && !vk_perf_logger_enabled) {
             ggml_vk_submit(subctx, ctx->fence);
             ctx->final_fence_pending = true;
@@ -14182,7 +14166,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
                     ctx->name.c_str(), overlap.promotion_submits, overlap.promotion_commits,
                     overlap.promotion_writeback_bytes, overlap.promotion_pending_at_compute_submit);
         }
-        if (ggml_vk_expert_full_hot_requested()) {
+        {
             GGML_LOG_INFO("ggml_vulkan: %s expert full hot overlap split_ffns=%" PRIu64 " scratch_ffns=%" PRIu64
                     " fallback_ffns=%" PRIu64 " fallback_down_q8=%" PRIu64 "\n", ctx->name.c_str(),
                     overlap.split_ffns, overlap.split_ffn_scratch, overlap.split_ffn_fallbacks, overlap.split_ffn_fallback_down_q8);
@@ -15916,7 +15900,7 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         const char *fusion_string {};
         int full_hot_count = 0;
         size_t full_hot_scratch = 0;
-        if (overlap.projection == cgraph->nodes[i] && ggml_vk_expert_full_hot_requested()) {
+        if (overlap.projection == cgraph->nodes[i]) {
             full_hot_count = ggml_vk_expert_full_hot_count(ctx, cgraph, i);
             if (full_hot_count) {
                 full_hot_scratch = ggml_vk_expert_full_hot_scratch_size(ctx, cgraph->nodes + i, full_hot_count);
@@ -16316,7 +16300,7 @@ static ggml_status ggml_backend_vk_graph_handoff(ggml_backend_t backend, ggml_cg
     const size_t bytes = ggml_nbytes(output);
     if (!ctx->device->support_async || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
             ctx->device->has_internally_synchronized_queues || ctx->final_fence_pending ||
-            !ggml_vk_reuse_graph_fence_enabled() || vk_perf_logger_enabled ||
+            !ggml_vk_packed_experts_configured() || vk_perf_logger_enabled ||
             output->type != GGML_TYPE_F32 || !ggml_is_contiguous(output) || output->view_src || !output->buffer ||
             !output->data || output->buffer->buft != &ctx->device->buffer_type || !staging ||
             staging->buft != &ctx->device->buffer_type || !bytes) {
@@ -18471,7 +18455,7 @@ void vk_queue_handle_synchronized::submit(vk::ArrayProxy<const vk::SubmitInfo> s
             vk_telemetry_timer timer(VK_TEL_SUBMIT_NS, transfer_only ? VK_TEL_TRANSFER_SUBMITS : VK_TEL_COMPUTE_SUBMITS);
             queue.submit(submits, fence);
         }
-        if (ggml_vk_reuse_graph_fence_enabled()) {
+        if (ggml_vk_packed_experts_configured()) {
             last_submit_fence = fence;
         }
     } catch (vk::DeviceLostError &) {

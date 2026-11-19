@@ -399,23 +399,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
         const bool spin_cc121 = prop.major == 12 && prop.minor == 1;
-        const char * spin_env = std::getenv("GGML_CUDA_SCHEDULE_SPIN");
-        const bool spin_override = spin_env && strcmp(spin_env, "1") == 0;
-        const bool log_schedule = spin_env && (spin_override || strcmp(spin_env, "0") == 0);
-        if (spin_cc121 || log_schedule) {
+        bool spin_packed = false;
+#ifdef _WIN32
+        const char * placement = std::getenv("LLAMA_EXPERT_PLACEMENT");
+        spin_packed = placement && *placement && prop.major == 8 && prop.minor == 9;
+#endif
+        if (spin_cc121 || spin_packed) {
             int prev_device = -1;
             CUDA_CHECK(cudaGetDevice(&prev_device));
             CUDA_CHECK(cudaSetDevice(physical_id));
             unsigned int flags = 0;
             CUDA_CHECK(cudaGetDeviceFlags(&flags));
-            if ((spin_cc121 || spin_override) && (flags & cudaDeviceScheduleMask) != cudaDeviceScheduleSpin) {
+            if ((flags & cudaDeviceScheduleMask) != cudaDeviceScheduleSpin) {
                 // MapHost is implicit in the runtime and can be returned even when it cannot be set.
                 const unsigned int new_flags = (flags & ~(cudaDeviceScheduleMask | cudaDeviceMapHost)) | cudaDeviceScheduleSpin;
                 CUDA_CHECK(cudaSetDeviceFlags(new_flags));
                 CUDA_CHECK(cudaGetDeviceFlags(&flags));
             }
             GGML_LOG_INFO("CUDA device %d scheduling: request=%s effective_flags=0x%x effective_spin=%d\n",
-                    physical_id, spin_override ? "spin" : spin_cc121 ? "cc121-spin" : "baseline",
+                    physical_id, spin_cc121 ? "cc121-spin" : "spin",
                     flags, (flags & cudaDeviceScheduleMask) == cudaDeviceScheduleSpin);
             if (!spin_cc121 && prev_device != physical_id) {
                 CUDA_CHECK(cudaSetDevice(prev_device));

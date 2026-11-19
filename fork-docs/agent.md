@@ -104,3 +104,7 @@ Historical tested changes and opt-in experiments may share a baseline commit whe
 - 検証ブランチは `codex/recurrent-conv-validation`。`-Mode speed -ExpertRamRotation -SharedHostExpertInput -SharedHostExpertReturn -MtpDevicePending -RecurrentConvHistory` を指定する。Q8再利用、戻り2枠化、HC実験、RTX Expert分担はOFF。
 - 固定5回答は生成40.53秒、30.00 tok/s。既存の検証フォルダと `G:/AI/build-rtx-validation` を使用する。増分ビルドでQwen4exp側のUnityコンパイルが省かれた場合は、該当するUnity単位を再コンパイルしてDLLと発動ログを確認する。
 - 保留・不採用の実験は作業ワークツリーのアーカイブから復元できる。生ログやプロファイルはGit外に保管する。
+
+## 採用済みフラグの整理（2026-11-19）
+
+現在の作業ツリーでは、採用済みの最適化を対応する配置・GPU・テンソル形状で自動選択する。固定5問の通常検証は start-dialogue-measurement.ps1 に -Mode speed と使用する -BuildDirectory を渡す。上の旧5スイッチ付きコマンドは過去のバイナリ用。Prefill32は比較試験、旧HC融合とRTXのExpert分担は引き続き任意。実機で確認するのは、同じモデル・MTP設定で自動選択された経路と出力・速度。

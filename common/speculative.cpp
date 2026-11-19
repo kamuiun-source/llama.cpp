@@ -1686,9 +1686,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
         const char * reuse = std::getenv("LLAMA_MTP_REUSE_DRAFT_ANCHOR");
         reuse_draft_anchor = single_candidate && reuse && std::strcmp(reuse, "1") == 0;
-        const char * pending = std::getenv("LLAMA_MTP_DEVICE_PENDING");
-        if (pending && std::strcmp(pending, "1") == 0) {
-            device_pending = single_candidate && !reuse_draft_anchor && llama_enable_mtp_device_pending(ctx_dft);
+        if (single_candidate && !reuse_draft_anchor) {
+            device_pending = llama_enable_mtp_device_pending(ctx_dft);
             if (device_pending) {
                 // There is no second draft step to consume this output.
                 llama_set_embeddings_nextn(ctx_dft, false, /*masked*/ true);

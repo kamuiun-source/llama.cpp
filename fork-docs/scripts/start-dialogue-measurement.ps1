@@ -9,12 +9,7 @@ param(
     [switch]$HcInjectSplit,
     [switch]$HcAll,
     [switch]$ExpertRamCopyTiming,
-    [switch]$ExpertRamRotation,
-    [switch]$SharedHostExpertReturn,
-    [switch]$SharedHostExpertInput,
-    [switch]$MtpDevicePending,
-    [switch]$RecurrentConvHistory,
-    [string]$BuildDirectory = 'G:\AI\build-rtx-validation'
+    [string]$BuildDirectory = 'G:\AI\build-prefill32'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,35 +30,33 @@ foreach ($path in @($cli, $settingsPath, $model, $draft)) {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing: $path" }
 }
 $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-$keys = @($settings.Environment.PSObject.Properties.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'GGML_SCHED_OVERLAP_SHARED_READBACK', 'GGML_SCHED_SHARED_HOST_EXPERT_RETURN', 'GGML_SCHED_SHARED_HOST_EXPERT_INPUT', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_RAM_ROTATION', 'LLAMA_MTP_DEVICE_PENDING') + @($projections | ForEach-Object { $_.Key })
-$keys = @($keys + 'GGML_CUDA_SSM_CONV_HISTORY' | Select-Object -Unique)
+$retiredKeys = @(
+    'LLAMA_EXPERT_SCRATCH_REUSE', 'LLAMA_EXPERT_DYNAMIC_RESIDENT', 'LLAMA_EXPERT_BATCH_UPLOAD',
+    'LLAMA_EXPERT_ROUTER_HOST_IDS', 'GGML_CUDA_SCHEDULE_SPIN', 'LLAMA_EXPERT_VK_DEFER_SLOT_MAP',
+    'GGML_SCHED_BATCH_DEVICE_INPUTS', 'GGML_SCHED_OVERLAP_SHARED_EXPERT', 'GGML_VK_REUSE_GRAPH_FENCE',
+    'LLAMA_EXPERT_VK_OVERLAP_UPLOAD', 'LLAMA_EXPERT_VK_OVERLAP_PROMOTION', 'LLAMA_EXPERT_VK_FULL_HOT_OVERLAP',
+    'LLAMA_EXPERT_RAM_ROTATION', 'GGML_SCHED_SHARED_HOST_EXPERT_INPUT', 'GGML_SCHED_SHARED_HOST_EXPERT_RETURN',
+    'LLAMA_MTP_DEVICE_PENDING', 'GGML_CUDA_SSM_CONV_HISTORY', 'GGML_SCHED_OVERLAP_SHARED_READBACK'
+)
+$baselineEnvironment = @($settings.Environment.PSObject.Properties | Where-Object { $_.Name -notin $retiredKeys })
+$keys = @($baselineEnvironment.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_PROFILE_RAM_COPY') + @($projections | ForEach-Object { $_.Key })
+$keys = @($keys | Select-Object -Unique)
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
 $projectionLabel = if ($activeProjections.Count -eq $projections.Count) { 'hc-all-' }
     elseif ($activeProjections.Count) { 'hc-' + (($activeProjections | ForEach-Object { $_.Name }) -join '-') + '-' }
     else { '' }
-$ramLabel = if ($ExpertRamRotation) { 'ram-rotation-' } else { '' }
-if ($ExpertRamCopyTiming) { $ramLabel += 'ram-timing-' }
-if ($SharedHostExpertReturn) { $ramLabel += 'shared-host-return-' }
-if ($SharedHostExpertInput) { $ramLabel += 'shared-host-input-' }
-if ($RecurrentConvHistory) { $ramLabel += 'recurrent-conv-history-' }
-$mtpLabel = if ($MtpDevicePending) { 'mtp-device-pending-' } else { '' }
-$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel$mtpLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
+$ramLabel = if ($ExpertRamCopyTiming) { 'ram-timing-' } else { '' }
+$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
 New-Item -ItemType Directory -Path $runDir | Out-Null
 
 try {
-    foreach ($item in $settings.Environment.PSObject.Properties) {
+    foreach ($item in $baselineEnvironment) {
         [Environment]::SetEnvironmentVariable($item.Name, $item.Value, 'Process')
     }
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RTX_COLD_SLOTS', $null, 'Process')
-    [Environment]::SetEnvironmentVariable('GGML_SCHED_OVERLAP_SHARED_READBACK', $null, 'Process')
-    [Environment]::SetEnvironmentVariable('GGML_SCHED_SHARED_HOST_EXPERT_RETURN', $(if ($SharedHostExpertReturn) { '1' } else { $null }), 'Process')
-    [Environment]::SetEnvironmentVariable('GGML_SCHED_SHARED_HOST_EXPERT_INPUT', $(if ($SharedHostExpertInput) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PROFILE_RAM_COPY', $(if ($ExpertRamCopyTiming) { '1' } else { $null }), 'Process')
-    [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RAM_ROTATION', $(if ($ExpertRamRotation) { '1' } else { $null }), 'Process')
-    [Environment]::SetEnvironmentVariable('LLAMA_MTP_DEVICE_PENDING', $(if ($MtpDevicePending) { '1' } else { $null }), 'Process')
-    [Environment]::SetEnvironmentVariable('GGML_CUDA_SSM_CONV_HISTORY', $(if ($RecurrentConvHistory) { '1' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_DECODE_TELEMETRY_PER_RESPONSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_MIX_FUSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_SCALE_SILU_FUSE', $(if ($HcScaleSilu) { '1' } else { $null }), 'Process')
@@ -107,23 +100,27 @@ try {
     "exit_code=$code" | Set-Content (Join-Path $runDir 'exit.txt')
     if ($code -ne 0) { throw "llama-cli failed: $code" }
     $dialogueLog = Join-Path $runDir 'dialogue.log'
-    if ($RecurrentConvHistory -and !(Select-String -LiteralPath $dialogueLog -SimpleMatch 'CUDA SSM convolution history applied' -Quiet)) {
-        throw 'CUDA SSM convolution history did not activate. Check the binary and recurrent layout.'
+    if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch 'CUDA SSM convolution history applied' -Quiet)) {
+        Write-Warning 'CUDA SSM convolution history was not observed.'
     }
-    if ($MtpDevicePending -and !(Select-String -LiteralPath $dialogueLog -Pattern 'MTP device pending: enabled=1 copies=[1-9][0-9]*' -Quiet)) {
-        throw 'MTP device pending did not activate. Check the binary and target/draft CUDA devices.'
+    if (!(Select-String -LiteralPath $dialogueLog -Pattern 'MTP device pending: enabled=1 copies=[1-9][0-9]*' -Quiet)) {
+        Write-Warning 'MTP device pending copies were not observed.'
     }
-    if ($SharedHostExpertInput -and !(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert input: batches=[1-9][0-9]*' -Quiet)) {
-        throw 'Shared host Expert input did not activate. Check the binary, Expert graph and host memory import.'
+    if (!(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert input: batches=[1-9][0-9]*' -Quiet)) {
+        Write-Warning 'Shared host Expert input batches were not observed.'
     }
-    if ($SharedHostExpertReturn -and !(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert return: copies=[1-9][0-9]*' -Quiet)) {
-        throw 'Shared host Expert return did not activate. Check the binary, producer graph and host memory import.'
+    if (!(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert return: copies=[1-9][0-9]*' -Quiet)) {
+        Write-Warning 'Shared host Expert return copies were not observed.'
     }
     if ($ExpertRamCopyTiming -and !(Select-String -LiteralPath $dialogueLog -SimpleMatch 'packed expert promotion RAM memcpy:' -Quiet)) {
         throw 'Expert RAM copy timing did not activate. Check the binary and dynamic Expert placement.'
     }
-    if ($ExpertRamRotation -and !(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: rotations=[1-9][0-9]*' -Quiet)) {
-        throw 'Expert RAM rotation did not activate. Check the binary and Expert promotion overlap.'
+    if (!(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: rotations=[1-9][0-9]*' -Quiet)) {
+        if (!(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: .*pool_bytes=[1-9][0-9]*' -Quiet)) {
+            Write-Warning 'Expert RAM rotation pool allocation was not observed.'
+        } else {
+            Write-Warning 'The Expert RAM rotation pool was allocated, but this run performed no rotations.'
+        }
     }
     foreach ($projection in $activeProjections) {
         if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch $projection.Marker -Quiet)) {
