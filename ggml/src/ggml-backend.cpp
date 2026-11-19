@@ -1372,6 +1372,13 @@ struct ggml_backend_sched {
     ggml_backend_cuda_get_shared_input_t shared_input_get;
     bool shared_input_get_tried;
     bool target_mtp_verify;
+    bool target_mtp_verify_three;
+    bool mtp_three_shared_input;
+    bool mtp_three_shared_overlap;
+    size_t mtp_three_shared_input_batches;
+    size_t mtp_three_shared_input_bytes;
+    size_t mtp_three_shared_overlap_submits;
+    size_t mtp_three_shared_return_copies;
     bool routed_stats_enabled;
     ggml_backend_t routed_stats_backend;
     void (*set_routed_stats_active)(ggml_backend_t, bool);
@@ -2535,7 +2542,8 @@ struct ggml_backend_sched_upload {
 
 static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, const ggml_backend_sched_split * split,
         const ggml_tensor * const * srcs, ggml_tensor * const * dsts, int count) {
-    if (count != 3 || !sched->callback_copy) {
+    const bool three = sched->target_mtp_verify_three;
+    if (!sched->callback_copy || (three ? !sched->mtp_three_shared_input || (count != 2 && count != 3) : count != 3)) {
         return false;
     }
     int actual = 0;
@@ -2548,12 +2556,19 @@ static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, c
         if (!ggml_backend_sched_is_host_weight(input)) {
             ++actual;
         } else if (strncmp(input->name, "moe_cache.packed_slots-", 23) == 0) {
-            slot_map = tensor_copy(input, split->backend_id, sched->cur_copy);
+            constexpr const char wave_zero[] = "-mtp3-0";
+            const size_t length = strlen(input->name);
+            // Only the first wave introduces the CUDA inputs. The second may skip its expert dispatch entirely.
+            if (!three || (length >= sizeof(wave_zero) - 1 &&
+                    strcmp(input->name + length - (sizeof(wave_zero) - 1), wave_zero) == 0)) {
+                slot_map = tensor_copy(input, split->backend_id, sched->cur_copy);
+            }
         }
     }
     if (actual != count || !slot_map) {
         return false;
     }
+    const int width = three ? 3 : 2;
     const ggml_tensor * ids = nullptr;
     const ggml_tensor * activation = nullptr;
     const ggml_tensor * weights = nullptr;
@@ -2562,7 +2577,7 @@ static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, c
         if (src->type == GGML_TYPE_I32 && ggml_is_vector(src) &&
                 ggml_nbytes(src) <= 256 && strncmp(src->name, "ffn_moe_topk-", 13) == 0) {
             ids = dsts[i];
-        } else if (src->type == GGML_TYPE_F32 && src->ne[2] == 2 && src->ne[3] == 1) {
+        } else if (src->type == GGML_TYPE_F32 && src->ne[2] == width && src->ne[3] == 1) {
             if (src->ne[1] == 1 && strncmp(src->name, "hc_mixed-", 9) == 0) {
                 activation = dsts[i];
             } else if (src->ne[0] == 1 && strncmp(src->name, "ffn_moe_weights_", 16) == 0) {
@@ -2570,7 +2585,8 @@ static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, c
             }
         }
     }
-    if (!ids || !activation || !weights || ids->ne[0] % 2 != 0 || weights->ne[1] != ids->ne[0] / 2) {
+    if (!ids || !activation || ids->ne[0] % width != 0 ||
+            (count == 3 && (!weights || weights->ne[1] != ids->ne[0] / width))) {
         return false;
     }
     for (int i = 0; i < split->graph.n_nodes; ++i) {
@@ -2665,7 +2681,8 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
                     ggml_backend_reg_get_proc_address(dst_reg, "ggml_backend_vk_graph_upload"));
             if (supports && compute_upload && ggml_backend_sched_init_shared_host(sched->shared_input, dst_backend, src_backend)) {
                 const ggml_backend_graph_upload regions{sched->shared_input.vk_buffer,
-                    {dsts[0], dsts[1], dsts[2]}, {data_offsets[0], data_offsets[1], data_offsets[2]}};
+                    {dsts[0], dsts[1], count == 3 ? dsts[2] : nullptr},
+                    {data_offsets[0], data_offsets[1], count == 3 ? data_offsets[2] : 0}};
                 if (supports(dst_backend, &regions)) {
                     upload = {regions, compute_upload, bytes};
                 }
@@ -2688,7 +2705,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     ggml_backend_handoff_times handoff;
     handoff.enabled = sched->trace_handoff_graph != 0;
     bool producer_copy = false;
-    if (upload.compute) {
+    if (upload.compute && !sched->target_mtp_verify_three) {
         if (sched->target_mtp_verify) {
             ++sched->shared_input_verify_batches;
             sched->shared_input_verify_bytes += bytes;
@@ -2938,33 +2955,44 @@ static bool ggml_backend_sched_shared_range(const ggml_tensor * tensor, const gg
     return a < b ? b - a >= ggml_nbytes(tensor) : a - b >= ggml_nbytes(copied);
 }
 
-static void ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_backend_sched_split & split,
+static bool ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_backend_sched_split & split,
         ggml_backend_sched_split & routed) {
+    const bool three = split.n_inputs == 1 && split.inputs[0]->ne[1] == 3;
+    if (three && (!sched->target_mtp_verify_three || !sched->mtp_three_shared_overlap)) {
+        return false;
+    }
     if (split.shared_plan_uid == split.graph.uid) {
-        return;
+        return split.shared_prefix.n_nodes != 0;
     }
     split.shared_plan_uid = split.graph.uid;
     split.shared_prefix = {};
     if (split.n_inputs != 1) {
-        return;
+        return false;
     }
     ggml_backend_t cuda = sched->backends[split.backend_id];
     ggml_backend_t vk = sched->backends[routed.backend_id];
     if (!ggml_backend_sched_is_cuda_vulkan_pair(vk, cuda) || strncmp(ggml_backend_name(cuda), "CUDA", 4) != 0) {
-        return;
+        return false;
     }
     auto * routed_out = split.inputs[0];
     constexpr const char routed_name[] = "ffn_moe_out-";
     if (strncmp(routed_out->name, routed_name, sizeof(routed_name) - 1) != 0 ||
-            routed_out->type != GGML_TYPE_F32 || routed_out->ne[1] != 2 || !ggml_is_matrix(routed_out) ||
+            routed_out->type != GGML_TYPE_F32 || routed_out->ne[1] != (three ? 3 : 2) || !ggml_is_matrix(routed_out) ||
             std::find(routed.graph.nodes, routed.graph.nodes + routed.graph.n_nodes, routed_out) == routed.graph.nodes + routed.graph.n_nodes ||
             !sched->hv_tensor_requires_copy[hash_id(routed_out)]) {
-        return;
+        return false;
     }
     const auto * copied = tensor_copy(split.inputs[0], split.backend_id, sched->cur_copy);
     const auto buft = ggml_backend_get_default_buffer_type(cuda);
     if (!copied->data || !copied->buffer || ggml_backend_buffer_get_type(copied->buffer) != buft) {
-        return;
+        return false;
+    }
+    if (three && (split.has_custom || routed.has_custom || (routed_out->flags & GGML_TENSOR_FLAG_INPUT) ||
+            sched->events[split.backend_id][sched->cur_copy] ||
+            !ggml_are_same_layout(routed_out, copied) ||
+            !ggml_backend_sched_device_input_buffer(vk, routed_out, ggml_nbytes(routed_out)) ||
+            !ggml_backend_sched_device_input_buffer(cuda, copied, ggml_nbytes(copied)))) {
+        return false;
     }
 
     constexpr int max_prefix = 32;
@@ -2976,34 +3004,36 @@ static void ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_back
         if (node->op == GGML_OP_MUL && merge->op == GGML_OP_ADD &&
                 strncmp(node->name, shared_name, sizeof(shared_name) - 1) == 0 &&
                 strcmp(node->name + sizeof(shared_name) - 1, routed_out->name + sizeof(routed_name) - 1) == 0 &&
-                merge->src[0] == copied && merge->src[1] == node) {
+                merge->src[0] == copied && merge->src[1] == node &&
+                (!three || (node->type == GGML_TYPE_F32 && ggml_are_same_shape(node, copied) &&
+                            ggml_are_same_shape(merge, copied)))) {
             end = i;
             break;
         }
     }
     if (end < 0) {
-        return;
+        return false;
     }
 
     // Every prefix node must feed the Shared Expert and must be independent of the routed input copy.
     uint32_t needed = UINT32_C(1) << end;
     for (int i = end; i >= 0; --i) {
         const auto * node = split.graph.nodes[i];
-        if (!(needed & (UINT32_C(1) << i)) || !ggml_backend_sched_shared_range(node, copied, buft)) {
-            return;
+        if (!(needed & (UINT32_C(1) << i)) || !ggml_backend_sched_shared_range(node, copied, buft) || (three && node->op == GGML_OP_CUSTOM)) {
+            return false;
         }
         for (const auto * src : node->src) {
             if (!src) {
                 continue;
             }
             if (!ggml_backend_sched_shared_range(src, copied, buft)) {
-                return;
+                return false;
             }
             const auto it = std::find(split.graph.nodes, split.graph.nodes + end + 1, src);
             if (it != split.graph.nodes + end + 1) {
                 const auto pos = it - split.graph.nodes;
                 if (pos >= i) {
-                    return;
+                    return false;
                 }
                 needed |= UINT32_C(1) << pos;
             }
@@ -3013,6 +3043,7 @@ static void ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_back
     split.after_shared = ggml_graph_view(&split.graph, end + 1, split.graph.n_nodes);
     split.shared_prefix.uid = ggml_graph_next_uid();
     split.after_shared.uid = ggml_graph_next_uid();
+    return true;
 }
 
 using ggml_backend_vk_graph_readback_t = enum ggml_status (*)(ggml_backend_t, ggml_cgraph *,
@@ -3061,8 +3092,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched_upload upload;
 
         if (sched->overlap_shared && split_id > 0 && !profile.enabled && !sched->callback_eval) {
-            ggml_backend_sched_plan_shared(sched, *split, splits[split_id - 1]);
-            if (split->shared_prefix.n_nodes) {
+            if (ggml_backend_sched_plan_shared(sched, *split, splits[split_id - 1])) {
                 // The routed Vulkan split is already submitted. The CUDA destination wait below joins this prefix.
                 const int64_t start = sched->trace_handoff_graph ? ggml_time_us() : 0;
                 const auto status = ggml_backend_graph_compute_async(split_backend, &split->shared_prefix);
@@ -3074,6 +3104,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ++sched->shared_overlap_submits;
                 sched->shared_overlap_tokens += split->shared_prefix.nodes[split->shared_prefix.n_nodes - 1]->ne[1];
+                sched->mtp_three_shared_overlap_submits += split->inputs[0]->ne[1] == 3;
                 main_graph = &split->after_shared;
             }
         }
@@ -3117,6 +3148,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                     ++sched->shared_return_copies;
                     sched->shared_return_bytes += bytes;
+                    sched->mtp_three_shared_return_copies += input->ne[1] == 3;
                     continue;
                 }
                 if (sched->batch_host_inputs && (input->flags & GGML_TENSOR_FLAG_INPUT)) {
@@ -3190,8 +3222,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const ggml_tensor * return_tensor = nullptr;
         if (sched->shared_host_return && !profile.enabled && !sched->callback_eval && split_id + 1 < sched->n_splits) {
             auto & next = splits[split_id + 1];
-            ggml_backend_sched_plan_shared(sched, next, *split);
-            if (next.shared_prefix.n_nodes) {
+            if (ggml_backend_sched_plan_shared(sched, next, *split)) {
                 auto * input = next.inputs[0];
                 auto * dst = sched->backends[next.backend_id];
                 auto * copy = tensor_copy(input, next.backend_id, sched->cur_copy);
@@ -3233,6 +3264,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (upload.compute && status == GGML_STATUS_SUCCESS) {
                     ++sched->shared_input_batches;
                     sched->shared_input_bytes += upload.bytes;
+                    if (sched->target_mtp_verify_three) {
+                        ++sched->mtp_three_shared_input_batches;
+                        sched->mtp_three_shared_input_bytes += upload.bytes;
+                    }
                 }
                 if (recorded) {
                     shared_return_input = return_tensor;
@@ -3418,6 +3453,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->shared_host_input = sched->n_copies == 1 && cuda_vulkan &&
             !(rtx_slots && atoi(rtx_slots) > 0);
 #endif
+    const char * fast_three = getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+    if (fast_three && strcmp(fast_three, "1") == 0) {
+        const char * input = getenv("GGML_SCHED_MTP_THREE_SHARED_INPUT");
+        const char * overlap = getenv("GGML_SCHED_MTP_THREE_SHARED_OVERLAP");
+        sched->mtp_three_shared_input = sched->shared_host_input && input && strcmp(input, "1") == 0;
+        sched->mtp_three_shared_overlap = sched->overlap_shared && overlap && strcmp(overlap, "1") == 0;
+    }
     const char * producer_copy = getenv("GGML_SCHED_SHARED_INPUT_PRODUCER_COPY");
     sched->shared_input_producer = sched->shared_host_input && producer_copy && strcmp(producer_copy, "1") == 0;
     const char * routed_stats = getenv("LLAMA_MTP_ROUTED_DISPATCH_STATS");
@@ -3576,6 +3618,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->shared_input_verify_batches, sched->shared_input_other_batches,
                 sched->shared_input_verify_bytes, sched->shared_input_other_bytes,
                 sched->shared_input_optimized_verify, sched->shared_input_optimized_other);
+    }
+    if (sched->mtp_three_shared_input || sched->mtp_three_shared_overlap) {
+        GGML_LOG_INFO("mtp fast-three shared handoff: input_enabled=%d input_batches=%zu input_bytes=%zu"
+                " overlap_enabled=%d prefix_submits=%zu return_copies=%zu\n",
+                sched->mtp_three_shared_input, sched->mtp_three_shared_input_batches, sched->mtp_three_shared_input_bytes,
+                sched->mtp_three_shared_overlap, sched->mtp_three_shared_overlap_submits, sched->mtp_three_shared_return_copies);
     }
     if (sched->routed_stats_rounds) {
         GGML_LOG_INFO("mtp routed schedule: rounds=%zu vulkan1_aggregate_add=%zu other_backend_aggregate_add=%zu other_aggregate_op=%zu\n",
@@ -3740,6 +3788,12 @@ bool ggml_backend_sched_set_target_mtp_verify(ggml_backend_sched_t sched, bool e
     if (sched->set_routed_stats_active && enabled != previous) {
         sched->set_routed_stats_active(sched->routed_stats_backend, enabled);
     }
+    return previous;
+}
+
+bool ggml_backend_sched_set_target_mtp_verify_three(ggml_backend_sched_t sched, bool enabled) {
+    const bool previous = sched->target_mtp_verify_three;
+    sched->target_mtp_verify_three = enabled;
     return previous;
 }
 

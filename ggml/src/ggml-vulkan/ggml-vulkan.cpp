@@ -100,6 +100,14 @@ static bool ggml_vk_mtp_three_fast() {
     return enabled;
 }
 
+static bool ggml_vk_mtp_three_overlap() {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_MTP_VERIFY_THREE_OVERLAP");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return ggml_vk_mtp_three_fast() && enabled;
+}
+
 static bool ggml_vk_expert_pair_requested() {
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_EXPERT_VK_PAIR_IQ4_NL");
@@ -1255,6 +1263,11 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (owner) {
         auto & overlap = owner->expert_overlap;
         overlap.wait_submitted |= wait;
+        if (overlap.width3) {
+            overlap.width3_compute_hot_only += hot && !wait;
+            overlap.width3_compute_wait_only += wait && !hot;
+            overlap.width3_compute_paired += hot && wait;
+        }
         if (hot && wait) {
             ++overlap.paired_submits;
             if (ggml_vk_telemetry_enabled()) {
@@ -1262,6 +1275,7 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
                 if (owner->device->device.getSemaphoreCounterValue(owner->transfer_semaphore.s, &value) == vk::Result::eSuccess &&
                         value < owner->transfer_semaphore.value) {
                     ++overlap.transfer_pending_at_compute_submit;
+                    overlap.width3_transfer_pending += overlap.width3;
                 }
             }
         }
@@ -8863,8 +8877,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         GGML_ASSERT(overlap.transfer_pending && !overlap.wait_recorded);
         const uint32_t full = UINT32_MAX >> (32 - nei0);
         subctx->s->expert_hot = true;
-        uint32_t hot_masks[2] = {};
-        uint32_t cold_masks[2] = {};
+        uint32_t hot_masks[3] = {};
+        uint32_t cold_masks[3] = {};
         for (uint32_t token = 0; token < nei1; ++token) {
             hot_masks[token] = overlap.hot_masks[token] | overlap.excluded_masks[token];
             cold_masks[token] = full & ~hot_masks[token];
@@ -8881,6 +8895,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         dispatch_masks(cold_masks);
         overlap.projection = nullptr;
         ++overlap.split_projections;
+        overlap.width3_projection_only += nei1 == 3;
     } else if (pair || time_gate_up) {
         const uint32_t full = UINT32_MAX >> (32 - nei0);
         const uint32_t masks[2] = { full, full };
@@ -12187,7 +12202,8 @@ static void ggml_vk_glu_masked(ggml_backend_vk_context * ctx, vk_context & subct
             (uint32_t)dst->ne[2],
             0,
             0, 0, 0, 0, 0, 0,
-            {expert_masks ? expert_masks[0] : 0, expert_masks ? expert_masks[1] : 0},
+            {expert_masks ? expert_masks[0] : 0, expert_masks && dst->ne[2] >= 2 ? expert_masks[1] : 0,
+             expert_masks && dst->ne[2] == 3 ? expert_masks[2] : 0},
         });
 }
 
@@ -13371,7 +13387,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
 static constexpr int vk_expert_ffn_max_nodes = 5;
 
 static int ggml_vk_expert_full_hot_count(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int start) {
-    if (ctx->expert_overlap.excluded_masks[0] || ctx->expert_overlap.excluded_masks[1]) {
+    if (ctx->expert_overlap.excluded_masks[0] || ctx->expert_overlap.excluded_masks[1] || ctx->expert_overlap.excluded_masks[2]) {
         return 0;
     }
 
@@ -13612,7 +13628,7 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
     }
     const auto * ids = nodes[0]->src[2];
     const uint32_t full = UINT32_MAX >> (32 - ids->ne[0]);
-    uint32_t cold_masks[2] = {};
+    uint32_t cold_masks[3] = {};
     for (int token = 0; token < ids->ne[1]; ++token) {
         cold_masks[token] = full ^ overlap.hot_masks[token];
         overlap.hot_positions += ggml_vk_expert_position_count(overlap.hot_masks[token]);
@@ -13625,6 +13641,9 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
     local_graph.nodes = ffn;
     const bool gate_up = act == 2 && ggml_vk_mtp_gate_up_eligible(ctx, ffn[0], ffn[1], ffn[act]);
     const auto phase = [&](const uint32_t * masks, uint32_t gate_up_phase) {
+        if (ids->ne[1] == 3 && !(masks[0] || masks[1] || masks[2])) {
+            return;
+        }
         ctx->prealloc_y_last_tensor_used = nullptr;
         if (gate_up) {
             ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 0, masks, ffn[act], gate_up_phase);
@@ -13676,6 +13695,7 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
     ctx->num_additional_fused_ops = fused;
     overlap.projection = nullptr;
     ++overlap.split_ffns;
+    overlap.width3_full_ffns += ids->ne[1] == 3;
     if (ctx->mtp_routed_stats_active) {
         ++ctx->mtp_routed_full_hot;
     }
@@ -14573,6 +14593,13 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
                       ctx->name.c_str(), ctx->expert_pair_dispatches);
     }
     if (ggml_vk_mtp_three_fast() && ctx->device->idx == 1) {
+        const auto & overlap = ctx->expert_overlap;
+        GGML_LOG_INFO("mtp overlap-three Vulkan: transfer_submits=%" PRIu64 " upload_bytes=%" PRIu64
+                " promotions=%" PRIu64 " writeback_bytes=%" PRIu64 " full_ffns=%" PRIu64 " projection_only=%" PRIu64
+                " compute_hot_only=%" PRIu64 " compute_wait_only=%" PRIu64 " compute_paired=%" PRIu64 " transfer_pending=%" PRIu64 "\n",
+                overlap.width3_transfer_submits, overlap.width3_upload_bytes, overlap.width3_promotions, overlap.width3_writeback_bytes,
+                overlap.width3_full_ffns, overlap.width3_projection_only, overlap.width3_compute_hot_only,
+                overlap.width3_compute_wait_only, overlap.width3_compute_paired, overlap.width3_transfer_pending);
         GGML_LOG_INFO("mtp fast-three Vulkan: gate_up=%" PRIu64 " weighted=%" PRIu64 " reduce=%" PRIu64 "\n",
                 ctx->mtp_three_gate_up_dispatches, ctx->mtp_three_weighted_dispatches, ctx->mtp_three_reduce_dispatches);
     }
@@ -16201,6 +16228,9 @@ static bool ggml_backend_vk_supports_graph_upload(ggml_backend_t backend, const 
     }
     for (size_t i = 0; i < 3; ++i) {
         const auto * dst = upload->dst[i];
+        if (!dst && i == 2) {
+            break;
+        }
         if (!dst || !dst->buffer || dst->buffer->buft != buft || dst->view_src || !dst->data || !ggml_is_contiguous(dst)) {
             return false;
         }
@@ -16227,6 +16257,9 @@ static void ggml_vk_record_graph_upload(ggml_backend_vk_context * ctx, const ggm
             { { vk::AccessFlagBits::eHostWrite, vk::AccessFlagBits::eTransferRead } }, {}, {});
     for (size_t i = 0; i < 3; ++i) {
         const auto * dst = upload.dst[i];
+        if (!dst) {
+            break;
+        }
         const auto & buffer = static_cast<const ggml_backend_vk_buffer_context *>(dst->buffer->context)->dev_buffer;
         cmd.copyBuffer(staging->buffer, buffer->buffer, { vk::BufferCopy{ upload.offsets[i], vk_tensor_offset(dst), ggml_nbytes(dst) } });
     }
@@ -18562,7 +18595,8 @@ static bool ggml_backend_vk_prefill_upload_start(void * handle, ggml_tensor * co
     return true;
 }
 
-static const ggml_tensor * ggml_vk_overlap_first_projection(const ggml_cgraph * graph, const ggml_tensor * map) {
+static const ggml_tensor * ggml_vk_overlap_first_projection(const ggml_cgraph * graph, const ggml_tensor * map,
+                                                              bool allow_width3 = false) {
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto * node = graph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT_ID || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
@@ -18572,7 +18606,9 @@ static const ggml_tensor * ggml_vk_overlap_first_projection(const ggml_cgraph * 
         const auto * lookup = ids && ids->op == GGML_OP_RESHAPE ? ids->src[0] : nullptr;
         if (!lookup || lookup->op != GGML_OP_GET_ROWS || lookup->src[0] != map ||
                 !ggml_vk_use_mul_mat_vec_id(node) || !ggml_is_contiguous(node->src[0]) ||
-                ids->ne[0] <= 0 || ids->ne[0] > 32 || ids->ne[1] <= 0 || ids->ne[1] > 2) {
+                ids->ne[0] <= 0 || ids->ne[0] > 32 || ids->ne[1] <= 0 ||
+                (ids->ne[1] > 2 && (!allow_width3 || ids->ne[1] != 3 || ids->ne[0] != 10 ||
+                 strcmp(ids->name, "ffn_moe_mtp_three_slots") != 0))) {
             return nullptr;
         }
         // The shared projection is the first reader of any of these routed weight planes.
@@ -18635,7 +18671,7 @@ static bool ggml_backend_vk_overlap_expert_transfer(
     if (!overlap.enabled || overlap.transfer_pending || ctx->submit_pending || !ctx->compute_ctx.expired()) {
         return false;
     }
-    const auto * projection = ggml_vk_overlap_first_projection(graph, map);
+    const auto * projection = ggml_vk_overlap_first_projection(graph, map, ggml_vk_mtp_three_overlap());
     if (!projection) {
         return false;
     }
@@ -18646,7 +18682,7 @@ static bool ggml_backend_vk_overlap_expert_transfer(
     const int64_t bank_slots = projection->src[0]->ne[2];
     bool any_hot = false;
     bool any_cold = false;
-    uint32_t excluded_masks[2] = {};
+    uint32_t excluded_masks[3] = {};
     for (uint32_t t = 0; t < nt; ++t) {
         if (hot_masks[t] & ~full) {
             return false;
@@ -18678,7 +18714,7 @@ static bool ggml_backend_vk_overlap_expert_transfer(
     std::vector<vk_buffer_region> regions;
     regions.reserve(n);
     uint64_t bytes = 0;
-    uint32_t covered_cold[2] = {};
+    uint32_t covered_cold[3] = {};
     for (size_t i = 0; i < n; ++i) {
         const auto * weight = weights[i];
         if (!weight || !weight->buffer || weight->view_src || !weight->data ||
@@ -18846,7 +18882,15 @@ static bool ggml_backend_vk_overlap_expert_transfer(
     ctx->submit_pending = true;
     overlap.transfer_pending = true;
     overlap.projection = n ? projection : nullptr;
+    std::fill(std::begin(overlap.hot_masks), std::end(overlap.hot_masks), 0u);
     std::copy(hot_masks, hot_masks + nt, overlap.hot_masks);
+    overlap.width3 = nt == 3;
+    if (overlap.width3) {
+        ++overlap.width3_transfer_submits;
+        overlap.width3_upload_bytes += bytes;
+        overlap.width3_promotions += promotion;
+        overlap.width3_writeback_bytes += writeback_bytes;
+    }
     std::copy(std::begin(excluded_masks), std::end(excluded_masks), overlap.excluded_masks);
     ++overlap.transfer_submits;
     overlap.transfer_bytes += bytes;

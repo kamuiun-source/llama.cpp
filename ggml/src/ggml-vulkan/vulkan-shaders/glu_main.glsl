@@ -10,7 +10,8 @@ void main() {
     const uint i22 = fastdiv(i - i23_offset, p.ne2_01mp, p.ne2_01L);
     const uint i22_offset = i22*p.ne21*p.ne20;
     const uint i21 = fastdiv(i - i23_offset - i22_offset, p.ne2_0mp, p.ne2_0L);
-    if ((p.expert_masks[0] | p.expert_masks[1]) != 0 && (p.expert_masks[i22] & (1u << i21)) == 0) {
+    if ((p.expert_masks[0] | p.expert_masks[1] | p.expert_masks[2]) != 0 &&
+            (i22 >= 3 || (p.expert_masks[i22] & (1u << i21)) == 0)) {
         return;
     }
     const uint i20 = i - i23_offset - i22_offset - i21*p.ne20;

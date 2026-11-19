@@ -267,7 +267,7 @@ struct vk_op_glu_push_constants {
     uint32_t ne2_012mp; uint32_t ne2_012L;
     uint32_t ne2_01mp;  uint32_t ne2_01L;
     uint32_t ne2_0mp;   uint32_t ne2_0L;
-    uint32_t expert_masks[2];
+    uint32_t expert_masks[3];
 };
 
 static_assert(sizeof(vk_op_glu_push_constants) <= 128, "sizeof(vk_op_glu_push_constants) must be <= 128");

@@ -46,7 +46,7 @@ def verify_metrics(log, enabled, require_three=True):
     )
 
 
-def fast_three_metrics(log, layers, overflow):
+def fast_three_metrics(log, layers, overflow, overlapped_ffns=0):
     waves = re.findall(r"MTP 3-position waves: second_passes=(\d+) empty_no_copy=(\d+)", log)
     vk = re.findall(r"mtp fast-three Vulkan: gate_up=(\d+) weighted=(\d+) reduce=(\d+)", log)
     require(len(waves) == 1 and vk, "missing fast width-3 runtime evidence")
@@ -54,7 +54,7 @@ def fast_three_metrics(log, layers, overflow):
     gate_up, weighted, reduce = map(sum, zip(*(map(int, row) for row in vk)))
     require(second_passes == overflow and empty_no_copy == layers - overflow,
             "width-3 second waves or no-copy carry disagree with unique nonresident Expert counts")
-    require(gate_up > 0 and weighted > 0 and gate_up <= 3 * (layers + overflow) and weighted + reduce <= layers,
+    require(gate_up > 0 and weighted > 0 and gate_up <= 3 * (layers + overflow + overlapped_ffns) and weighted + reduce <= layers,
             "fast width-3 Vulkan activations missing or inconsistent")
     return dict(second_passes=second_passes, empty_no_copy=empty_no_copy,
                 gate_up_dispatches=gate_up, weighted_dispatches=weighted, reduce_dispatches=reduce)
@@ -168,29 +168,34 @@ def read_logit_trace(log, count, reference=None):
     return rows
 
 
-def logit_comparison(reference, candidate, control=None):
+def logit_comparison(reference, candidate, control=None, labels=("width_2", "width_3")):
     require(len(reference) == len(candidate) and (control is None or len(reference) == len(control)),
             "different logit trace lengths")
     differences, top_changes, by_shape = [], [], {}
-    max_delta = 0.0
+    max_delta, max_top_delta, max_second_delta, max_margin_delta = 0.0, 0.0, 0.0, 0.0
+    second_changes = 0
     for left, right in zip(reference, candidate):
         require((left["pos"], left["chosen"], left["input"]) == (right["pos"], right["chosen"], right["input"]),
                 f"target position or fixed token mismatch at commitment {left['index']}")
         delta = right["chosen_logit"] - left["chosen_logit"]
         max_delta = max(max_delta, abs(delta))
+        max_top_delta = max(max_top_delta, abs(right["top_logit"] - left["top_logit"]))
+        max_second_delta = max(max_second_delta, abs(right["second_logit"] - left["second_logit"]))
+        max_margin_delta = max(max_margin_delta, abs(right["margin"] - left["margin"]))
+        second_changes += left["second"] != right["second"]
         shape = f"{left['ubatch']['size']}:{left['row']}->{right['ubatch']['size']}:{right['row']}"
         counts = by_shape.setdefault(shape, {"rows": 0, "differences": 0})
         counts["rows"] += 1
         counts["differences"] += left["natural"] != right["natural"]
         if left["natural"] != right["natural"]:
-            differences.append(dict(width_2=left, width_3=right, chosen_logit_delta=delta))
+            differences.append({labels[0]: left, labels[1]: right, "chosen_logit_delta": delta})
         if left["top"] != right["top"]:
-            top_changes.append(dict(width_2=left, width_3=right, chosen_logit_delta=delta))
+            top_changes.append({labels[0]: left, labels[1]: right, "chosen_logit_delta": delta})
     first = differences[0] if differences else None
     if control is not None:
         for difference in (first, top_changes[0] if top_changes else None):
             if difference is not None:
-                right = difference["width_3"]
+                right = difference[labels[1]]
                 comparison = control[right["index"]]
                 require((comparison["pos"], comparison["input"]) == (right["pos"], right["input"]),
                         "no-rejection control position is misaligned")
@@ -200,7 +205,39 @@ def logit_comparison(reference, candidate, control=None):
     return dict(committed_tokens=len(reference), natural_sample_differences=len(differences),
                 raw_top1_differences=len(top_changes), first_natural_difference=first,
                 first_raw_top1_difference=top_changes[0] if top_changes else None,
+                raw_top2_second_id_differences=second_changes, max_abs_top_logit_delta=max_top_delta,
+                max_abs_second_logit_delta=max_second_delta, max_abs_margin_delta=max_margin_delta,
                 max_abs_chosen_logit_delta=max_delta, natural_differences_by_batch_and_row=by_shape)
+
+
+def overlap_three_metrics(log, verify, enabled):
+    host = re.findall(r"MTP 3-position overlap: fit_layers=(\d+) attempts=(\d+) submitted=(\d+)", log)
+    keys = ("transfer_submits", "upload_bytes", "promotions", "writeback_bytes", "full_ffns", "projection_only",
+            "compute_hot_only", "compute_wait_only", "compute_paired", "transfer_pending")
+    vk = re.findall(r"mtp overlap-three Vulkan: ([^\r\n]+)", log)
+    require(len(host) == 1 and vk, "missing width-3 overlap runtime evidence")
+    fit, attempts, submitted = map(int, host[0])
+    counts = dict.fromkeys(keys, 0)
+    for line in vk:
+        values = dict(re.findall(r"(\w+)=(\d+)", line))
+        for key in keys:
+            counts[key] += int(values[key])
+    require(fit == (verify["layers"] - verify["overflow_layers"] if enabled else 0)
+            and counts["transfer_submits"] == submitted <= attempts <= fit
+            and counts["full_ffns"] + counts["projection_only"] <= submitted
+            and counts["promotions"] <= submitted
+            and counts["transfer_pending"] <= counts["compute_paired"],
+            "width-3 overlap bookkeeping is inconsistent")
+    rows = re.findall(r"decode_telemetry: phase=target_verify (calls=[^\r\n]+)", log)
+    require(len(rows) == 1, "expected a single target-verify phase in each forced CLI process")
+    verify_wall = {key: float(value) if "." in value else int(value)
+                   for key, value in re.findall(r"(\w+)=([\d.]+)", rows[0])}
+    for line in re.findall(r"decode_telemetry: phase=target_verify (vk_compute_submits=[^\r\n]+)", log):
+        verify_wall.update({key: float(value) if "." in value else int(value)
+                            for key, value in re.findall(r"(\w+)=([\d.]+)", line)})
+    require(verify_wall["calls"] > 0 and "vk_compute_submits" in verify_wall, "missing verify submit counts")
+    verify_wall["wall_ms_per_call"] = verify_wall["wall_ms"] / verify_wall["calls"]
+    return dict(fit_layers=fit, attempts=attempts, submitted=submitted, vulkan=counts, target_verify=verify_wall)
 
 
 def main():
@@ -215,9 +252,20 @@ def main():
     order_options.add_argument("--three-first", action="store_true", help="run fixed three, then fixed two, then adaptive")
     order_options.add_argument("--auto-first", action="store_true", help="run adaptive first")
     parser.add_argument("--fast-three", action="store_true", help="test the fast width-3 path with the accepted width-2 baseline")
+    parser.add_argument("--phase-telemetry", action="store_true", help="record response/phase GPU spans and waits during the forced-token diagnostic")
+    parser.add_argument("--overlap-three", action="store_true", help="force one width-2 reference through fast-3 overlap OFF and ON")
+    parser.add_argument("--overlap-on-first", action="store_true", help="reverse the two fast-3 overlap arms")
+    parser.add_argument("--overlap-reference", type=Path, help="reuse a completed comparison's width-2 reference and token IDs")
     args = parser.parse_args()
+    if args.overlap_three and not (args.fast_three and args.logit_diagnostic):
+        parser.error("--overlap-three requires --fast-three and --logit-diagnostic")
+    if not args.overlap_three and (args.overlap_on_first or args.overlap_reference):
+        parser.error("overlap order and reference options require --overlap-three")
+    args.phase_telemetry |= args.overlap_three
     if os.name != "nt":
         parser.error("this comparison requires Windows")
+    if args.phase_telemetry and not args.logit_diagnostic:
+        parser.error("--phase-telemetry requires --logit-diagnostic")
     if args.fast_three and not args.logit_diagnostic:
         parser.error("use --fast-three with --logit-diagnostic, or compare-mtp-warm.py --fast-three for speed")
     if not 8 <= args.tokens <= 512:
@@ -234,6 +282,8 @@ def main():
         run_name = "mtp-two-vs-auto"
     if args.fast_three:
         run_name = "mtp-fast-three-logit"
+    if args.overlap_three:
+        run_name = "mtp-fast-three-overlap-logit"
     directory = COMMON["LOG_ROOT"] / f"{run_name}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
     try:
         cli = args.build_directory.resolve() / "bin/llama-cli.exe"
@@ -249,6 +299,9 @@ def main():
             order = ["width-2", "width-3"]
             if args.no_rejection_control:
                 order.append("width-3-no-rejection")
+        if args.overlap_three:
+            overlap_arms = ["width-3-off", "width-3-on"]
+            order = ([] if args.overlap_reference else ["width-2"]) + (overlap_arms[::-1] if args.overlap_on_first else overlap_arms)
         baseline = COMMON["build_environment"]()
         baseline.update({
             "LLAMA_EXPERT_PREFILL_512": "1",
@@ -257,6 +310,7 @@ def main():
             "LLAMA_EXPERT_PREFILL_OVERLAP_TEN": "1",
             "LLAMA_MTP_REUSE_DRAFT_ANCHOR": None,
             "LLAMA_MTP_VERIFY_THREE_FAST": "0",
+            "LLAMA_MTP_VERIFY_THREE_OVERLAP": "0",
             "LLAMA_MTP_DRAFT_VOCAB": None,
             "LLAMA_MTP_LOGIT_TRACE": "1" if args.logit_diagnostic else None,
             "LLAMA_MTP_LOGIT_REFERENCE": None,
@@ -274,6 +328,12 @@ def main():
                 "GGML_VK_SKIP_EMPTY_POOL_RESET": "0", "GGML_VK_MTP_ROUTED_REDUCE": "1", "GGML_VK_MTP_ROUTED_WEIGHTED": "1",
                 "GGML_VK_MTP_ROUTED_GATE_UP": "1", "GGML_VK_MTP_ROUTED_GATE_UP_PAIR": "0", "LLAMA_MTP_PAIR_EXPERT_OVERLAP": None,
             })
+        if args.phase_telemetry:
+            baseline.update({
+                "LLAMA_DECODE_TELEMETRY": "1", "LLAMA_DECODE_TELEMETRY_PER_RESPONSE": "1",
+                "LLAMA_EXPERT_MISS_HISTOGRAM": "1", "GGML_CUDA_GPU_TIMESTAMPS_DEVICE": "CUDA0",
+                "GGML_VK_GPU_TIMESTAMPS_DEVICE": "Vulkan1",
+            })
         options = COMMON["read_json"](COMMON["SOURCE_RUN"] / "arguments.json")
         require(options[COMMON["argument_index"](options, "-np")] == "1"
                 and options[COMMON["argument_index"](options, "--spec-type")] == "draft-mtp",
@@ -286,6 +346,8 @@ def main():
             "build_artifact_sha256": hashes, "stdin_sha256": COMMON["sha256"](stdin.read_bytes()),
             "expected_user_message_sha256": COMMON["sha256"](message),
             "generated_limit": args.tokens, "prompt_tokens": COMMON["PROMPT_TOKENS"], "order": order,
+            "phase_telemetry": args.phase_telemetry,
+            "reference_archive": str(args.overlap_reference.resolve()) if args.overlap_reference else None,
             "timing_scope": ("Diagnostic timings include logit reads and logging."
                              if args.logit_diagnostic else
                              "One fresh CLI process and uncached prompt per arm. Prompt/load timing is separate. "
@@ -297,6 +359,24 @@ def main():
         traces = {}
         reference_path = directory / "committed-token-ids.txt"
         reference = None
+        if args.overlap_reference:
+            archive = args.overlap_reference.resolve()
+            saved = COMMON["read_json"](archive / "run.json")
+            require(saved["build_artifact_sha256"] == hashes and saved["stdin_sha256"] == provenance["stdin_sha256"]
+                    and saved["expected_user_message_sha256"] == provenance["expected_user_message_sha256"]
+                    and saved["generated_limit"] == args.tokens and saved["phase_telemetry"],
+                    "reference must use the same binaries, input, generation limit and phase telemetry")
+            ref_case = archive / "width-2"
+            settings = COMMON["read_json"](ref_case / "settings.json")
+            require(settings["environment"] == dict(baseline, LLAMA_MTP_VERIFY_THREE=None),
+                    "reference must have the same fixed width-2 settings")
+            traces["width-2"] = read_logit_trace((ref_case / "llama.log").read_text(encoding="utf-8", errors="replace"), args.tokens)
+            reference = [row["chosen"] for row in traces["width-2"]]
+            text_ids = "\n".join(map(str, reference)) + "\n"
+            require((archive / "committed-token-ids.txt").read_text(encoding="ascii") == text_ids, "archived IDs differ from its reference trace")
+            reference_path.write_text(text_ids, encoding="ascii")
+            results["width-2"] = COMMON["read_json"](ref_case / "metrics.json")
+            answers["width-2"] = (ref_case / "answer.txt").read_bytes()
         with COMMON["memory_monitor"](True) as (memory, failure):
             for mode in order:
                 width = 2 if mode == "width-2" else 3
@@ -304,10 +384,12 @@ def main():
                 case.mkdir()
                 arm_stdin, arm_message = COMMON["prepare_inputs"](case)
                 require(arm_message == message and arm_stdin.read_bytes() == stdin.read_bytes(), "benchmark input changed")
-                verify_mode = {"width-2": None, "width-3": "1", "width-3-no-rejection": "1", "auto": "auto"}[mode]
+                verify_mode = None if width == 2 else ("auto" if mode == "auto" else "1")
                 settings = dict(baseline, LLAMA_MTP_VERIFY_THREE=verify_mode)
                 if args.fast_three and width == 3:
                     settings["LLAMA_MTP_VERIFY_THREE_FAST"] = "1"
+                if mode == "width-3-on":
+                    settings["LLAMA_MTP_VERIFY_THREE_OVERLAP"] = "1"
                 if args.logit_diagnostic and reference is not None:
                     settings["LLAMA_MTP_LOGIT_REFERENCE"] = str(reference_path)
                     settings["LLAMA_MTP_LOGIT_MATCH_DRAFTS"] = "1" if mode == "width-3-no-rejection" else None
@@ -337,8 +419,11 @@ def main():
                 require(result["mtp_three"]["draft2_proposed"] * 2 <= result["draft_generated"],
                         "two-draft rounds exceed total MTP proposals")
                 result["decode_tokens_per_second"] = 1000 * result["generated_tokens"] / result["decode_ms"]
+                if args.overlap_three and width == 3:
+                    result["overlap_three"] = overlap_three_metrics(log, verify, mode == "width-3-on")
                 if args.fast_three and width == 3:
-                    result["fast_three"] = fast_three_metrics(log, verify["layers"], verify["overflow_layers"])
+                    overlapped = result.get("overlap_three", {}).get("vulkan", {}).get("full_ffns", 0)
+                    result["fast_three"] = fast_three_metrics(log, verify["layers"], verify["overflow_layers"], overlapped)
                 if args.logit_diagnostic:
                     trace = read_logit_trace(log, args.tokens, reference)
                     require(trace[0]["pos"] + 1 == COMMON["PROMPT_TOKENS"], "unexpected first committed target position")
@@ -369,13 +454,23 @@ def main():
             pairs = (("width-2", "auto"),)
         elif args.logit_diagnostic:
             pairs = (("width-2", "width-3"),)
+        if args.overlap_three:
+            pairs = (("width-2", "width-3-off"), ("width-2", "width-3-on"), ("width-3-off", "width-3-on"))
         comparison = {
             f"{candidate}_vs_{baseline}": pair_report(results, answers, baseline, candidate)
             for baseline, candidate in pairs
         }
         report = {"runs": results, "comparison": comparison, "run_provenance": provenance}
         if args.logit_diagnostic:
-            report["logit_diagnostic"] = logit_comparison(traces["width-2"], traces["width-3"], traces.get("width-3-no-rejection"))
+            if args.overlap_three:
+                report["logit_diagnostic"] = logit_comparison(traces["width-3-off"], traces["width-3-on"], labels=("overlap_off", "overlap_on"))
+                report["vs_width2_logits"] = {
+                    mode: logit_comparison(traces["width-2"], traces[mode], labels=("width_2", mode))
+                    for mode in ("width-3-off", "width-3-on")
+                }
+                report["timing_scope"] = "First generation in each fresh CLI process. Use both orders to expose first-run noise."
+            else:
+                report["logit_diagnostic"] = logit_comparison(traces["width-2"], traces["width-3"], traces.get("width-3-no-rejection"))
             report["committed_token_ids_sha256"] = COMMON["sha256"](reference_path.read_bytes())
             report["diagnostic_scope"] = ("Same committed token IDs, actual target logits before sampling, and normal MTP "
                                           "acceptance and rollback on those IDs. The logit row position is the input "
@@ -387,6 +482,11 @@ def main():
             print(f"{mode}: {result['decode_ms']:.2f} ms, {result['decode_tokens_per_second']:.2f} tok/s")
         print(json.dumps(report["logit_diagnostic"] if args.logit_diagnostic else
                          {"comparison": comparison, "adaptive": results["auto"]["adaptive"]}, indent=2))
+        if args.overlap_three:
+            on = results["width-3-on"]["overlap_three"]["vulkan"]
+            require(on["transfer_submits"] > 0 and on["full_ffns"] > 0 and
+                    on["compute_paired"] + on["compute_hot_only"] > 0,
+                    "width-3 overlap did not submit a full hot/cold FFN; inspect comparison.json")
         if args.fast_three:
             require(not any(result["rollback_validation"]["mismatches"] for result in results.values()),
                     "committed verification rollback ranges or tails differ; inspect comparison.json")

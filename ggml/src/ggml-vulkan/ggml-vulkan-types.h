@@ -1157,8 +1157,19 @@ struct vk_gpu_telemetry {
 
 struct vk_expert_overlap {
     const ggml_tensor * projection = nullptr;
-    uint32_t hot_masks[2] = {};
-    uint32_t excluded_masks[2] = {};
+    uint32_t hot_masks[3] = {};
+    uint32_t excluded_masks[3] = {};
+    bool width3 = false;
+    uint64_t width3_transfer_submits = 0;
+    uint64_t width3_upload_bytes = 0;
+    uint64_t width3_promotions = 0;
+    uint64_t width3_writeback_bytes = 0;
+    uint64_t width3_full_ffns = 0;
+    uint64_t width3_projection_only = 0;
+    uint64_t width3_compute_hot_only = 0;
+    uint64_t width3_compute_wait_only = 0;
+    uint64_t width3_compute_paired = 0;
+    uint64_t width3_transfer_pending = 0;
     ggml_backend_buffer_ptr ffn_scratch;
     std::vector<ggml_backend_buffer_ptr> ffn_retired_scratch;
     uint64_t split_ffns = 0;

@@ -2082,6 +2082,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    struct scheduler_verify_three_scope {
+        ggml_backend_sched_t sched;
+        bool previous;
+        ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
+    } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
+            target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

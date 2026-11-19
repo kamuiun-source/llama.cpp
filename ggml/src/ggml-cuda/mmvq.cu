@@ -778,12 +778,12 @@ static __global__ void mul_mat_vec_q(
 #endif
 
         if constexpr (hc_reuse) {
-            static_assert(type == GGML_TYPE_Q8_0 && ncols_dst == 2 && rows_per_cuda_block == 2 && !has_fusion);
+            static_assert(type == GGML_TYPE_Q8_0 && (ncols_dst == 2 || ncols_dst == 3) && rows_per_cuda_block == 2 && !has_fusion);
             constexpr int n = VDR_Q8_0_Q8_1_MMVQ;
-            int u[2][n];
-            float dy[2];
+            int u[ncols_dst][n];
+            float dy[ncols_dst];
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < ncols_dst; ++j) {
                 const block_q8_1 & activation = y[j*stride_col_y + kby];
                 dy[j] = __low2half(activation.ds);
 #pragma unroll
@@ -792,7 +792,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const block_q8_0 & weight = ((const block_q8_0 *) vx)[kbx_offset + i*stride_row_x + kbx];
                 const float dx = weight.d;
                 int v[n];
@@ -801,7 +801,7 @@ static __global__ void mul_mat_vec_q(
                     v[k] = get_int_b2(weight.qs, kqs + k);
                 }
 #pragma unroll
-                for (int j = 0; j < 2; ++j) {
+                for (int j = 0; j < ncols_dst; ++j) {
                     tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, n>(v, u[j], dx, dy[j]);
                 }
             }
@@ -1634,33 +1634,45 @@ void ggml_cuda_mul_mat_vec_q(
     }();
     const auto & device = ggml_cuda_info().devices[ctx.device];
     if ((hc_down_reuse || hc_up_reuse) && !ids && !fusion && src0->type == GGML_TYPE_Q8_0 &&
-            device.cc == GGML_CUDA_CC_ADA_LOVELACE && ne11 == 2 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            device.cc == GGML_CUDA_CC_ADA_LOVELACE && (ne11 == 2 || (ne11 == 3 && ggml_cuda_hc_mtp_three_enabled())) &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ((hc_down_reuse && ne00 == 10240 && ne01 == 320) || (hc_up_reuse && ne00 == 320 && ne01 == 10240)) &&
             ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
         const auto projection = ggml_cuda_hc_projection_for_weight(src0->name);
         const bool down = hc_down_reuse && ne00 == 10240 && projection == GGML_CUDA_HC_DOWN;
         const bool up = hc_up_reuse && ne00 == 320 && projection == GGML_CUDA_HC_UP;
         if (down || up) {
-            const auto launch = [&](auto groups) {
+            const auto launch = [&](auto cols, auto groups) {
+                constexpr int ncols = decltype(cols)::value;
                 constexpr int row_groups = decltype(groups)::value;
-                auto dims = calc_launch_params<GGML_TYPE_Q8_0>(2, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
+                auto dims = calc_launch_params<GGML_TYPE_Q8_0>(ncols, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
                 dims.first.x /= row_groups;
                 dims.second.z = row_groups;
                 const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
-                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, 2, false, false, false, true, row_groups>, params,
+                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, ncols, false, false, false, true, row_groups>, params,
                     src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
                     uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
                     init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
             };
-            if (down) {
-                launch(std::integral_constant<int, 1>{});
-                static const bool logged = (GGML_LOG_INFO("CUDA HC down reuse applied\n"), true);
-                GGML_UNUSED(logged);
+            const auto launch_projection = [&](auto cols) {
+                constexpr int ncols = decltype(cols)::value;
+                if (down) {
+                    launch(cols, std::integral_constant<int, 1>{});
+                    static const bool logged = (GGML_LOG_INFO("%s\n",
+                        ncols == 2 ? "CUDA HC down reuse applied" : "CUDA HC down reuse applied: tokens=3"), true);
+                    GGML_UNUSED(logged);
+                } else {
+                    // Pack two row pairs without changing the reduction for either pair.
+                    launch(cols, std::integral_constant<int, 2>{});
+                    static const bool logged = (GGML_LOG_INFO("%s\n",
+                        ncols == 2 ? "CUDA HC up reuse applied" : "CUDA HC up reuse applied: tokens=3"), true);
+                    GGML_UNUSED(logged);
+                }
+            };
+            if (ne11 == 2) {
+                launch_projection(std::integral_constant<int, 2>{});
             } else {
-                // Pack two row pairs without changing the reduction for either pair.
-                launch(std::integral_constant<int, 2>{});
-                static const bool logged = (GGML_LOG_INFO("CUDA HC up reuse applied\n"), true);
-                GGML_UNUSED(logged);
+                launch_projection(std::integral_constant<int, 3>{});
             }
             return;
         }

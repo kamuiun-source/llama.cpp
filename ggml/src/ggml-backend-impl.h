@@ -10,7 +10,7 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 3
 
-    // Three contiguous inputs for the packed MoE Vulkan graph.
+    // Two or three contiguous inputs for the packed MoE Vulkan graph. The last destination may be null.
     struct ggml_backend_graph_upload {
         ggml_backend_buffer_t staging;
         struct ggml_tensor * dst[3];

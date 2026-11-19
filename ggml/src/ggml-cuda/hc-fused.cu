@@ -520,7 +520,8 @@ bool ggml_cuda_hc_inject_split(ggml_backend_cuda_context & ctx, const ggml_tenso
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             device.cc != GGML_CUDA_CC_ADA_LOVELACE || device.warp_size != hc_inject_splits ||
             src0->ne[0] != hc_inject_width || src0->ne[1] != hc_inject_rows || src1->ne[0] != hc_inject_width ||
-            src1->ne[1] < 1 || src1->ne[1] > 2 || !ggml_is_matrix(src0) || !ggml_is_matrix(src1) ||
+            src1->ne[1] < 1 || src1->ne[1] > 3 || (src1->ne[1] == 3 && !ggml_cuda_hc_mtp_three_enabled()) ||
+            !ggml_is_matrix(src0) || !ggml_is_matrix(src1) ||
             !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
             ggml_cuda_hc_projection_for_weight(src0->name) != GGML_CUDA_HC_INJECT) {
         return false;
@@ -532,13 +533,20 @@ bool ggml_cuda_hc_inject_split(ggml_backend_cuda_context & ctx, const ggml_tenso
     const float * input = (const float *) src1->data;
     if (tokens == 1) {
         ggml_cuda_kernel_launch(hc_inject_partials<1>, first, weights, input, partials.get());
-    } else {
+    } else if (tokens == 2) {
         ggml_cuda_kernel_launch(hc_inject_partials<2>, first, weights, input, partials.get());
+    } else {
+        ggml_cuda_kernel_launch(hc_inject_partials<3>, first, weights, input, partials.get());
     }
     const ggml_cuda_kernel_launch_params last(dim3(tokens * hc_inject_rows), dim3(device.warp_size), 0, ctx.stream());
     ggml_cuda_kernel_launch(hc_inject_reduce, last, partials.get(), (float *) dst->data);
-    static const bool logged = (GGML_LOG_INFO("CUDA HC inject split applied\n"), true);
-    GGML_UNUSED(logged);
+    if (tokens == 3) {
+        static const bool logged = (GGML_LOG_INFO("CUDA HC inject split applied: tokens=3\n"), true);
+        GGML_UNUSED(logged);
+    } else {
+        static const bool logged = (GGML_LOG_INFO("CUDA HC inject split applied\n"), true);
+        GGML_UNUSED(logged);
+    }
     return true;
 #endif
 }

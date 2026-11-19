@@ -443,6 +443,9 @@ struct llama_moe_cache::impl {
     std::vector<std::array<uint64_t, mtp_pair_experts + 1>> mtp_pair_histograms;
     size_t mtp_verify_layers = 0;
     size_t mtp_verify_overflow_layers = 0;
+    size_t mtp_overlap_fit_layers = 0;
+    size_t mtp_overlap_attempts = 0;
+    size_t mtp_overlap_submitted = 0;
     size_t mtp_verify_second_passes = 0;
     size_t mtp_verify_empty_no_copy = 0;
     int32_t mtp_verify_max_cold = 0;
@@ -1845,7 +1848,7 @@ struct llama_moe_cache::impl {
         constexpr size_t max_lanes = 32;
         constexpr size_t max_planes = 3;
         if (n_used <= 0 || ids.size() > max_lanes || ids.size() % n_used != 0 ||
-                ids.size() / n_used > 2 || l.experts.size() > max_planes) {
+                ids.size() / n_used > 3 || l.experts.size() > max_planes) {
             return false;
         }
         const auto & map = placement->maps[il];
@@ -1854,7 +1857,7 @@ struct llama_moe_cache::impl {
             filled[fill.expert] = true;
         }
         std::array<int32_t, max_lanes> used_slots{};
-        std::array<uint32_t, 2> hot_masks{};
+        std::array<uint32_t, 3> hot_masks{};
         for (size_t i = 0; i < ids.size(); ++i) {
             const auto expert = ids[i];
             used_slots[i] = slots[expert];
@@ -1862,7 +1865,7 @@ struct llama_moe_cache::impl {
                 hot_masks[i / n_used] |= uint32_t{1} << (i % n_used);
             }
         }
-        if (!(hot_masks[0] || hot_masks[1])) {
+        if (!(hot_masks[0] || hot_masks[1] || hot_masks[2])) {
             return false;
         }
 
@@ -2044,6 +2047,12 @@ struct llama_moe_cache::impl {
         const bool mtp_verify = mtp_verify_three_enabled && !prefill &&
                 (src == l.mtp_verify_maps[0] || src == l.mtp_verify_maps[1]);
         const bool use_waves = prefill || mtp_verify;
+        static const bool overlap_three = [] {
+            const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE_OVERLAP");
+            const char * fast = std::getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+            return value && std::strcmp(value, "1") == 0 && fast && std::strcmp(fast, "1") == 0;
+        }();
+        bool overlap_three_fit = false;
         const int32_t wave = mtp_verify ? int32_t(src == l.mtp_verify_maps[1]) :
                 static_cast<int32_t>(wave_it - l.prefill_maps.begin());
 
@@ -2231,6 +2240,8 @@ struct llama_moe_cache::impl {
                     if (mtp_verify) {
                         ++mtp_verify_layers;
                         mtp_verify_overflow_layers += cold_count > placement->n_slots;
+                        overlap_three_fit = overlap_three && cold_count <= placement->n_slots;
+                        mtp_overlap_fit_layers += overlap_three_fit;
                         mtp_verify_max_cold = std::max(mtp_verify_max_cold, cold_count);
                     } else {
                         ++prefill_layer_batches;
@@ -2378,10 +2389,18 @@ struct llama_moe_cache::impl {
                 pending_scratch_hits = scratch_hits;
                 return true;
             }
+            if (use_waves) {
+                for (size_t expert = 0; expert < slots.size(); ++expert) {
+                    if (l.prefill_wave[expert] != wave) {
+                        slots[expert] = -1;
+                    }
+                }
+            }
             const int32_t evict = placement->dynamic_resident && promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
             bool upload_submitted = false;
             bool overlap_submitted = false;
-            const bool can_overlap = !use_waves && overlap_expert_upload && !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
+            const bool can_overlap = (!use_waves || overlap_three_fit) && overlap_expert_upload &&
+                    !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
             if (batch && (!fills.empty() || can_overlap_promotion)) {
                 // A single-copy scheduler synchronizes the backend before each host-weight callback.
@@ -2390,7 +2409,9 @@ struct llama_moe_cache::impl {
                 try {
                     size_t overlap_copied_bytes = 0;
                     if (can_overlap && (evict < 0 || can_overlap_promotion)) {
+                        mtp_overlap_attempts += overlap_three_fit;
                         overlap_submitted = overlap_packed_upload(backend, graph, dst, l, il, n_used, slots, promote_index, evict, bytes, overlap_copied_bytes);
+                        mtp_overlap_submitted += overlap_three_fit && overlap_submitted;
                     }
                     if (!overlap_submitted && !fills.empty()) {
                         bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr, overlap_copied_bytes);
@@ -2418,13 +2439,6 @@ struct llama_moe_cache::impl {
             }
             if (evict >= 0 && !overlap_submitted) {
                 promote_packed(l, il, promote_index, evict);
-            }
-            if (use_waves) {
-                for (size_t expert = 0; expert < slots.size(); ++expert) {
-                    if (l.prefill_wave[expert] != wave) {
-                        slots[expert] = -1;
-                    }
-                }
             }
             if (gate_up_diag_ids && fixed_mtp_pair && src == l.slot_map && ids.size() == 20) {
                 int32_t selected_slots[20];
@@ -2565,6 +2579,8 @@ struct llama_moe_cache::impl {
                     mtp_verify_layers, mtp_verify_overflow_layers, mtp_verify_max_cold);
             LLAMA_LOG_INFO("MTP 3-position waves: second_passes=%zu empty_no_copy=%zu\n",
                     mtp_verify_second_passes, mtp_verify_empty_no_copy);
+            LLAMA_LOG_INFO("MTP 3-position overlap: fit_layers=%zu attempts=%zu submitted=%zu\n",
+                    mtp_overlap_fit_layers, mtp_overlap_attempts, mtp_overlap_submitted);
         }
         if (placement && prompt_stats) {
             LLAMA_LOG_INFO("packed expert prompt uploads: capacity=%d ubatches=%" PRIu64 " tokens=%" PRIu64

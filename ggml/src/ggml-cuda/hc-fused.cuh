@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 
+#include <cstring>
 #include <string_view>
 
 enum ggml_cuda_hc_projection {
@@ -25,6 +26,15 @@ inline ggml_cuda_hc_projection ggml_cuda_hc_projection_for_weight(std::string_vi
         return GGML_CUDA_HC_INJECT;
     }
     return GGML_CUDA_HC_PROJECTION_COUNT;
+}
+
+inline bool ggml_cuda_hc_mtp_three_enabled() {
+    static const bool enabled = [] {
+        const char * hc = std::getenv("GGML_CUDA_HC_MTP_THREE");
+        const char * verify = std::getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+        return hc && std::strcmp(hc, "1") == 0 && verify && std::strcmp(verify, "1") == 0;
+    }();
+    return enabled;
 }
 
 int ggml_cuda_hc_mix_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
