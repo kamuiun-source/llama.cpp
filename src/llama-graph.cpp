@@ -1592,12 +1592,15 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    target_mtp_verify_three(params.target_mtp_verify_three),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    mtp_vocab_head   (params.mtp_vocab_head),
+    mtp_vocab_ids    (params.mtp_vocab_ids),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2436,8 +2439,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const std::array<ggml_tensor *, 4> exps = { up_exps, gate_exps, down_exps, gate_up_exps };
     const bool can_cpu_share = !weight_before_ffn && loras->empty() &&
         std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; });
-    const int32_t prefill_waves = moe_cache ? moe_cache->get_prefill_waves(il, n_tokens, n_expert_used) : 0;
-    const bool compact_prefill = moe_cache && moe_cache->compact_prefill(n_tokens);
+    const bool mtp_waves = target_mtp_verify_three && n_tokens == 3 && moe_cache && moe_cache->requires_slots(il);
+    static const bool mtp_three_fast = [] {
+        const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const bool fast_three = mtp_waves && mtp_three_fast;
+    const int32_t prefill_waves = mtp_waves ? 2 : moe_cache ? moe_cache->get_prefill_waves(il, n_tokens, n_expert_used) : 0;
+    const bool compact_prefill = !mtp_waves && moe_cache && moe_cache->compact_prefill(n_tokens);
+    if (mtp_waves && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || down_exps_b || post_exp_norm ||
+            type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f)) {
+        throw std::runtime_error("3-position MTP requires unclamped SiLU Experts without bias, rotation, LoRA or post norm");
+    }
     if (compact_prefill && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || down_exps_b || post_exp_norm ||
             type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f ||
             (prec_policy && std::any_of(exps.begin(), exps.end(), [&](ggml_tensor * w) {
@@ -2634,9 +2647,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
         ggml_build_forward_expand(gf, ids);
         for (int32_t wave = 0; wave < prefill_waves; ++wave) {
-            auto slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, false, wave, ids);
+            auto slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, false, wave, ids, mtp_waves);
             auto * out = build_experts(cur, selected_experts, slots.slots, true);
-            experts = experts ? ggml_add(ctx0, experts, out) : out;
+            if (experts) {
+                // The first wave has no other consumer. The empty-wave path can keep it in place.
+                experts = fast_three ? ggml_add_inplace(ctx0, experts, out) : ggml_add(ctx0, experts, out);
+            } else {
+                experts = out;
+            }
             if (wave > 0) {
                 ggml_set_name(experts, "ffn_moe_prefill_accumulator");
             }
@@ -2701,7 +2719,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
+        cb(experts, fast_three ? "ffn_moe_weighted_mtp_three" : "ffn_moe_weighted", il);
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2724,8 +2742,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // aggregate experts
     ggml_tensor * moe_out = cur_experts[0];
 
+    static const bool trace_routed_dispatch = [] {
+        const char * value = std::getenv("LLAMA_MTP_ROUTED_DISPATCH_STATS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (trace_routed_dispatch && n_tokens == 2 && i + 1 < n_expert_used_il) {
+            ggml_format_name(moe_out, "ffn_moe_reduce-%d", il);
+        }
 
         ggml_build_forward_expand(gf, moe_out);
     }
@@ -2750,7 +2775,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
                  int   il,
                 bool   cold,
              int32_t   prefill_wave,
-         ggml_tensor * prefill_ids) const {
+         ggml_tensor * prefill_ids,
+                bool   mtp_verify_three) const {
     if (moe_cache == nullptr) {
         return { nullptr, nullptr };
     }
@@ -2763,7 +2789,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     };
 
     ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
-    ggml_tensor * slot_map = prefill_wave >= 0 ? moe_cache->get_prefill_map(il, prefill_wave) :
+    ggml_tensor * slot_map = mtp_verify_three ? moe_cache->get_mtp_verify_map(il, prefill_wave) :
+            prefill_wave >= 0 ? moe_cache->get_prefill_map(il, prefill_wave) :
             cold ? moe_cache->get_cold_slot_map(il) :
             moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
     if (slot_map == nullptr) {
@@ -2811,8 +2838,16 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
 
     slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
-    if (prefill_wave >= 0) {
+    if (prefill_wave >= 0 && !mtp_verify_three) {
         ggml_set_name(slots, "ffn_moe_prefill_slots");
+    } else if (mtp_verify_three) {
+        static const bool mtp_three_fast = [] {
+            const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (mtp_three_fast) {
+            ggml_set_name(slots, "ffn_moe_mtp_three_slots");
+        }
     }
     return { slots, cpu_ids };
 }

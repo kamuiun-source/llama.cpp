@@ -164,8 +164,11 @@ struct llama_context {
                        ggml_status & ret,
                               bool   profile = false);
 
+    bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
+    void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
+
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true);
+    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false);
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -277,6 +280,7 @@ private:
 public:
     uint32_t graph_max_nodes() const;
     uint32_t n_ubatch_prefill() const;
+    bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -408,7 +412,16 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    void init_mtp_vocab_subset();
+    ggml_context_ptr mtp_vocab_ctx;
+    ggml_backend_buffer_ptr mtp_vocab_buffer;
+    ggml_tensor * mtp_vocab_head = nullptr;
+    ggml_tensor * mtp_vocab_ids = nullptr;
+
     ggml_backend_sched_ptr sched;
+    bool mtp_verify_three_enabled = false;
+    bool mtp_logit_trace_enabled = false;
+    uint32_t target_mtp_verify_width = 0;
 
     sched_params sched_params_cur;
 

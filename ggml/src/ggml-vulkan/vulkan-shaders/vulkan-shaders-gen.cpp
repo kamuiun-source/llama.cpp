@@ -812,6 +812,20 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        if (tname == "iq2_s" || tname == "iq3_xxs" || tname == "iq4_xs") {
+            const auto gate_up = merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MOE_GATE_UP", "1"}, {data_a_key, "1"},
+                                                       {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+            const auto name = "mul_mat_vec_id_" + tname + "_gate_up";
+            string_to_spv(name, shader, gate_up);
+            string_to_spv(name + "_subgroup", shader, merge_maps(gate_up, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv(name + "_subgroup_no_shmem", shader, merge_maps(gate_up, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            if (tname != "iq4_xs") {
+                const auto pair = merge_maps(gate_up, {{"MUL_MAT_ID_PAIR", "1"}});
+                string_to_spv(name + "_pair", shader, pair);
+                string_to_spv(name + "_pair_subgroup", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD", "1"}}));
+                string_to_spv(name + "_pair_subgroup_no_shmem", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            }
+        }
         if (tname == "iq4_nl") {
             const auto pair = merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_PAIR", "1"}, {data_a_key, "1"},
                                                       {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
@@ -1248,6 +1262,8 @@ void process_shaders() {
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
+    string_to_spv("mtp_routed_reduce_f32", "mtp_routed_reduce.comp", {});
+    string_to_spv("mtp_routed_weighted_f32", "mtp_routed_reduce.comp", {{"ROUTER_WEIGHTS", "1"}});
 
     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

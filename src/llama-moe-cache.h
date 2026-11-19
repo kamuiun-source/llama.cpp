@@ -17,7 +17,7 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool mtp_verify_three_enabled = false);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -37,6 +37,7 @@ public:
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
     int32_t get_prefill_waves(int32_t il, int64_t n_tokens, int64_t n_used) const;
     ggml_tensor * get_prefill_map(int32_t il, int32_t wave) const;
+    ggml_tensor * get_mtp_verify_map(int32_t il, int32_t wave) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w, bool cold = false) const;
@@ -51,7 +52,7 @@ public:
     bool early_copy_enabled() const;
     bool router_host_ids_enabled() const;
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile,
-            bool early = false, ggml_backend_sched_t sched = nullptr);
+            bool early = false, ggml_backend_sched_t sched = nullptr, bool fixed_mtp_pair = false);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

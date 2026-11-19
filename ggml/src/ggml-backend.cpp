@@ -1279,6 +1279,9 @@ struct ggml_backend_sched_host_copies {
     size_t count = 0;
 };
 
+using ggml_backend_cuda_get_shared_input_t = bool (*)(ggml_backend_t, const ggml_tensor * const *,
+        ggml_backend_buffer_t, void *, const size_t *, const size_t *, const size_t *, size_t);
+
 struct ggml_backend_sched_shared_host {
     ggml_backend_buffer_t cuda_buffer;
     ggml_backend_buffer_t vk_buffer;
@@ -1365,6 +1368,27 @@ struct ggml_backend_sched {
     ggml_backend_sched_shared_host shared_input;
     bool shared_host_input;
     bool shared_input_pending;
+    bool shared_input_producer;
+    ggml_backend_cuda_get_shared_input_t shared_input_get;
+    bool shared_input_get_tried;
+    bool target_mtp_verify;
+    bool routed_stats_enabled;
+    ggml_backend_t routed_stats_backend;
+    void (*set_routed_stats_active)(ggml_backend_t, bool);
+    size_t routed_stats_rounds;
+    size_t routed_stats_vulkan_aggregates;
+    size_t routed_stats_other_backend;
+    size_t routed_stats_other_op;
+    size_t shared_input_verify_batches;
+    size_t shared_input_other_batches;
+    size_t shared_input_verify_bytes;
+    size_t shared_input_other_bytes;
+    size_t shared_input_optimized_verify;
+    size_t shared_input_optimized_other;
+    size_t shared_input_producer_eligible;
+    size_t shared_input_producer_batches;
+    size_t shared_input_producer_bytes;
+    size_t shared_input_producer_fallbacks;
     size_t shared_input_batches;
     size_t shared_input_bytes;
     size_t shared_return_copies;
@@ -2661,21 +2685,65 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     auto & profile = sched->profile;
     const int64_t start_us = profile.enabled ? ggml_time_us() : 0;
 
-    // Complete the source producers and the older destination users before issuing the synchronous bulk copies.
     ggml_backend_handoff_times handoff;
     handoff.enabled = sched->trace_handoff_graph != 0;
-    handoff.measure(handoff.source_wait_us, [&] { ggml_backend_synchronize(src_backend); });
-    handoff.measure(handoff.destination_wait_us, [&] { ggml_backend_synchronize(dst_backend); });
+    bool producer_copy = false;
     if (upload.compute) {
-        // The preceding Vulkan graph no longer reads this staging allocation.
-        sched->shared_input_pending = false;
+        if (sched->target_mtp_verify) {
+            ++sched->shared_input_verify_batches;
+            sched->shared_input_verify_bytes += bytes;
+        } else {
+            ++sched->shared_input_other_batches;
+            sched->shared_input_other_bytes += bytes;
+        }
     }
-    handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
+    if (upload.compute && sched->shared_input_producer && sched->target_mtp_verify) {
+        ++sched->shared_input_producer_eligible;
+        if (!sched->shared_input_get_tried) {
+            sched->shared_input_get_tried = true;
+            auto * device = ggml_backend_get_device(src_backend);
+            auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+            if (reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+                sched->shared_input_get = reinterpret_cast<ggml_backend_cuda_get_shared_input_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_shared_input"));
+            }
+        }
+        // Finish prior Vulkan staging reads and promotion commits before CUDA overwrites shared RAM.
+        handoff.measure(handoff.destination_wait_us, [&] { ggml_backend_synchronize(dst_backend); });
+        sched->shared_input_pending = false;
+        if (sched->shared_input_get) {
+            handoff.read([&] {
+                producer_copy = sched->shared_input_get(src_backend, srcs, sched->shared_input.cuda_buffer,
+                        staging, offsets, sizes, data_offsets, count);
+            });
+        }
+        if (producer_copy) {
+            ++sched->shared_input_producer_batches;
+            sched->shared_input_producer_bytes += bytes;
+            if (sched->target_mtp_verify) {
+                ++sched->shared_input_optimized_verify;
+            } else {
+                ++sched->shared_input_optimized_other;
+            }
+        } else {
+            ++sched->shared_input_producer_fallbacks;
+            handoff.measure(handoff.source_wait_us, [&] { ggml_backend_synchronize(src_backend); });
+            handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
+        }
+    } else {
+        // Keep the ordinary synchronous bulk path for every other input layout and backend.
+        handoff.measure(handoff.source_wait_us, [&] { ggml_backend_synchronize(src_backend); });
+        handoff.measure(handoff.destination_wait_us, [&] { ggml_backend_synchronize(dst_backend); });
+        if (upload.compute) {
+            sched->shared_input_pending = false;
+        }
+        handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
+    }
     if (!upload.compute) {
         handoff.measure(handoff.write_us, [&] { ggml_backend_tensor_set_n(dsts, staging, offsets, sizes, data_offsets, count); });
     }
     ggml_backend_sched_log_handoff(sched, split, src_backend, dst_backend, srcs, count, bytes, handoff,
-            upload.compute ? "host_batch_shared" : "host_batch");
+            producer_copy ? "host_batch_shared_producer" : upload.compute ? "host_batch_shared" : "host_batch");
     for (int i = 0; i < count; ++i) {
         if (auto * entry = ggml_backend_sched_host_copy_entry(host_copies, src_backend, dst_backend, srcs[i])) {
             if (upload.compute) {
@@ -3350,6 +3418,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->shared_host_input = sched->n_copies == 1 && cuda_vulkan &&
             !(rtx_slots && atoi(rtx_slots) > 0);
 #endif
+    const char * producer_copy = getenv("GGML_SCHED_SHARED_INPUT_PRODUCER_COPY");
+    sched->shared_input_producer = sched->shared_host_input && producer_copy && strcmp(producer_copy, "1") == 0;
+    const char * routed_stats = getenv("LLAMA_MTP_ROUTED_DISPATCH_STATS");
+    const char * routed_reduce = getenv("GGML_VK_MTP_ROUTED_REDUCE");
+    sched->routed_stats_enabled = routed_stats && strcmp(routed_stats, "1") == 0;
+    if (sched->routed_stats_enabled || (routed_reduce && strcmp(routed_reduce, "1") == 0)) {
+        for (int i = 0; i < n_backends; ++i) {
+            auto backend = backends[i];
+            if (strcmp(ggml_backend_name(backend), "Vulkan1") == 0) {
+                auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                sched->routed_stats_backend = backend;
+                if (reg) {
+                    sched->set_routed_stats_active = reinterpret_cast<decltype(sched->set_routed_stats_active)>(
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_mtp_routed_stats_active"));
+                }
+                break;
+            }
+        }
+    }
     const char * trace_handoff = getenv("GGML_SCHED_TRACE_EXPERT_HANDOFF");
     sched->trace_handoff = trace_handoff && strcmp(trace_handoff, "1") == 0;
     const char * batch_host_inputs = getenv("GGML_SCHED_BATCH_HOST_INPUTS");
@@ -3481,6 +3568,19 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     if (sched->shared_host_input) {
         GGML_LOG_INFO("shared host expert input: batches=%zu bytes=%zu\n", sched->shared_input_batches, sched->shared_input_bytes);
+        GGML_LOG_INFO("shared host producer copy: enabled=%d eligible=%zu batches=%zu tensors=%zu bytes=%zu waits=%zu fallbacks=%zu"
+                " scope=mtp_verify verify_shared=%zu other_shared=%zu verify_bytes=%zu other_bytes=%zu optimized_verify=%zu optimized_other=%zu\n",
+                sched->shared_input_producer, sched->shared_input_producer_eligible, sched->shared_input_producer_batches,
+                3 * sched->shared_input_producer_batches, sched->shared_input_producer_bytes,
+                sched->shared_input_producer_batches, sched->shared_input_producer_fallbacks,
+                sched->shared_input_verify_batches, sched->shared_input_other_batches,
+                sched->shared_input_verify_bytes, sched->shared_input_other_bytes,
+                sched->shared_input_optimized_verify, sched->shared_input_optimized_other);
+    }
+    if (sched->routed_stats_rounds) {
+        GGML_LOG_INFO("mtp routed schedule: rounds=%zu vulkan1_aggregate_add=%zu other_backend_aggregate_add=%zu other_aggregate_op=%zu\n",
+                sched->routed_stats_rounds, sched->routed_stats_vulkan_aggregates,
+                sched->routed_stats_other_backend, sched->routed_stats_other_op);
     }
     // Release Vulkan's imports before CUDA unpins and frees the original allocations.
     ggml_backend_buffer_free(sched->shared_return.vk_buffer);
@@ -3571,6 +3671,27 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (sched->target_mtp_verify && sched->routed_stats_enabled && sched->set_routed_stats_active) {
+        ++sched->routed_stats_rounds;
+        constexpr const char prefix[] = "ffn_moe_out-";
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const auto * node = graph->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) || strncmp(node->name, prefix, sizeof(prefix) - 1) != 0) {
+                continue;
+            }
+            const size_t index = ggml_hash_find(&sched->hash_set, node);
+            const int backend_id = index < sched->hash_set.size && ggml_bitset_get(sched->hash_set.used, index) ?
+                    sched->hv_tensor_backend_ids[index] : -1;
+            if (node->op != GGML_OP_ADD) {
+                ++sched->routed_stats_other_op;
+            } else if (backend_id >= 0 && sched->backends[backend_id] == sched->routed_stats_backend) {
+                ++sched->routed_stats_vulkan_aggregates;
+            } else {
+                ++sched->routed_stats_other_backend;
+            }
+        }
+    }
+
     auto & profile = sched->profile;
     if (!profile.enabled) {
         return ggml_backend_sched_compute_splits(sched);
@@ -3611,6 +3732,15 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+bool ggml_backend_sched_set_target_mtp_verify(ggml_backend_sched_t sched, bool enabled) {
+    const bool previous = sched->target_mtp_verify;
+    sched->target_mtp_verify = enabled;
+    if (sched->set_routed_stats_active && enabled != previous) {
+        sched->set_routed_stats_active(sched->routed_stats_backend, enabled);
+    }
+    return previous;
 }
 
 bool ggml_backend_sched_set_custom_op_backend(ggml_backend_sched_t sched, ggml_tensor * op, ggml_backend_t backend) {

@@ -17,58 +17,6 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 uint a_offset, b_offset, d_offset, y_offset;
 
 #ifdef MUL_MAT_ID_PAIR
-uint pair_b_offset;
-
-uint first_matching_rank(int expert, uint token, uint mask) {
-    while (mask != 0) {
-        const uint rank = uint(findLSB(mask));
-        if (data_ids[token*p.nbi1 + rank] == expert) {
-            return rank;
-        }
-        mask &= mask - 1;
-    }
-    return p.nei0;
-}
-
-bool get_pair_offsets() {
-    const uint count_0 = uint(bitCount(p.expert_mask));
-    const uint token = uint(gl_WorkGroupID.y >= count_0);
-    const uint mask = token == 0 ? p.expert_mask : p.expert_mask_1;
-    uint remaining = mask;
-    for (uint i = gl_WorkGroupID.y - token*count_0; i > 0; --i) {
-        remaining &= remaining - 1;
-    }
-    const uint rank = uint(findLSB(remaining));
-    const int expert = data_ids[token*p.nbi1 + rank];
-
-    pair_active = false;
-    expert_skip = expert < 0 || uint(expert) >= p.n_experts;
-    expert_id = expert_skip ? 0 : uint(expert);
-    d_offset = token*p.batch_stride_d + rank*p.stride_d;
-    if (expert_skip) {
-        return true;
-    }
-
-    a_offset = expert_id * (p.batch_stride_a / QUANT_K);
-    b_offset = token*p.batch_stride_b + rank*p.stride_b;
-
-    // Pair only the first active occurrence in each token.
-    const uint earlier = mask & ((1u << rank) - 1u);
-    if (first_matching_rank(expert, token, earlier) == p.nei0) {
-        const uint other_mask = token == 0 ? p.expert_mask_1 : p.expert_mask;
-        const uint other_rank = first_matching_rank(expert, 1u - token, other_mask);
-        if (other_rank < p.nei0) {
-            if (token == 1) {
-                return false;
-            }
-            pair_active = true;
-            pair_b_offset = p.batch_stride_b + other_rank*p.stride_b;
-            pair_d_offset = p.batch_stride_d + other_rank*p.stride_d;
-        }
-    }
-    return true;
-}
-
 void load_iq4_nl_b(uint offset, out vec4 b0, out vec4 b1) {
     const vec4 lo = data_b_v4[offset / 4];
     const vec4 hi = data_b_v4[(offset + y_offset) / 4];
@@ -225,7 +173,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
 #ifdef MUL_MAT_ID_PAIR
-    if (!get_pair_offsets()) {
+    if (!get_pair_offsets(a_offset, b_offset, d_offset)) {
         return;
     }
 #else

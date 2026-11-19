@@ -19,6 +19,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <charconv>
+#include <fstream>
+#include <sstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -360,7 +363,13 @@ llama_context::llama_context(
         if (cparams.n_ubatch == 0) {
             throw std::runtime_error("packed expert placement requires a nonzero microbatch");
         }
-        if (cparams.n_rs_seq >= cparams.n_ubatch) {
+        const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        mtp_verify_three_enabled = mtp_three && (strcmp(mtp_three, "1") == 0 || strcmp(mtp_three, "auto") == 0) &&
+                model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                cparams.n_seq_max == 1 && cparams.n_batch >= 3 && cparams.n_ubatch == 2 &&
+                placement->n_slots == 20 && !placement->overlap && placement->prefill_tokens == 512 &&
+                cparams.n_rs_seq == 2;
+        if (cparams.n_rs_seq >= cparams.n_ubatch && !mtp_verify_three_enabled) {
             LLAMA_LOG_INFO("%s: packed expert microbatch cannot hold the requested recurrent snapshots, using checkpoint rollback\n",
                     __func__);
             cparams.n_rs_seq = 0;
@@ -641,9 +650,10 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0 || model.expert_placement) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, mtp_verify_three_enabled);
         }
 
+        init_mtp_vocab_subset();
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -662,6 +672,95 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+static std::vector<int64_t> llama_read_mtp_vocab(const char * path, int64_t n_vocab) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() <= 0 || file.tellg() > 16 * 1024 * 1024 || n_vocab > 1024 * 1024) {
+        throw std::runtime_error("invalid MTP draft vocabulary file or vocabulary size");
+    }
+    file.seekg(0);
+    std::vector<int64_t> ids;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line[0] == '#') {
+            continue;
+        }
+        std::istringstream values(line);
+        std::string value;
+        while (values >> value) {
+            int64_t id = -1;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), id);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                    id < 0 || id >= n_vocab || (!ids.empty() && id <= ids.back()) || ids.size() >= size_t(n_vocab)) {
+                throw std::runtime_error("MTP draft vocabulary requires sorted unique in-range token IDs");
+            }
+            ids.push_back(id);
+        }
+    }
+    if (!file.eof() || ids.empty() || ids.size() >= size_t(n_vocab)) {
+        throw std::runtime_error("MTP draft vocabulary must be a proper nonempty subset");
+    }
+    return ids;
+}
+
+void llama_context::init_mtp_vocab_subset() {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    const char * path = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
+    const char * stats = std::getenv("LLAMA_MTP_DRAFT_VOCAB_STATS");
+    auto * source = model.output;
+    if (!path || !*path) {
+        if (stats && std::strcmp(stats, "1") == 0) {
+            LLAMA_LOG_INFO("mtp_draft_vocab: enabled=0 full_rows=%u subset_rows=0 full_head_bytes=%zu subset_head_bytes=0 buffer_bytes=0 full_head_retained=1 target_full_vocab=1\n",
+                    model.vocab.n_tokens(), source ? ggml_nbytes(source) : 0);
+        }
+        return;
+    }
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_layer_nextn != 1 || model.no_alloc() ||
+            !source || !source->buffer || !source->data || !ggml_is_contiguous(source) ||
+            source->ne[1] != model.vocab.n_tokens() || source->ne[2] != 1 || source->ne[3] != 1 ||
+            (source->type != GGML_TYPE_Q8_0 && source->type != GGML_TYPE_F16 &&
+             source->type != GGML_TYPE_BF16 && source->type != GGML_TYPE_F32) ||
+            (model.output_s && ggml_nelements(model.output_s) != 1) ||
+            !model.hdmd.rot.empty() || !model.hdmd.inv.empty()) {
+        throw std::runtime_error("MTP draft vocabulary requires a contiguous QWEN4EXP single-head Q8_0/F16/BF16/F32 output with scalar scale and no Hadamard folding");
+    }
+    const auto ids = llama_read_mtp_vocab(path, model.vocab.n_tokens());
+    mtp_vocab_ctx.reset(ggml_init({2 * ggml_tensor_overhead() + 1024, nullptr, true}));
+    if (!mtp_vocab_ctx) {
+        throw std::runtime_error("MTP draft vocabulary metadata allocation failed");
+    }
+    mtp_vocab_head = ggml_new_tensor_2d(mtp_vocab_ctx.get(), source->type, source->ne[0], ids.size());
+    mtp_vocab_ids = ggml_new_tensor_1d(mtp_vocab_ctx.get(), GGML_TYPE_I64, ids.size());
+    ggml_set_name(mtp_vocab_head, "mtp_vocab_subset.weight");
+    ggml_set_name(mtp_vocab_ids, "mtp_vocab_subset.global_ids");
+    mtp_vocab_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_vocab_ctx.get(), ggml_backend_buffer_get_type(source->buffer)));
+    if (!mtp_vocab_buffer) {
+        throw std::runtime_error("MTP draft vocabulary head allocation failed");
+    }
+    ggml_backend_buffer_set_usage(mtp_vocab_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    constexpr size_t chunk = 128;
+    const size_t stride = source->nb[1];
+    std::vector<uint8_t> staging(std::min(chunk, ids.size()) * stride);
+    std::array<const ggml_tensor *, chunk> sources;
+    std::array<size_t, chunk> offsets, sizes, data_offsets;
+    for (size_t first = 0; first < ids.size(); first += chunk) {
+        const size_t count = std::min(chunk, ids.size() - first);
+        for (size_t i = 0; i < count; ++i) {
+            sources[i] = source;
+            offsets[i] = size_t(ids[first + i]) * stride;
+            sizes[i] = stride;
+            data_offsets[i] = i * stride;
+        }
+        ggml_backend_tensor_get_n(sources.data(), staging.data(), offsets.data(), sizes.data(), data_offsets.data(), count);
+        ggml_backend_tensor_set(mtp_vocab_head, staging.data(), first * stride, count * stride);
+    }
+    ggml_backend_tensor_set(mtp_vocab_ids, ids.data(), 0, ids.size() * sizeof(int64_t));
+    LLAMA_LOG_INFO("mtp_draft_vocab: enabled=1 full_rows=%u subset_rows=%zu full_head_bytes=%zu subset_head_bytes=%zu buffer_bytes=%zu full_head_retained=1 target_full_vocab=1 backend=%s\n",
+            model.vocab.n_tokens(), ids.size(), ggml_nbytes(source), ggml_nbytes(mtp_vocab_head),
+            ggml_backend_buffer_get_size(mtp_vocab_buffer.get()), ggml_backend_buffer_name(mtp_vocab_buffer.get()));
 }
 
 llama_context::~llama_context() {
@@ -2243,7 +2342,25 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide) {
+int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify) {
+    struct verify_scope {
+        uint32_t & width;
+        uint32_t previous;
+        ~verify_scope() { width = previous; }
+    } verify{target_mtp_verify_width, target_mtp_verify_width};
+    target_mtp_verify_width = 0;
+    if (target_mtp_verify && !prefill && memory &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_ubatch == 2) {
+        if (batch_inp.tokens.size() == 2) {
+            target_mtp_verify_width = 2;
+        } else if (batch_inp.tokens.size() == 3 && mtp_verify_three_enabled) {
+            target_mtp_verify_width = 3;
+        }
+    }
+    if (target_mtp_verify && batch_inp.tokens.size() == 3 && target_mtp_verify_width != 3) {
+        LLAMA_LOG_ERROR("%s: three-position MTP verification is unavailable\n", __func__);
+        return -1;
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2357,7 +2474,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
     memory_update(false);
 
     llama_memory_context_ptr mctx;
-    const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() : cparams.n_ubatch;
+    const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() :
+            std::max(cparams.n_ubatch, target_mtp_verify_width);
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch, embd_all);
@@ -2471,6 +2589,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        if (mtp_logit_trace_enabled) {
+            LLAMA_LOG_INFO("mtp logits ubatch: from=%d to=%d size=%u outputs=%d verify=%u prefill=%d\n",
+                    ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], ubatch.n_tokens, n_outputs, target_mtp_verify_width, prefill);
         }
 
         ggml_status status;
@@ -3229,10 +3352,13 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+        /*.mtp_vocab_head =*/ mtp_vocab_head,
+        /*.mtp_vocab_ids  =*/ mtp_vocab_ids,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.target_mtp_verify_three =*/ target_mtp_verify_width == 3,
     };
 }
 
@@ -3292,6 +3418,11 @@ ggml_status llama_context::graph_compute(
         decode_profile_active = true;
     }
 
+    struct scheduler_verify_scope {
+        ggml_backend_sched_t sched;
+        bool previous;
+        ~scheduler_verify_scope() { ggml_backend_sched_set_target_mtp_verify(sched, previous); }
+    } verify{sched.get(), ggml_backend_sched_set_target_mtp_verify(sched.get(), target_mtp_verify_width == 2)};
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3322,7 +3453,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active, false, lctx->sched.get())) {
+    const bool fixed_mtp_pair = lctx->target_mtp_verify_width == 2 && !lctx->mtp_verify_three_enabled;
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active, false, lctx->sched.get(), fixed_mtp_pair)) {
         return true;
     }
 
@@ -5396,6 +5528,22 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, true, false);
+}
+
+bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
+    return ctx->mtp_vocab_subset_enabled();
+}
+
+int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode(*batch, false, true, true);
+}
+
+bool llama_supports_mtp_verify_three(const llama_context * ctx) {
+    return ctx->supports_mtp_verify_three();
+}
+
+void llama_set_mtp_logit_trace(llama_context * ctx, bool enabled) {
+    ctx->set_mtp_logit_trace(enabled);
 }
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {

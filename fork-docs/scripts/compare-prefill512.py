@@ -300,12 +300,12 @@ def parse_last_use_ticks(log, enabled, prompt, *, require_age_change=True):
     return fields
 
 
-def parse_results(case_directory, expected_message, width, *, archived=False, decode_expert_window=False, last_use=None):
+def parse_results(case_directory, expected_message, width, *, archived=False, decode_expert_window=False, last_use=None, verify_width=2, actual_verify_width=None):
     log = (case_directory / "llama.log").read_text(encoding="utf-8", errors="replace")
     for marker in (
         "using device CUDA0 (NVIDIA GeForce RTX 4070 Ti)",
         "using device Vulkan1 (AMD Radeon Pro VII)",
-        "packed expert batch capacity = 2, n_ubatch = 2, n_rs_seq = 1",
+        f"packed expert batch capacity = 2, n_ubatch = 2, n_rs_seq = {verify_width - 1}",
         "20 scratch slots per layer",
     ):
         require(marker in log, f"missing expected benchmark configuration: {marker}")
@@ -324,7 +324,8 @@ def parse_results(case_directory, expected_message, width, *, archived=False, de
                   "compact_chunks", "workspace_bytes"):
         require(field in fields, f"prompt upload summary lacks {field}")
     require(fields["capacity"] == fields["max_tokens"] == width, f"expected live prompt width {width}: {raw_stats}")
-    require(fields["decode_max_tokens"] == 2, f"expected actual target nonprompt width 2: {raw_stats}")
+    expected_width = verify_width if actual_verify_width is None else actual_verify_width
+    require(fields["decode_max_tokens"] == expected_width, f"expected actual target nonprompt width {expected_width}: {raw_stats}")
     require(fields["tokens"] == PROMPT_TOKENS, f"expected prompt-only coverage of {PROMPT_TOKENS} tokens: {raw_stats}")
     require(0 < fields["ubatches"] <= fields["tokens"] <= width * fields["ubatches"] and fields["layer_steps"] > 0,
             f"invalid prompt coverage: {raw_stats}")

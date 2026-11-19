@@ -829,6 +829,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[DMMV_WG_SIZE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up_pair[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -856,6 +858,8 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_mtp_routed_reduce;
+    vk_pipeline pipeline_mtp_routed_weighted;
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -1126,6 +1130,22 @@ struct vk_event {
     uint64_t cmd_buffer_use_counter = 0;
 };
 
+struct vk_gate_up_diagnostic {
+    static constexpr uint32_t capacity = 128;
+    struct group {
+        uint64_t dispatches = 0, timed = 0, dropped = 0, ticks = 0;
+        uint64_t phases = 0, proven = 0, matched = 0, shared = 0;
+    };
+    vk::QueryPool pool;
+    uint32_t valid_bits = 0;
+    uint32_t count = 0;
+    std::array<uint8_t, capacity> groups;
+    std::array<group, 6> totals;
+    const ggml_tensor * lookup = nullptr;
+    std::array<int32_t, 20> experts;
+    std::array<int32_t, 20> slots;
+};
+
 struct vk_gpu_telemetry {
     static constexpr uint32_t capacity = 128;
     enum sample_state : uint8_t { free, recording, submitted };
@@ -1380,10 +1400,39 @@ struct ggml_backend_vk_context {
     uint32_t pipeline_descriptor_set_requirements {};
 
     vk_gpu_telemetry gpu_telemetry;
+    vk_gate_up_diagnostic gate_up_diagnostic;
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
     vk_expert_overlap expert_overlap;
     uint64_t expert_pair_dispatches = 0;
+    bool mtp_routed_stats_active = false;
+    bool mtp_routed_stats_seen = false;
+    bool target_mtp_verify = false;
+    const ggml_tensor * fused_mtp_routed_experts = nullptr;
+    bool fused_mtp_routed_weighted = false;
+    bool fused_mtp_gate_up = false;
+    uint64_t mtp_gate_up_dispatches = 0;
+    uint64_t mtp_three_gate_up_dispatches = 0;
+    uint64_t mtp_three_weighted_dispatches = 0;
+    uint64_t mtp_three_reduce_dispatches = 0;
+    uint64_t mtp_gate_up_pair_dispatches = 0;
+    uint64_t mtp_gate_up_pair_slots = 0;
+    uint64_t mtp_gate_up_ordinary = 0;
+    uint64_t mtp_gate_up_full_hot = 0;
+    uint64_t mtp_gate_up_quant[GGML_TYPE_COUNT] {};
+    uint64_t mtp_routed_add_dispatches = 0;
+    uint64_t mtp_routed_multi_add_dispatches = 0;
+    uint64_t mtp_routed_reduce_dispatches = 0;
+    uint64_t mtp_routed_weighted_dispatches = 0;
+    uint64_t mtp_routed_other_fused_groups = 0;
+    uint64_t mtp_routed_recorded_adds = 0;
+    uint64_t mtp_routed_aggregates = 0;
+    uint64_t mtp_routed_aggregate_layers = 0;
+    uint64_t mtp_routed_full_hot = 0;
+    uint64_t mtp_routed_scratch_copies = 0;
+    uint64_t mtp_routed_scratch_bytes = 0;
+    uint64_t mtp_routed_scratch_layers = 0;
+    uint64_t mtp_routed_scratch_unknown_layer = 0;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed

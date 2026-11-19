@@ -42,6 +42,14 @@ static bool ggml_vk_telemetry_enabled() {
     return enabled;
 }
 
+static bool ggml_vk_skip_empty_pool_reset() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_VK_SKIP_EMPTY_POOL_RESET");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 vk_telemetry_scope::vk_telemetry_scope(vk_telemetry_cause cause) : previous(VK_TEL_CAUSES) {
     if (ggml_vk_telemetry_enabled() && vk_telemetry_current == VK_TEL_UNCLASSIFIED) {
         previous = vk_telemetry_current;
@@ -82,6 +90,14 @@ static bool ggml_vk_packed_experts_configured() {
         return path && *path;
     }();
     return configured;
+}
+
+static bool ggml_vk_mtp_three_fast() {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_MTP_VERIFY_THREE_FAST");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 static bool ggml_vk_expert_pair_requested() {
@@ -159,6 +175,28 @@ static void ggml_backend_vk_get_telemetry(uint64_t * totals) {
 vk::Result ggml_vk_wait_for_fences(vk::Device device, vk::Fence fence) {
     vk_telemetry_timer timer(VK_TEL_FENCE_WAIT_NS, VK_TEL_FENCE_WAITS);
     return device.waitForFences({ fence }, true, UINT64_MAX);
+}
+
+static void ggml_vk_gate_up_query_read(ggml_backend_vk_context * ctx) {
+    auto & timing = ctx->gate_up_diagnostic;
+    if (timing.count == 0) {
+        return;
+    }
+    std::array<uint64_t, 4 * vk_gate_up_diagnostic::capacity> data{};
+    const vk::Result rc = ctx->device->device.getQueryPoolResults(timing.pool, 0, 2 * timing.count,
+            4 * timing.count * sizeof(uint64_t), data.data(), 2 * sizeof(uint64_t),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+    const uint64_t mask = timing.valid_bits == 64 ? UINT64_MAX : (UINT64_C(1) << timing.valid_bits) - 1;
+    for (uint32_t i = 0; i < timing.count; ++i) {
+        auto & total = timing.totals[timing.groups[i]];
+        if ((rc == vk::Result::eSuccess || rc == vk::Result::eNotReady) && data[4*i+1] && data[4*i+3]) {
+            total.ticks += (data[4*i+2] - data[4*i]) & mask;
+            ++total.timed;
+        } else {
+            ++total.dropped;
+        }
+    }
+    timing.count = 0;
 }
 
 static void ggml_vk_gpu_telemetry_start(vk_context & ctx) {
@@ -1389,6 +1427,12 @@ static vk::Event ggml_vk_create_event(ggml_backend_vk_context * ctx) {
 
 void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
     VK_LOG_DEBUG("ggml_vk_command_pool_cleanup()");
+
+    if (ggml_vk_skip_empty_pool_reset() &&
+            std::none_of(p.cmd_buffers.begin(), p.cmd_buffers.end(),
+                    [](const vk_command_buffer & buffer) { return buffer.in_use; })) {
+        return;
+    }
 
     // Requires command buffers to be done
     device->device.resetCommandPool(p.pool);
@@ -3513,6 +3557,30 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+#ifndef GGML_VULKAN_CHECK_RESULTS
+        const char * gate_up = getenv("GGML_VK_MTP_ROUTED_GATE_UP");
+        const char * verify_three = getenv("LLAMA_MTP_VERIFY_THREE");
+        if (w == DMMV_WG_SIZE_SUBGROUP && device->idx == 1 && device->vendor_id == VK_VENDOR_ID_AMD &&
+                !device->uma && !device->disable_fusion && gate_up && strcmp(gate_up, "1") == 0 &&
+                (ggml_vk_mtp_three_fast() || !(verify_three && (strcmp(verify_three, "1") == 0 || strcmp(verify_three, "auto") == 0)))) {
+#define CREATE_GATE_UP(type, name, pipelines, pc) \
+            const uint64_t name##_lens[] = { name##_len, name##_subgroup_len, name##_subgroup_no_shmem_len }; \
+            const void * name##_blobs[] = { name##_data, name##_subgroup_data, name##_subgroup_no_shmem_data }; \
+            ggml_vk_create_pipeline(device, device->pipelines[type], #name, \
+                    name##_lens[reduc16], name##_blobs[reduc16], "main", mul_mat_vec_id_num_bindings, \
+                    sizeof(pc), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, \
+                    true, use_subgroups16, force_subgroup_size16);
+            CREATE_GATE_UP(GGML_TYPE_IQ2_S, mul_mat_vec_id_iq2_s_gate_up, pipeline_mtp_gate_up, vk_mat_vec_id_push_constants)
+            CREATE_GATE_UP(GGML_TYPE_IQ3_XXS, mul_mat_vec_id_iq3_xxs_gate_up, pipeline_mtp_gate_up, vk_mat_vec_id_push_constants)
+            CREATE_GATE_UP(GGML_TYPE_IQ4_XS, mul_mat_vec_id_iq4_xs_gate_up, pipeline_mtp_gate_up, vk_mat_vec_id_push_constants)
+            const char * gate_up_pair = getenv("GGML_VK_MTP_ROUTED_GATE_UP_PAIR");
+            if (gate_up_pair && strcmp(gate_up_pair, "1") == 0) {
+                CREATE_GATE_UP(GGML_TYPE_IQ2_S, mul_mat_vec_id_iq2_s_gate_up_pair, pipeline_mtp_gate_up_pair, vk_mat_vec_id_pair_push_constants)
+                CREATE_GATE_UP(GGML_TYPE_IQ3_XXS, mul_mat_vec_id_iq3_xxs_gate_up_pair, pipeline_mtp_gate_up_pair, vk_mat_vec_id_pair_push_constants)
+            }
+#undef CREATE_GATE_UP
+        }
+#endif
         if (ggml_vk_expert_pair_requested()) {
             const uint64_t pair_len[] = {mul_mat_vec_id_iq4_nl_pair_len, mul_mat_vec_id_iq4_nl_pair_subgroup_len,
                                          mul_mat_vec_id_iq4_nl_pair_subgroup_no_shmem_len};
@@ -3852,6 +3920,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_BINARY(add_rms, _norepeat, {1}, 4)
 #undef CREATE_BINARY
 
+#ifndef GGML_VULKAN_CHECK_RESULTS
+    const char * routed_reduce = getenv("GGML_VK_MTP_ROUTED_REDUCE");
+    const char * verify_three = getenv("LLAMA_MTP_VERIFY_THREE");
+    if (device->idx == 1 && device->vendor_id == VK_VENDOR_ID_AMD && !device->disable_fusion &&
+            device->properties.limits.maxComputeWorkGroupInvocations >= 256 &&
+            device->properties.limits.maxComputeWorkGroupSize[0] >= 256 &&
+            routed_reduce && strcmp(routed_reduce, "1") == 0 &&
+            (ggml_vk_mtp_three_fast() || !(verify_three && (strcmp(verify_three, "1") == 0 || strcmp(verify_three, "auto") == 0)))) {
+        ggml_vk_create_pipeline(device, device->pipeline_mtp_routed_reduce, "mtp_routed_reduce_f32",
+                mtp_routed_reduce_f32_len, mtp_routed_reduce_f32_data, "main", 2, sizeof(uint32_t), {256, 1, 1}, {}, 1);
+        const char * routed_weighted = getenv("GGML_VK_MTP_ROUTED_WEIGHTED");
+        if (routed_weighted && strcmp(routed_weighted, "1") == 0) {
+            ggml_vk_create_pipeline(device, device->pipeline_mtp_routed_weighted, "mtp_routed_weighted_f32",
+                    mtp_routed_weighted_f32_len, mtp_routed_weighted_f32_data, "main", 3, sizeof(uint32_t), {256, 1, 1}, {}, 1);
+        }
+    }
+#endif
     if (device->multi_add) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
@@ -5439,6 +5524,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                                  (device->subgroup_size == 32 && device->coopmat_support_16x16x16_f32acc && (getenv("GGML_VK_FORCE_XE_FA") != nullptr)));
 #endif
 
+        device->idx = idx;
+        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -5467,16 +5554,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
 
-        device->idx = idx;
-
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
         if (ggml_vk_telemetry_enabled()) {
             GGML_LOG_INFO("ggml_vulkan: %s queue topology compute_family=%u transfer_family=%u shared_queue=%d async_transfer=%d serialize_submissions=%d\n",
                     device->name.c_str(), compute_queue_family_index, transfer_queue_family_index, device->single_queue,
                     device->async_use_transfer_queue, device->serialize_submissions);
         }
-
-        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
@@ -6056,6 +6139,8 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
     ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
+    GGML_LOG_INFO("ggml_vulkan: device=%s empty_pool_reset_skip=%d fence_reuse=automatic\n",
+            ctx->device->name.c_str(), ggml_vk_skip_empty_pool_reset());
 #ifndef GGML_VULKAN_CHECK_RESULTS
     const char * timing_device = getenv("GGML_VK_GPU_TIMESTAMPS_DEVICE");
     if (ggml_vk_telemetry_enabled() && timing_device && ctx->name == timing_device &&
@@ -6076,6 +6161,26 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
             }
         } else {
             GGML_LOG_WARN("ggml_vulkan: %s compute timestamps unsupported for family %u\n", ctx->name.c_str(), family);
+        }
+    }
+#endif
+#ifndef GGML_VULKAN_CHECK_RESULTS
+    const char * gate_up_timing = getenv("GGML_VK_MTP_GATE_UP_TIMING");
+    if (gate_up_timing && strcmp(gate_up_timing, "1") == 0 && ctx->name == "Vulkan1" &&
+            !ctx->device->serialize_submissions && !vk_perf_logger_enabled &&
+            ctx->device->properties.limits.timestampComputeAndGraphics) {
+        auto & timing = ctx->gate_up_diagnostic;
+        const uint32_t family = ctx->device->compute_queue->queue_family_index;
+        const uint32_t bits = ctx->device->physical_device.getQueueFamilyProperties()[family].timestampValidBits;
+        const float period = ctx->device->properties.limits.timestampPeriod;
+        if (bits > 0 && bits <= 64 && std::isfinite(period) && period > 0.0f) {
+            try {
+                timing.pool = ctx->device->device.createQueryPool({{},
+                        vk::QueryType::eTimestamp, 2 * vk_gate_up_diagnostic::capacity});
+                timing.valid_bits = bits;
+            } catch (const vk::SystemError & error) {
+                GGML_LOG_WARN("ggml_vulkan: %s gate/up timestamps unavailable: %s\n", ctx->name.c_str(), error.what());
+            }
         }
     }
 #endif
@@ -8390,11 +8495,12 @@ static bool ggml_vk_mmv_id_quantize_y(const ggml_backend_vk_context * ctx, const
 }
 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph,
-                                        int node_idx, const uint32_t * expert_masks = nullptr) {
-    ggml_tensor * dst = cgraph->nodes[node_idx];
-    ggml_tensor * src0 = dst->src[0];
-    ggml_tensor * src1 = dst->src[1];
-    ggml_tensor * ids = dst->src[2];
+                                        int node_idx, const uint32_t * expert_masks = nullptr, ggml_tensor * gate_up = nullptr, uint32_t gate_up_phase = 0) {
+    ggml_tensor * projection = gate_up ? gate_up->src[0] : cgraph->nodes[node_idx];
+    ggml_tensor * dst = gate_up ? gate_up : projection;
+    ggml_tensor * src0 = projection->src[0];
+    ggml_tensor * src1 = projection->src[1];
+    ggml_tensor * ids = projection->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -8426,7 +8532,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = !y_non_contig && ggml_vk_mmv_id_quantize_y(ctx, dst);
+    bool quantize_y = !gate_up && !y_non_contig && ggml_vk_mmv_id_quantize_y(ctx, dst);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -8445,7 +8551,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
+        dmmv = gate_up ? ctx->device->pipeline_mtp_gate_up[src0->type] :
+                ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
         quantize_y = false;
     }
 
@@ -8502,11 +8609,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1 * (ctx->expert_overlap.projection == dst ? 2 : 1));
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, gate_up ? gate_up : cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
-    vk_subbuffer d_F0 = d_D;
+    vk_subbuffer d_F0 = gate_up ? ggml_vk_tensor_subbuffer(ctx, gate_up->src[1]->src[0]) : d_D;
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
@@ -8577,7 +8684,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     uint32_t fusion_flags = 0;
 
-    if (ctx->num_additional_fused_ops > 0) {
+    if (!gate_up && ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
         d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
@@ -8591,7 +8698,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops > 1) {
+    if (!gate_up && ctx->num_additional_fused_ops > 1) {
         const ggml_tensor * scale = cgraph->nodes[node_idx + 2]->src[1];
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
@@ -8599,7 +8706,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 
     vk_pipeline pair;
-    if (ggml_vk_expert_pair_requested() && src0->type == GGML_TYPE_IQ4_NL &&
+    if (gate_up && nei1 == 2) {
+        pair = ctx->device->pipeline_mtp_gate_up_pair[src0->type];
+    } else if (!gate_up && ggml_vk_expert_pair_requested() && src0->type == GGML_TYPE_IQ4_NL &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !quantize_y &&
             ctx->num_additional_fused_ops == 0 && nei1 == 2 && nei0 > 0 && nei0 <= 32 &&
             ne11 == nei0 && src1->ne[2] == 2 && src1->ne[3] == 1 &&
@@ -8610,6 +8719,79 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         pair = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00, true);
     }
 
+    auto & timing = ctx->gate_up_diagnostic;
+    const bool time_gate_up = timing.pool && ctx->target_mtp_verify && nei1 == 2 && gate_up &&
+            (src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS);
+    const uint32_t timing_group = (src0->type == GGML_TYPE_IQ2_S ? 0 : 3) + gate_up_phase;
+    const auto begin_timing = [&]() {
+        if (!time_gate_up) {
+            return -1;
+        }
+        auto & group = timing.totals[timing_group];
+        ++group.dispatches;
+        if (timing.count == timing.capacity) {
+            ++group.dropped;
+            return -1;
+        }
+        const auto sample = timing.count++;
+        timing.groups[sample] = timing_group;
+        const auto & command = subctx->s->buffer->buf;
+        command.resetQueryPool(timing.pool, 2 * sample, 2);
+        command.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, timing.pool, 2 * sample);
+        return int(sample);
+    };
+    const auto end_timing = [&](int sample) {
+        if (sample >= 0) {
+            subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader,
+                    timing.pool, 2 * sample + 1);
+        }
+    };
+    const auto prove_pairs = [&](const uint32_t * masks, bool pair_dispatch) {
+        if (!time_gate_up || !(masks[0] || masks[1])) {
+            return;
+        }
+        auto & group = timing.totals[timing_group];
+        ++group.phases;
+        if (!timing.lookup || (ids != timing.lookup && ids->view_src != timing.lookup && ids->src[0] != timing.lookup)) {
+            return;
+        }
+        uint32_t matches = 0;
+        for (unsigned first = 0; first < 10; ++first) {
+            if (!(masks[0] & (1u << first))) {
+                continue;
+            }
+            const int slot = timing.slots[first];
+            if (slot < 0 || slot >= src0->ne[2]) {
+                continue;
+            }
+            bool duplicate = false;
+            for (unsigned earlier = 0; earlier < first; ++earlier) {
+                if ((masks[0] & (1u << earlier)) && timing.slots[earlier] == slot) {
+                    if (timing.experts[earlier] != timing.experts[first]) {
+                        return;
+                    }
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            for (unsigned second = 0; second < 10; ++second) {
+                if ((masks[1] & (1u << second)) && timing.slots[10 + second] == slot) {
+                    if (timing.experts[10 + second] != timing.experts[first]) {
+                        return;
+                    }
+                    ++matches;
+                    break;
+                }
+            }
+        }
+        ++group.proven;
+        group.matched += matches;
+        group.shared += pair_dispatch ? matches : 0;
+    };
+
     const auto dispatch = [&](uint32_t expert_i1, uint32_t expert_mask, uint32_t positions) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
@@ -8617,6 +8799,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             fusion_flags,
             (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1, expert_mask
         };
+        const int timing_sample = begin_timing();
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
                 d_X,
@@ -8627,10 +8810,18 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_ids,
             },
             pc, { groups_x, positions, groups_z });
+        end_timing(timing_sample);
+        if (gate_up && nei1 == 3) {
+            ++ctx->mtp_three_gate_up_dispatches;
+        } else if (gate_up && ctx->mtp_routed_stats_active) {
+            ++ctx->mtp_gate_up_dispatches;
+        }
     };
 
     const auto dispatch_masks = [&](const uint32_t * masks) {
-        if (pair && masks[0] && masks[1]) {
+        const bool pair_dispatch = pair && masks[0] && masks[1];
+        prove_pairs(masks, pair_dispatch);
+        if (pair_dispatch) {
             const uint32_t count = ggml_vk_expert_position_count(masks[0]) + ggml_vk_expert_position_count(masks[1]);
             const vk_mat_vec_id_pair_push_constants pc = {
                 {
@@ -8642,9 +8833,19 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             };
             // The descriptor sets reserved for the single-token dispatches also cover this dispatch.
             ggml_pipeline_request_descriptor_sets(ctx, pair, 0);
+            const int timing_sample = begin_timing();
             ggml_vk_dispatch_pipeline(ctx, subctx, pair, { d_X, d_Y, d_D, d_F0, d_F1, d_ids },
                                       pc, { groups_x, count, groups_z });
-            ++ctx->expert_pair_dispatches;
+            end_timing(timing_sample);
+            if (gate_up) {
+                if (ctx->mtp_routed_stats_active) {
+                    ++ctx->mtp_gate_up_dispatches;
+                    ++ctx->mtp_gate_up_pair_dispatches;
+                    ctx->mtp_gate_up_pair_slots += count;
+                }
+            } else {
+                ++ctx->expert_pair_dispatches;
+            }
             return;
         }
         for (uint32_t token = 0; token < nei1; ++token) {
@@ -8680,10 +8881,17 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         dispatch_masks(cold_masks);
         overlap.projection = nullptr;
         ++overlap.split_projections;
-    } else if (pair) {
+    } else if (pair || time_gate_up) {
         const uint32_t full = UINT32_MAX >> (32 - nei0);
         const uint32_t masks[2] = { full, full };
-        dispatch_masks(masks);
+        if (pair) {
+            dispatch_masks(masks);
+        } else {
+            prove_pairs(masks, false);
+            for (uint32_t token = 0; token < nei1; ++token) {
+                dispatch(token, 0, (uint32_t)nei0);
+            }
+        }
     } else {
         for (uint32_t token = 0; token < nei1; ++token) {
             dispatch(token, 0, (uint32_t)nei0);
@@ -13236,6 +13444,62 @@ static int ggml_vk_expert_full_hot_count(ggml_backend_vk_context * ctx, const gg
 
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 
+static bool ggml_vk_mtp_gate_up_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * first,
+                                         const ggml_tensor * second, const ggml_tensor * act) {
+    if ((!ctx->target_mtp_verify && !ggml_vk_mtp_three_fast()) ||
+            !ctx->device->pipeline_mtp_gate_up[GGML_TYPE_IQ2_S] || first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID ||
+            act->op != GGML_OP_GLU || ggml_get_glu_op(act) != GGML_GLU_OP_SWIGLU || act->op_params[1] != 0 ||
+            !((act->src[0] == first && act->src[1] == second) ||
+              (act->src[0] == second && act->src[1] == first)) ||
+            second->src[1] != first->src[1] || second->src[2] != first->src[2]) {
+        return false;
+    }
+
+    const auto * x = first->src[1];
+    const auto * ids = first->src[2];
+    const auto * gate = act->src[0]->src[0];
+    const auto * up = act->src[1]->src[0];
+    const auto width = ids->ne[1];
+    if (!(width == 2 && ctx->target_mtp_verify) &&
+            !(width == 3 && ggml_vk_mtp_three_fast() && strcmp(ids->name, "ffn_moe_mtp_three_slots") == 0)) {
+        return false;
+    }
+    if (gate->type != up->type || !ctx->device->pipeline_mtp_gate_up[gate->type] ||
+            !ggml_are_same_shape(gate, up) || gate->ne[0] != 2560 || gate->ne[1] != 640 || gate->ne[3] != 1 ||
+            x->type != GGML_TYPE_F32 || x->ne[0] != 2560 || x->ne[1] != 1 || x->ne[2] != width || x->ne[3] != 1 ||
+            ids->type != GGML_TYPE_I32 || ids->ne[0] != 10 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            act->type != GGML_TYPE_F32 || act->ne[0] != 640 || act->ne[1] != 10 || act->ne[2] != width || act->ne[3] != 1 ||
+            first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(first, act) || !ggml_are_same_shape(second, act) || act->view_src) {
+        return false;
+    }
+    for (const auto * tensor : {gate, up, x, ids, act}) {
+        if (!tensor->buffer || tensor->buffer->buft != &ctx->device->buffer_type || !ggml_is_contiguous(tensor)) {
+            return false;
+        }
+        const auto * buffer = static_cast<const ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+        const auto offset = vk_tensor_offset(tensor) + tensor->view_offs;
+        if (!buffer->dev_buffer || offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment ||
+                offset >= buffer->dev_buffer->size ||
+                ggml_nbytes(tensor) > ggml_vk_get_max_buffer_range(ctx, buffer->dev_buffer, offset)) {
+            return false;
+        }
+    }
+    for (const auto * tensor : {gate, up, x, ids}) {
+        if (ggml_vk_tensors_overlap(act, tensor, false)) {
+            return false;
+        }
+    }
+    // The integer-dot variant has a different accumulation path.
+    for (const auto * projection : {first, second}) {
+        if (ggml_vk_mmv_id_quantize_y(ctx, projection) &&
+                ggml_vk_get_dequantize_mul_mat_vec_id(ctx, gate->type, GGML_TYPE_Q8_1, act->ne[0], x->ne[0])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static size_t ggml_vk_expert_full_hot_scratch_size(const ggml_backend_vk_context * ctx, ggml_tensor * const * nodes, int count) {
     const auto alignment = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
     bool need_scratch = false;
@@ -13266,6 +13530,48 @@ static size_t ggml_vk_expert_full_hot_scratch_size(const ggml_backend_vk_context
         }
     }
     return need_scratch ? size : 0;
+}
+
+static int ggml_vk_mtp_routed_layer(const char * name, const char * prefix) {
+    const size_t length = strlen(prefix);
+    if (strncmp(name, prefix, length) != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long layer = strtol(name + length, &end, 10);
+    return end != name + length && !*end && layer >= 0 && layer < 64 ? int(layer) : -1;
+}
+
+static void ggml_vk_mtp_count_routed_reduction(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int first) {
+    unsigned adds = 0;
+    for (int i = first; i <= first + ctx->num_additional_fused_ops; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_ADD) {
+            continue;
+        }
+        const int layer = ggml_vk_mtp_routed_layer(node->name, "ffn_moe_out-");
+        if (layer >= 0) {
+            ++ctx->mtp_routed_aggregates;
+            ctx->mtp_routed_aggregate_layers |= UINT64_C(1) << layer;
+            ++adds;
+        } else if (ggml_vk_mtp_routed_layer(node->name, "ffn_moe_reduce-") >= 0) {
+            ++adds;
+        }
+    }
+    if (adds) {
+        ctx->mtp_routed_recorded_adds += adds;
+        if (ctx->fused_mtp_routed_weighted) {
+            ++ctx->mtp_routed_weighted_dispatches;
+        } else if (ctx->fused_mtp_routed_experts) {
+            ++ctx->mtp_routed_reduce_dispatches;
+        } else if (graph->nodes[first]->op != GGML_OP_ADD) {
+            ++ctx->mtp_routed_other_fused_groups;
+        } else if (ctx->num_additional_fused_ops) {
+            ++ctx->mtp_routed_multi_add_dispatches;
+        } else {
+            ++ctx->mtp_routed_add_dispatches;
+        }
+    }
 }
 
 static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * const * nodes,
@@ -13317,14 +13623,19 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
     ggml_cgraph local_graph = {};
     local_graph.n_nodes = count;
     local_graph.nodes = ffn;
-    const auto phase = [&](const uint32_t * masks) {
+    const bool gate_up = act == 2 && ggml_vk_mtp_gate_up_eligible(ctx, ffn[0], ffn[1], ffn[act]);
+    const auto phase = [&](const uint32_t * masks, uint32_t gate_up_phase) {
         ctx->prealloc_y_last_tensor_used = nullptr;
-        ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 0, masks);
-        if (ffn[1]->op == GGML_OP_MUL_MAT_ID) {
-            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 1, masks);
+        if (gate_up) {
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 0, masks, ffn[act], gate_up_phase);
+        } else {
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 0, masks);
+            if (ffn[1]->op == GGML_OP_MUL_MAT_ID) {
+                ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, 1, masks);
+            }
+            ggml_vk_sync_buffers(nullptr, subctx);
+            ggml_vk_glu_masked(ctx, subctx, ffn[act]->src[0], ffn[act]->src[1], ffn[act], masks);
         }
-        ggml_vk_sync_buffers(nullptr, subctx);
-        ggml_vk_glu_masked(ctx, subctx, ffn[act]->src[0], ffn[act]->src[1], ffn[act], masks);
         ggml_vk_sync_buffers(nullptr, subctx);
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, &local_graph, down, masks);
     };
@@ -13333,23 +13644,41 @@ static void ggml_vk_expert_full_hot_ffn(ggml_backend_vk_context * ctx, vk_contex
         ggml_vk_sync_buffers(nullptr, subctx);
     }
     subctx->s->expert_hot = true;
-    phase(overlap.hot_masks);
+    phase(overlap.hot_masks, 1);
     ggml_vk_ctx_begin(ctx->device, subctx);
     ggml_vk_expert_overlap_join(ctx, subctx);
     ggml_vk_gpu_telemetry_start(subctx);
     ggml_vk_sync_buffers(nullptr, subctx);
-    phase(cold_masks);
+    phase(cold_masks, 2);
+    if (gate_up && ctx->mtp_routed_stats_active) {
+        ++ctx->mtp_gate_up_full_hot;
+        ++ctx->mtp_gate_up_quant[ffn[0]->src[0]->type];
+    }
     if (scratch) {
         ggml_vk_sync_buffers(nullptr, subctx);
         auto src = ggml_vk_tensor_subbuffer(ctx, ffn[down]);
         auto dst = ggml_vk_tensor_subbuffer(ctx, nodes[down]);
-        ggml_vk_buffer_copy_async(subctx, dst.buffer, dst.offset, src.buffer, src.offset, ggml_nbytes(nodes[down]));
+        const size_t bytes = ggml_nbytes(nodes[down]);
+        ggml_vk_buffer_copy_async(subctx, dst.buffer, dst.offset, src.buffer, src.offset, bytes);
         ++overlap.split_ffn_scratch;
+        if (ctx->mtp_routed_stats_active) {
+            ++ctx->mtp_routed_scratch_copies;
+            ctx->mtp_routed_scratch_bytes += bytes;
+            const int layer = ggml_vk_mtp_routed_layer(nodes[down]->name, "ffn_moe_down-");
+            if (layer >= 0) {
+                ctx->mtp_routed_scratch_layers |= UINT64_C(1) << layer;
+            } else {
+                ++ctx->mtp_routed_scratch_unknown_layer;
+            }
+        }
     }
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->num_additional_fused_ops = fused;
     overlap.projection = nullptr;
     ++overlap.split_ffns;
+    if (ctx->mtp_routed_stats_active) {
+        ++ctx->mtp_routed_full_hot;
+    }
 }
 
 struct ggml_vk_graph_readback {
@@ -13376,6 +13705,11 @@ struct ggml_vk_graph_readback {
         recorded = true;
     }
 };
+
+static vk_subbuffer ggml_vk_mtp_routed_binding(const ggml_tensor * tensor) {
+    const auto * buffer = static_cast<const ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+    return { buffer->dev_buffer, vk_tensor_offset(tensor) + tensor->view_offs, ggml_nbytes(tensor) };
+}
 
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin,
                          int node_idx_begin, bool last_node, bool almost_ready, bool submit, int full_hot_count, bool full_hot_scratch,
@@ -13417,7 +13751,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     auto & overlap = ctx->expert_overlap;
     if (overlap.projection && node != overlap.projection) {
         bool reads_bank = false;
-        for (int j = 0; j <= ctx->num_additional_fused_ops && !reads_bank; ++j) {
+        const int last_read = ctx->fused_mtp_routed_weighted ? 0 : ctx->num_additional_fused_ops;
+        for (int j = 0; j <= last_read && !reads_bank; ++j) {
             const auto * fused = cgraph->nodes[node_idx + j];
             reads_bank = fused == overlap.projection;
             for (const auto * src : fused->src) {
@@ -13476,6 +13811,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
+            if (ctx->fused_mtp_routed_weighted && i != 0 && i != ctx->num_additional_fused_ops) {
+                continue;
+            }
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -13483,6 +13821,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     need_sync = true;
                     break;
                 }
+            }
+            if (ctx->fused_mtp_routed_weighted && i != 0) {
+                continue;
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
@@ -13511,10 +13852,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
         // Add all fused nodes to the unsynchronized lists.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+            if (ctx->fused_mtp_routed_weighted && i != 0 && i != ctx->num_additional_fused_ops) {
+                continue;
+            }
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
                 ctx->unsynced_nodes_written.push_back(cur_node);
+            }
+            if (ctx->fused_mtp_routed_weighted && i != 0) {
+                continue;
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
@@ -13571,7 +13918,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (const auto * experts = ctx->fused_mtp_routed_experts) {
+            const auto * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            const uint32_t width = dst->ne[0];
+            auto & pipeline = ctx->device->pipeline_mtp_routed_reduce;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
+                ggml_vk_mtp_routed_binding(experts), ggml_vk_mtp_routed_binding(dst),
+            }, std::array<uint32_t, 1>{width}, { width, uint32_t(dst->ne[1]), 1 });
+            ctx->mtp_three_reduce_dispatches += dst->ne[1] == 3;
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -13585,6 +13941,17 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL:
+        if (ctx->fused_mtp_routed_weighted) {
+            const auto * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            const uint32_t width = dst->ne[0];
+            auto & pipeline = ctx->device->pipeline_mtp_routed_weighted;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
+                ggml_vk_mtp_routed_binding(src0), ggml_vk_mtp_routed_binding(dst), ggml_vk_mtp_routed_binding(src1),
+            }, std::array<uint32_t, 1>{width}, { width, uint32_t(dst->ne[1]), 1 });
+            ctx->mtp_three_weighted_dispatches += dst->ne[1] == 3;
+            break;
+        }
         if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
@@ -13896,7 +14263,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL_MAT_ID:
-        ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_mtp_gate_up) {
+            auto * act = cgraph->nodes[node_idx + 2];
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, compute_ctx, cgraph, node_idx, nullptr, act);
+            if (ctx->mtp_routed_stats_active) {
+                ++ctx->mtp_gate_up_ordinary;
+                ++ctx->mtp_gate_up_quant[act->src[0]->src[0]->type];
+            }
+        } else {
+            ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
 
@@ -13951,6 +14327,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     default:
         return false;
+    }
+
+    if (ctx->mtp_routed_stats_active && !full_hot_count) {
+        ggml_vk_mtp_count_routed_reduction(ctx, cgraph, node_idx);
     }
 
     // the submit path below can end the command buffer, so close the region first
@@ -14110,6 +14490,21 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroyQueryPool(ctx->gpu_telemetry.pool);
     }
 
+    auto & gate_up_timing = ctx->gate_up_diagnostic;
+    if (gate_up_timing.pool) {
+        ctx->device->device.destroyQueryPool(gate_up_timing.pool);
+        const char * phases[] = { "ordinary", "resident", "nonresident" };
+        for (uint32_t i = 0; i < gate_up_timing.totals.size(); ++i) {
+            const auto & group = gate_up_timing.totals[i];
+            GGML_LOG_INFO("mtp gate-up timing: quant=%s phase=%s dispatches=%" PRIu64 " timed=%" PRIu64
+                    " dropped=%" PRIu64 " ns=%.0f phases=%" PRIu64 " proven=%" PRIu64
+                    " matched=%" PRIu64 " shared=%" PRIu64 "\n",
+                    i < 3 ? "IQ2_S" : "IQ3_XXS", phases[i%3], group.dispatches, group.timed, group.dropped,
+                    double(group.ticks) * ctx->device->properties.limits.timestampPeriod,
+                    group.phases, group.proven, group.matched, group.shared);
+        }
+    }
+
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
@@ -14176,6 +14571,28 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (ggml_vk_expert_pair_requested()) {
         GGML_LOG_INFO("ggml_vulkan: %s expert IQ4_NL pair shader dispatches=%" PRIu64 "\n",
                       ctx->name.c_str(), ctx->expert_pair_dispatches);
+    }
+    if (ggml_vk_mtp_three_fast() && ctx->device->idx == 1) {
+        GGML_LOG_INFO("mtp fast-three Vulkan: gate_up=%" PRIu64 " weighted=%" PRIu64 " reduce=%" PRIu64 "\n",
+                ctx->mtp_three_gate_up_dispatches, ctx->mtp_three_weighted_dispatches, ctx->mtp_three_reduce_dispatches);
+    }
+    if (ctx->mtp_routed_stats_seen) {
+        GGML_LOG_INFO("mtp gate-up Vulkan: device=%s dispatches=%" PRIu64 " ordinary=%" PRIu64
+                " full_hot=%" PRIu64 " iq2_s=%" PRIu64 " iq3_xxs=%" PRIu64 " iq4_xs=%" PRIu64
+                " pair_dispatches=%" PRIu64 " pair_slots=%" PRIu64 "\n",
+                ctx->name.c_str(), ctx->mtp_gate_up_dispatches, ctx->mtp_gate_up_ordinary, ctx->mtp_gate_up_full_hot,
+                ctx->mtp_gate_up_quant[GGML_TYPE_IQ2_S], ctx->mtp_gate_up_quant[GGML_TYPE_IQ3_XXS], ctx->mtp_gate_up_quant[GGML_TYPE_IQ4_XS],
+                ctx->mtp_gate_up_pair_dispatches, ctx->mtp_gate_up_pair_slots);
+        GGML_LOG_INFO("mtp routed Vulkan: device=%s add_dispatches=%" PRIu64 " multi_add_dispatches=%" PRIu64
+                " reduce_dispatches=%" PRIu64 " weighted_dispatches=%" PRIu64
+                " other_fused_groups=%" PRIu64 " recorded_adds=%" PRIu64 " aggregates=%" PRIu64
+                " aggregate_mask=%016" PRIx64 " full_hot=%" PRIu64 " scratch_copies=%" PRIu64
+                " scratch_bytes=%" PRIu64 " scratch_mask=%016" PRIx64 " scratch_unknown_layer=%" PRIu64 "\n",
+                ctx->name.c_str(), ctx->mtp_routed_add_dispatches, ctx->mtp_routed_multi_add_dispatches,
+                ctx->mtp_routed_reduce_dispatches, ctx->mtp_routed_weighted_dispatches,
+                ctx->mtp_routed_other_fused_groups, ctx->mtp_routed_recorded_adds, ctx->mtp_routed_aggregates,
+                ctx->mtp_routed_aggregate_layers, ctx->mtp_routed_full_hot, ctx->mtp_routed_scratch_copies,
+                ctx->mtp_routed_scratch_bytes, ctx->mtp_routed_scratch_layers, ctx->mtp_routed_scratch_unknown_layer);
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
@@ -14853,6 +15270,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
                 ctx->final_fence_pending = false;
             }
             ggml_vk_gpu_telemetry_read(ctx);
+            ggml_vk_gate_up_query_read(ctx);
             overlap.projection = nullptr;
             overlap.transfer_pending = false;
             overlap.wait_recorded = false;
@@ -14869,8 +15287,8 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->submit_pending = false;
         if (cmd_buf) {
-            cmd_buf->in_use = false;
             cmd_buf->buf.reset();
+            cmd_buf->in_use = false;
         }
     }
 
@@ -15568,6 +15986,109 @@ bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
+static constexpr int vk_mtp_routed_expert_count = 10;
+static constexpr int vk_mtp_routed_weighted_nodes = 2 * vk_mtp_routed_expert_count;
+
+static bool ggml_vk_mtp_routed_binding_valid(const ggml_backend_vk_context * ctx, const ggml_tensor * tensor) {
+    if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+            !tensor->buffer || tensor->buffer->buft != &ctx->device->buffer_type) {
+        return false;
+    }
+    const auto binding = ggml_vk_mtp_routed_binding(tensor);
+    return binding.offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment == 0 &&
+            binding.offset < binding.buffer->size &&
+            binding.size <= ggml_vk_get_max_buffer_range(ctx, binding.buffer, binding.offset);
+}
+
+static const ggml_tensor * ggml_vk_mtp_routed_reduce_input(
+        const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int first, bool weighted) {
+    constexpr int n_adds = vk_mtp_routed_expert_count - 1;
+    if ((!ctx->target_mtp_verify && !ggml_vk_mtp_three_fast()) ||
+            !ctx->device->pipeline_mtp_routed_reduce || graph->nodes[first]->op != GGML_OP_ADD || first + n_adds > graph->n_nodes) {
+        return nullptr;
+    }
+    const auto * dst = graph->nodes[first + n_adds - 1];
+    const int layer = ggml_vk_mtp_routed_layer(dst->name, "ffn_moe_out-");
+    if (layer < 0 || dst->ne[0] != 2560 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            !(dst->ne[1] == 2 ? ctx->target_mtp_verify : dst->ne[1] == 3 && ggml_vk_mtp_three_fast())) {
+        return nullptr;
+    }
+    const auto * view0 = graph->nodes[first]->src[0];
+    const auto * experts = view0 ? view0->view_src : nullptr;
+    if (!experts || experts->op != GGML_OP_MUL ||
+            ggml_vk_mtp_routed_layer(experts->name, dst->ne[1] == 3 ? "ffn_moe_weighted_mtp_three-" : "ffn_moe_weighted-") != layer ||
+            experts->ne[0] != dst->ne[0] || experts->ne[1] != 10 || experts->ne[2] != dst->ne[1] || experts->ne[3] != 1) {
+        return nullptr;
+    }
+    if (experts->view_src || dst->view_src ||
+            !ggml_vk_mtp_routed_binding_valid(ctx, experts) || !ggml_vk_mtp_routed_binding_valid(ctx, dst) ||
+            (!weighted && ggml_vk_tensors_overlap(experts, dst, false))) {
+        return nullptr;
+    }
+    auto is_expert_view = [experts, dst](const ggml_tensor * view, int expert) {
+        return view && view->op == GGML_OP_VIEW && view->view_src == experts && view->buffer == experts->buffer &&
+                view->type == GGML_TYPE_F32 && ggml_are_same_shape(view, dst) &&
+                view->view_offs == expert * experts->nb[1] && view->nb[0] == sizeof(float) &&
+                view->nb[1] == experts->nb[2];
+    };
+    if (!is_expert_view(view0, 0)) {
+        return nullptr;
+    }
+    ggml_op ops[n_adds];
+    const ggml_tensor * prev = view0;
+    for (int i = 0; i < n_adds; ++i) {
+        const auto * add = graph->nodes[first + i];
+        if (add->op != GGML_OP_ADD || add->src[0] != prev || !is_expert_view(add->src[1], i + 1) ||
+                add->type != GGML_TYPE_F32 || add->view_src || !ggml_are_same_shape(add, dst) ||
+                !ggml_is_contiguous(add) || !add->buffer || add->buffer->buft != &ctx->device->buffer_type) {
+            return nullptr;
+        }
+        ops[i] = GGML_OP_ADD;
+        prev = add;
+    }
+    return ggml_can_fuse(graph, first, ops, n_adds) ? experts : nullptr;
+}
+
+static bool ggml_vk_mtp_routed_weighted(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int first) {
+    if ((!ctx->target_mtp_verify && !ggml_vk_mtp_three_fast()) ||
+            !ctx->device->pipeline_mtp_routed_weighted || first + vk_mtp_routed_weighted_nodes > graph->n_nodes) {
+        return false;
+    }
+    const auto * mul = graph->nodes[first];
+    if (mul->op != GGML_OP_MUL ||
+            (ggml_vk_mtp_routed_layer(mul->name, "ffn_moe_weighted-") < 0 &&
+             ggml_vk_mtp_routed_layer(mul->name, "ffn_moe_weighted_mtp_three-") < 0)) {
+        return false;
+    }
+    const int first_add = first + 1 + vk_mtp_routed_expert_count;
+    if (ggml_vk_mtp_routed_reduce_input(ctx, graph, first_add, true) != mul) {
+        return false;
+    }
+    const int output = first + vk_mtp_routed_weighted_nodes - 1;
+    const auto * dst = graph->nodes[output];
+    const auto * down = mul->src[0];
+    const auto * weights = mul->src[1];
+    if (!ggml_vk_mtp_routed_binding_valid(ctx, down) || !ggml_vk_mtp_routed_binding_valid(ctx, weights) ||
+            !ggml_are_same_shape(down, mul) ||
+            weights->ne[0] != 1 || weights->ne[1] != vk_mtp_routed_expert_count ||
+            weights->ne[2] != dst->ne[1] || weights->ne[3] != 1 ||
+            ggml_vk_tensors_overlap(down, dst, false) || ggml_vk_tensors_overlap(weights, dst, false)) {
+        return false;
+    }
+    ggml_op ops[vk_mtp_routed_weighted_nodes];
+    ops[0] = GGML_OP_MUL;
+    for (int e = 0; e < vk_mtp_routed_expert_count; ++e) {
+        const auto * view = graph->nodes[first + 1 + e];
+        const auto * add = graph->nodes[first_add + std::max(0, e - 1)];
+        if (view != add->src[e == 0 ? 0 : 1] || view->src[0] != mul) {
+            return false;
+        }
+        ops[1 + e] = GGML_OP_VIEW;
+    }
+    std::fill_n(ops + 1 + vk_mtp_routed_expert_count, vk_mtp_routed_expert_count - 1, GGML_OP_ADD);
+    return ggml_can_fuse_subgraph(graph, first, vk_mtp_routed_weighted_nodes, ops, &output, 1);
+}
+
 uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -15891,12 +16412,15 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        bool op_srcs_fused_elementwise[vk_mtp_routed_weighted_nodes];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_mtp_routed_experts = nullptr;
+        ctx->fused_mtp_routed_weighted = false;
+        ctx->fused_mtp_gate_up = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         int full_hot_count = 0;
@@ -15929,8 +16453,26 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
                 }
             }
         } else if (!ctx->device->disable_fusion) {
-            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            ctx->fused_mtp_gate_up = cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
+                    i + 2 < cgraph->n_nodes && overlap.projection != cgraph->nodes[i] && overlap.projection != cgraph->nodes[i + 1] &&
+                    ggml_vk_mtp_gate_up_eligible(ctx, cgraph->nodes[i], cgraph->nodes[i + 1], cgraph->nodes[i + 2]) &&
+                    ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 });
+            ctx->fused_mtp_routed_weighted = ggml_vk_mtp_routed_weighted(ctx, cgraph, i);
+            ctx->fused_mtp_routed_experts = ctx->fused_mtp_routed_weighted ? nullptr :
+                    ggml_vk_mtp_routed_reduce_input(ctx, cgraph, i, false);
+            if (ctx->fused_mtp_gate_up) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MTP_GATE_UP";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ctx->fused_mtp_routed_weighted) {
+                ctx->num_additional_fused_ops = vk_mtp_routed_weighted_nodes - 1;
+                fusion_string = "MTP_ROUTED_WEIGHTED";
+                std::fill_n(op_srcs_fused_elementwise, vk_mtp_routed_weighted_nodes, false);
+            } else if (ctx->fused_mtp_routed_experts) {
+                ctx->num_additional_fused_ops = 8;
+                fusion_string = "MTP_ROUTED_REDUCE";
+                std::fill_n(op_srcs_fused_elementwise, 9, false);
+            } else if (uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -16119,7 +16661,7 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops && !full_hot_count) {
+        if (ctx->num_additional_fused_ops && !full_hot_count && !ctx->fused_mtp_routed_weighted) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -16168,6 +16710,9 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_mtp_routed_experts = nullptr;
+                ctx->fused_mtp_routed_weighted = false;
+                ctx->fused_mtp_gate_up = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -17734,8 +18279,8 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         if (vkev->cmd_buffer) {
             // Only flag for reuse if it hasn't been reused already
             if (vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
-                vkev->cmd_buffer->in_use = false;
                 vkev->cmd_buffer->buf.reset();
+                vkev->cmd_buffer->in_use = false;
             }
             vkev->cmd_buffer = nullptr;
         }
@@ -18341,7 +18886,38 @@ static ggml_backend_buffer_t ggml_backend_vk_alloc_transfer_host_upload_buffer(g
     return ggml_backend_vk_alloc_host_upload_buffer(dev, size);
 }
 
+static void ggml_backend_vk_set_mtp_routed_stats_active(ggml_backend_t backend, bool active) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    static const bool stats_enabled = [] {
+        const char * value = getenv("LLAMA_MTP_ROUTED_DISPATCH_STATS");
+        return value && strcmp(value, "1") == 0;
+    }();
+    ctx->target_mtp_verify = active;
+    ctx->mtp_routed_stats_active = stats_enabled && active;
+    ctx->mtp_routed_stats_seen |= ctx->mtp_routed_stats_active;
+}
+
+static void ggml_backend_vk_set_gate_up_diagnostic_ids(ggml_backend_t backend, const ggml_tensor * lookup,
+                                                       const int32_t * ids, const int32_t * selected_slots) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    auto & timing = ctx->gate_up_diagnostic;
+    if (!timing.pool) {
+        return;
+    }
+    timing.lookup = lookup;
+    for (uint32_t i = 0; i < timing.experts.size(); ++i) {
+        timing.experts[i] = ids[i];
+        timing.slots[i] = selected_slots[i];
+    }
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_vk_set_gate_up_diagnostic_ids") == 0) {
+        return (void *) ggml_backend_vk_set_gate_up_diagnostic_ids;
+    }
+    if (strcmp(name, "ggml_backend_vk_set_mtp_routed_stats_active") == 0) {
+        return (void *) ggml_backend_vk_set_mtp_routed_stats_active;
+    }
     UNUSED(reg);
 #if !defined(_WIN32)
     if (strcmp(name, "ggml_backend_comm_init") == 0) {

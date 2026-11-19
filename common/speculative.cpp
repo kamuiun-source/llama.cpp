@@ -1597,6 +1597,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
+        if (llama_mtp_vocab_subset_enabled(ctx_dft) && (this->params.probabilistic || this->params.p_min != 0.0f)) {
+            throw std::runtime_error("MTP draft vocabulary requires greedy draft sampling and p_min=0");
+        }
+
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
@@ -1986,6 +1990,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (llama_mtp_vocab_subset_enabled(params.ctx_dft) && (dp.temp != 0.0f || dp.result_q)) {
+                throw std::runtime_error("MTP draft vocabulary requires target temperature=0 and sample-and-match verification");
+            }
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
@@ -2056,8 +2063,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = device_pending ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
+                const bool defer_hidden_row = dparams[seq_id].chain_mtp != nullptr;
+                const float * h_row = device_pending || defer_hidden_row ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
@@ -2091,13 +2098,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                bool chain = params.n_max > (int) result.size() &&
+                        !(dp.n_max > 0 && dp.n_max <= (int) result.size() && params.n_min <= dp.n_max &&
+                          llama_supports_mtp_verify_three(params.ctx_tgt));
+                if (chain && result.size() == 1 && dp.chain_mtp) {
+                    const auto * candidate = id == cur_p->data[0].id ? cur_p->data : std::find_if(cur_p->data, cur_p->data + cur_p->size,
+                            [id](const llama_token_data & token) { return token.id == id; });
+                    const float confidence = candidate == cur_p->data + cur_p->size ? 0.0f : candidate->p;
+                    chain = dp.chain_mtp(dp.chain_mtp_data, confidence);
+                }
+                if (!chain) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
                 }
 
                 GGML_ASSERT(!device_pending);
+                if (defer_hidden_row) {
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                }
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
@@ -3337,6 +3356,26 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+int64_t common_speculative_mtp_draft_us(const common_speculative * spec) {
+    int64_t total = 0;
+    if (spec) {
+        for (const auto & impl : spec->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                total += impl->t_draft_us;
+            }
+        }
+    }
+    return total;
+}
+
+common_speculative_type common_speculative_last_draft_type(const common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+    const auto * impl = spec->impl_last.at(seq_id);
+    return impl ? impl->type : COMMON_SPECULATIVE_TYPE_NONE;
 }
 
 bool common_speculative_keep_mtp_anchor(common_speculative * spec, llama_seq_id seq_id, llama_pos pos, llama_token token) {

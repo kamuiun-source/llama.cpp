@@ -117,10 +117,87 @@ layout (constant_id = 2) const uint NUM_COLS = 1;
 #ifdef MUL_MAT_ID_PAIR
 bool pair_active;
 uint pair_d_offset;
+uint pair_b_offset;
+
+uint first_matching_rank(int expert, uint token, uint mask) {
+    while (mask != 0) {
+        const uint rank = uint(findLSB(mask));
+        if (data_ids[token*p.nbi1 + rank] == expert) {
+            return rank;
+        }
+        mask &= mask - 1;
+    }
+    return p.nei0;
+}
+
+bool get_pair_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
+    const uint count_0 = uint(bitCount(p.expert_mask));
+    const uint token = uint(gl_WorkGroupID.y >= count_0);
+    const uint mask = token == 0 ? p.expert_mask : p.expert_mask_1;
+    uint remaining = mask;
+    for (uint i = gl_WorkGroupID.y - token*count_0; i > 0; --i) {
+        remaining &= remaining - 1;
+    }
+    const uint rank = uint(findLSB(remaining));
+    const int expert = data_ids[token*p.nbi1 + rank];
+
+    pair_active = false;
+    expert_skip = expert < 0 || uint(expert) >= p.n_experts;
+    expert_id = expert_skip ? 0 : uint(expert);
+    d_offset = token*p.batch_stride_d + rank*p.stride_d;
+    if (expert_skip) {
+        return true;
+    }
+
+    a_offset = expert_id * (p.batch_stride_a / QUANT_K);
+    b_offset = token*p.batch_stride_b + (rank % p.ne11)*p.stride_b;
+
+    // Pair only the first active occurrence in each token.
+    const uint earlier = mask & ((1u << rank) - 1u);
+    if (first_matching_rank(expert, token, earlier) == p.nei0) {
+        const uint other_mask = token == 0 ? p.expert_mask_1 : p.expert_mask;
+        const uint other_rank = first_matching_rank(expert, 1u - token, other_mask);
+        if (other_rank < p.nei0) {
+            if (token == 1) {
+                return false;
+            }
+            pair_active = true;
+            pair_b_offset = p.batch_stride_b + (other_rank % p.ne11)*p.stride_b;
+            pair_d_offset = p.batch_stride_d + other_rank*p.stride_d;
+        }
+    }
+    return true;
+}
+
+#endif
+
+#ifdef MOE_GATE_UP
+bool gate_up_second;
+float gate_value[NUM_COLS][NUM_ROWS];
+#define MOE_WEIGHT(a, i, field) (gate_up_second ? a ## _up[i].field : a[i].field)
+#else
+#define MOE_WEIGHT(a, i, field) a[i].field
 #endif
 
 void store_mat_vec_result(uint j, uint d_offset, uint row, FLOAT_TYPE value) {
+#if defined(MOE_GATE_UP)
 #ifdef MUL_MAT_ID_PAIR
+    if (j != 0) {
+        if (!pair_active) {
+            return;
+        }
+        d_offset = pair_d_offset;
+    }
+#endif
+    if (expert_skip) {
+        data_d[d_offset + row] = 0.0f;
+    } else if (!gate_up_second) {
+        gate_value[j][row % NUM_ROWS] = float(value);
+    } else {
+        const float gate = gate_value[j][row % NUM_ROWS];
+        data_d[d_offset + row] = gate / (1.0f + exp(-gate)) * float(value);
+    }
+#elif defined(MUL_MAT_ID_PAIR)
     if (j == 0) {
         data_d[d_offset + row] = D_TYPE(value);
     } else if (pair_active) {

@@ -2,6 +2,7 @@
 param(
     [ValidateSet('speed', 'telemetry', 'components')]
     [string]$Mode = 'telemetry',
+    [switch]$Accepted,
     [switch]$HcScaleSilu,
     [switch]$HcUpPair,
     [switch]$HcDownReuse,
@@ -16,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Accepted) { $HcAll = $true }
 if ($ExpertPrefillActiveWaves -and !$ExpertPrefill32) {
     throw 'ExpertPrefillActiveWaves requires ExpertPrefill32.'
 }
@@ -48,7 +50,41 @@ $retiredKeys = @(
     'LLAMA_MTP_DEVICE_PENDING', 'GGML_CUDA_SSM_CONV_HISTORY', 'GGML_SCHED_OVERLAP_SHARED_READBACK'
 )
 $baselineEnvironment = @($settings.Environment.PSObject.Properties | Where-Object { $_.Name -notin $retiredKeys })
-$keys = @($baselineEnvironment.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_PREFILL_32', 'LLAMA_EXPERT_PREFILL_ACTIVE_WAVES', 'LLAMA_EXPERT_PREFILL_TRACE') + @($projections | ForEach-Object { $_.Key })
+$telemetryEnvironment = @('LLAMA_DECODE_TELEMETRY', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'LLAMA_EXPERT_MISS_HISTOGRAM',
+    'GGML_CUDA_GPU_TIMESTAMPS_DEVICE', 'GGML_VK_GPU_TIMESTAMPS_DEVICE', 'GGML_CUDA_DISABLE_GRAPHS', 'GGML_CUDA_PROFILE_COMPONENTS')
+$acceptedEnvironment = [ordered]@{
+    LLAMA_EXPERT_PREFILL_512 = '1'
+    LLAMA_EXPERT_PREFILL_512_POLICY = 'auto'
+    LLAMA_EXPERT_PREFILL_LOGICAL_TICKS = '1'
+    LLAMA_EXPERT_PREFILL_OVERLAP_TEN = '1'
+    LLAMA_EXPERT_PREFILL_STATS = '1'
+    LLAMA_EXPERT_EARLY_DECODE = $null
+    LLAMA_MTP_VERIFY_THREE = $null
+    LLAMA_MTP_DRAFT_VOCAB = $null
+    LLAMA_MTP_DRAFT_VOCAB_STATS = if ($Mode -eq 'speed') { $null } else { '1' }
+    LLAMA_MTP_REUSE_DRAFT_ANCHOR = $null
+    LLAMA_MTP_LOGIT_TRACE = $null
+    LLAMA_MTP_LOGIT_REFERENCE = $null
+    LLAMA_MTP_LOGIT_MATCH_DRAFTS = $null
+    LLAMA_MTP_ROUTED_DISPATCH_STATS = $null
+    GGML_VK_MTP_ROUTED_REDUCE = '1'
+    GGML_VK_MTP_ROUTED_WEIGHTED = '1'
+    GGML_VK_MTP_ROUTED_GATE_UP = '1'
+    GGML_VK_MTP_ROUTED_GATE_UP_PAIR = '0'
+    GGML_SCHED_SHARED_INPUT_PRODUCER_COPY = '0'
+    GGML_VK_SKIP_EMPTY_POOL_RESET = '0'
+    GGML_SCHED_TRACE_EXPERT_HANDOFF = $null
+    GGML_VK_PERF_LOGGER = $null
+    GGML_VK_PERF_LOGGER_CONCURRENT = $null
+    GGML_VK_SERIALIZE_SUBMISSIONS = $null
+    LLAMA_DECODE_PROFILE = $null
+    LLAMA_DECODE_PROFILE_CUDA = $null
+}
+if ($Accepted -and ($ExpertPrefill32 -or $ExpertPrefillActiveWaves)) {
+    throw 'The accepted preset uses Prefill512. Run older Prefill32 experiments without -Accepted.'
+}
+$keys = @($baselineEnvironment.Name) + @('PATH', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_PREFILL_32', 'LLAMA_EXPERT_PREFILL_ACTIVE_WAVES', 'LLAMA_EXPERT_PREFILL_TRACE') + $telemetryEnvironment + @($projections | ForEach-Object { $_.Key })
+if ($Accepted) { $keys += @($acceptedEnvironment.Keys) }
 $keys = @($keys | Select-Object -Unique)
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
@@ -57,6 +93,7 @@ $projectionLabel = if ($activeProjections.Count -eq $projections.Count) { 'hc-al
     else { '' }
 $ramLabel = if ($ExpertRamCopyTiming) { 'ram-timing-' } else { '' }
 $prefillLabel = if ($ExpertPrefill32) { 'prefill32-' } else { '' }
+if ($Accepted) { $prefillLabel += 'accepted-' }
 if ($ExpertPrefillActiveWaves) { $prefillLabel += 'active-waves-' }
 $runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel$prefillLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
 if ($ExpertPrefillTrace) {
@@ -69,6 +106,14 @@ $tracePath = Join-Path $runDir 'expert-prefill.jsonl'
 try {
     foreach ($item in $baselineEnvironment) {
         [Environment]::SetEnvironmentVariable($item.Name, $item.Value, 'Process')
+    }
+    if ($Accepted) {
+        foreach ($key in $telemetryEnvironment) {
+            [Environment]::SetEnvironmentVariable($key, $null, 'Process')
+        }
+        foreach ($item in $acceptedEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($item.Key, $item.Value, 'Process')
+        }
     }
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RTX_COLD_SLOTS', $null, 'Process')
@@ -98,21 +143,25 @@ try {
     foreach ($key in $keys) {
         if ($key -ne 'PATH') { $effective[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
     }
-    @{ Mode=$Mode; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed' -or $ExpertRamCopyTiming -or $ExpertPrefillTrace) } |
+    @{ Mode=$Mode; AcceptedPreset=[bool]$Accepted; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed' -or $ExpertRamCopyTiming -or $ExpertPrefillTrace) } |
         ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'settings.json') -Encoding UTF8
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\research\dialogue-benchmark-prompts.md') -Destination $runDir
+    $batchSize = if ($Accepted) { '512' } else { '256' }
     $runArgs = @('-lv', '4', '--log-file', (Join-Path $runDir 'dialogue.log'), '--simple-io', '--color', 'off',
         '-m', $model, '-dev', 'CUDA0,Vulkan1', '-sm', 'layer', '-ts', '1,0', '-ngl', 'all',
         '--fit', 'off', '--load-mode', 'none', '--lazy-mode', 'on',
-        '-c', '2048', '-b', '256', '-ub', '2', '-np', '1', '--reasoning', 'off', '--temp', '0', '--seed', '1234', '-n', '256',
+        '-c', '2048', '-b', $batchSize, '-ub', '2', '-np', '1', '--reasoning', 'off', '--temp', '0', '--seed', '1234', '-n', '256',
         '--spec-type', 'draft-mtp', '-md', $draft, '-devd', 'CUDA0', '-ngld', 'all',
         '--spec-draft-n-max', '1', '--spec-draft-n-ubatch', '1')
+    if ($Accepted) { $runArgs += @('--output-file', (Join-Path $runDir 'transcript.txt')) }
     $runArgs | ConvertTo-Json | Set-Content (Join-Path $runDir 'arguments.json') -Encoding UTF8
     if ($ExpertPrefillTrace) {
         Write-Host 'Send the five saved prompts in order, then /exit.'
         Write-Host 'For a separate long-prompt trace, start a fresh run and enter this command before asking one short question:'
         Write-Host ("/read " + [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\research\dialogue-benchmark-prompts.md')))
         Write-Host 'Enter it twice to give the wider windows enough tokens, then ask one short question and /exit after the answer.'
+    } elseif ($Accepted) {
+        Write-Host "Mode: $Mode. Enter prompts interactively, then /exit to produce the telemetry summary."
     } else {
         Write-Host "Mode: $Mode. Send the five saved prompts in order, then /exit."
     }
@@ -124,6 +173,18 @@ try {
         $ErrorActionPreference = 'Stop'
     }
     "exit_code=$code" | Set-Content (Join-Path $runDir 'exit.txt')
+    if ($Mode -ne 'speed') {
+        $summarize = Join-Path $PSScriptRoot 'summarize-dialogue-telemetry.ps1'
+        if ($code -eq 0) {
+            & $summarize -LogDirectory $runDir
+        } else {
+            try {
+                & $summarize -LogDirectory $runDir -AllowPartial
+            } catch {
+                Write-Warning "Telemetry recovery could not summarize any completed turns: $($_.Exception.Message)"
+            }
+        }
+    }
     if ($code -ne 0) { throw "llama-cli failed: $code" }
     if ($ExpertPrefillTrace -and (!(Test-Path -LiteralPath $tracePath -PathType Leaf) -or (Get-Item -LiteralPath $tracePath).Length -eq 0)) {
         throw 'Expert Prefill trace was not recorded. Check the binary and prompt coverage.'
@@ -170,9 +231,6 @@ try {
         if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch $projection.Marker -Quiet)) {
             throw "HC $($projection.Name) did not activate. Check the binary, tensor type, shape and layout."
         }
-    }
-    if ($Mode -ne 'speed') {
-        & (Join-Path $PSScriptRoot 'summarize-dialogue-telemetry.ps1') -LogDirectory $runDir
     }
     if ($HcUpPair -and !(Select-String -LiteralPath (Join-Path $runDir 'dialogue.log') -SimpleMatch 'CUDA HC up pair applied' -Quiet)) {
         throw 'HC up pair did not activate. Check the binary and graph layout.'

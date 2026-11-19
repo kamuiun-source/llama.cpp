@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -75,6 +76,14 @@ static int server_expert_prefill_policy() {
 
 static bool server_expert_prefill_wide(int policy, int64_t uncached_tokens) {
     return policy == 0 || policy == 512 || (policy == -1 && uncached_tokens >= 80);
+}
+
+static bool server_mtp_vocab_stats_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_DRAFT_VOCAB_STATS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 static bool server_expert_decode_trace_enabled() {
@@ -697,7 +706,86 @@ struct server_batch {
     }
 };
 
+struct server_mtp_depth {
+    struct samples {
+        size_t rounds = 0;
+        size_t first = 0;
+        size_t both = 0;
+        size_t chained_first = 0;
+    };
+    samples confidence[3] = {};
+    samples total;
+    size_t decisions = 0;
+    size_t explored = 0;
+    size_t last[2] = {};
+    size_t rounds[2] = {};
+    size_t proposed2 = 0;
+    size_t proposed2_first = 0;
+    double draft_us[2] = {};
+    double cycle_us[2] = {};
+    int choice = -1;
+    int band = 0;
+    int64_t started_us = 0;
+    int64_t drafted_us = 0;
+
+    bool chain(float confidence_first) {
+        band = confidence_first < 0.90f ? 0 : confidence_first < 0.97f ? 1 : 2;
+        ++decisions;
+        if (decisions <= 8) {
+            choice = (decisions - 1) % 2;
+            ++explored;
+        } else if (decisions - last[0] >= 32 || decisions - last[1] >= 32) {
+            choice = decisions - last[1] >= 32;
+            ++explored;
+        } else {
+            const auto & b = confidence[band];
+            const double global_p1 = (total.first + 1.0) / (total.rounds + 2.0);
+            // A chain that fails to propose draft two still pays for the attempt.
+            const double global_p2 = (total.both + 1.0) / (total.chained_first + 2.0);
+            const double p1 = (b.first + 4 * global_p1) / (b.rounds + 4.0);
+            const double p2 = (b.both + 4 * global_p2) / (b.chained_first + 4.0);
+            // Both costs include draft, verification and rollback, in microseconds per cycle.
+            const double marginal = (1 + p1) * std::max(0.0, cycle_us[1] - cycle_us[0]) / cycle_us[0];
+            choice = p1 * p2 > 1.10 * marginal;
+        }
+        last[choice] = decisions;
+        return choice == 1;
+    }
+
+    void observe(size_t proposed, size_t accepted, int64_t finished_us) {
+        if (choice < 0) {
+            return;
+        }
+        for (auto * stats : { &total, &confidence[band] }) {
+            ++stats->rounds;
+            stats->first += accepted >= 1;
+            stats->chained_first += choice == 1 && accepted >= 1;
+            stats->both += accepted >= 2;
+        }
+        proposed2 += proposed == 2;
+        proposed2_first += proposed == 2 && accepted >= 1;
+        const double weight = rounds[choice]++ == 0 ? 1.0 : 0.125;
+        draft_us[choice] += weight * (double(drafted_us - started_us) - draft_us[choice]);
+        cycle_us[choice] += weight * (double(std::max<int64_t>(1, finished_us - started_us)) - cycle_us[choice]);
+        choice = -1;
+    }
+};
+
+struct server_mtp_logit_row {
+    int32_t row;
+    llama_pos pos;
+    llama_token input;
+    llama_token top;
+    llama_token second;
+    float top_logit;
+    float second_logit;
+    llama_token natural;
+    llama_token chosen;
+    float chosen_logit;
+};
+
 struct server_slot {
+    int64_t mtp_vocab_draft_start_us = 0;
     struct expert_round {
         uint64_t before = 0;
         uint64_t calls = 0;
@@ -915,6 +1003,11 @@ struct server_slot {
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+    bool mtp_adaptive = false;
+    server_mtp_depth mtp_depth;
+    size_t mtp_draft2_proposed = 0;
+    size_t mtp_draft2_first_accepted = 0;
+    size_t mtp_draft2_both_accepted = 0;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -956,6 +1049,10 @@ struct server_slot {
         expert_pending.reset();
         expert_total = {};
         n_accepted_per_pos.clear();
+        mtp_depth = {};
+        mtp_draft2_proposed = 0;
+        mtp_draft2_first_accepted = 0;
+        mtp_draft2_both_accepted = 0;
 
         n_predict_max = -1;
 
@@ -1320,6 +1417,16 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (llama_supports_mtp_verify_three(ctx_tgt)) {
+            SLT_INF(*this, "MTP 3-position verify: draft2_proposed=%zu first_accepted=%zu both_accepted=%zu\n",
+                    mtp_draft2_proposed, mtp_draft2_first_accepted, mtp_draft2_both_accepted);
+        }
+        if (mtp_adaptive) {
+            SLT_INF(*this, "MTP adaptive depth: decisions=%zu explore=%zu depth2=%zu chain=%zu proposed2=%zu first=%zu chain_first=%zu proposed2_first=%zu both=%zu draft2_us=%.1f draft3_us=%.1f round2_us=%.1f round3_us=%.1f\n",
+                    mtp_depth.decisions, mtp_depth.explored, mtp_depth.rounds[0], mtp_depth.rounds[1], mtp_depth.proposed2,
+                    mtp_depth.total.first, mtp_depth.total.chained_first, mtp_depth.proposed2_first, mtp_depth.total.both,
+                    mtp_depth.draft_us[0], mtp_depth.draft_us[1], mtp_depth.cycle_us[0], mtp_depth.cycle_us[1]);
+        }
         common_speculative_print_stats(spec);
     }
 
@@ -1606,6 +1713,9 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    bool mtp_logit_trace = false;
+    bool mtp_logit_match_drafts = false;
+    llama_tokens mtp_logit_reference;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
@@ -2031,6 +2141,66 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        const bool mtp_adaptive = mtp_three && std::strcmp(mtp_three, "auto") == 0;
+        if (mtp_adaptive || (mtp_three && std::strcmp(mtp_three, "1") == 0)) {
+            const bool mtp_only = spec_mtp && std::all_of(params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(), [](common_speculative_type type) {
+                        return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                    });
+            if (!spec || !mtp_only || common_speculative_n_max(spec.get()) != 2 || params_base.speculative.has_synth() ||
+                    (mtp_adaptive && params_base.speculative.draft.n_min > 1) ||
+                    !llama_supports_mtp_verify_three(ctx_tgt) || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                    ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                SRV_ERR("%s", "three-position MTP requires two draft tokens, real acceptance, one slot, and target and draft rollback on packed Qwen4Exp Prefill512\n");
+                return false;
+            }
+        }
+
+        for (auto & slot : slots) {
+            slot.mtp_adaptive = mtp_adaptive;
+        }
+
+        const char * logit_trace = std::getenv("LLAMA_MTP_LOGIT_TRACE");
+        mtp_logit_trace = logit_trace && std::strcmp(logit_trace, "1") == 0;
+        mtp_logit_reference.clear();
+        mtp_logit_match_drafts = false;
+        if (mtp_logit_trace) {
+            const bool mtp_only = spec_mtp && std::all_of(params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(), [](common_speculative_type type) {
+                        return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                    });
+            if (!spec || !mtp_only || mtp_adaptive || slots.size() != 1 || params_base.speculative.has_synth() ||
+                    params_base.speculative.draft.probabilistic || params_base.n_predict <= 0 ||
+                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                SRV_ERR("%s", "MTP logit trace requires fixed-depth greedy MTP, one slot, bounded generation and target/draft rollback\n");
+                return false;
+            }
+            if (const char * reference = std::getenv("LLAMA_MTP_LOGIT_REFERENCE"); reference && *reference) {
+                std::ifstream input{std::filesystem::u8path(reference)};
+                const auto n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                for (int64_t id; input >> id; ) {
+                    if (id < 0 || id >= n_vocab || mtp_logit_reference.size() >= size_t(params_base.n_predict)) {
+                        SRV_ERR("%s", "invalid MTP logit reference token list\n");
+                        return false;
+                    }
+                    mtp_logit_reference.push_back(id);
+                }
+                if (!input.eof() || mtp_logit_reference.size() != size_t(params_base.n_predict)) {
+                    SRV_ERR("%s", "MTP logit reference does not contain the requested token count\n");
+                    return false;
+                }
+            }
+            if (const char * control = std::getenv("LLAMA_MTP_LOGIT_MATCH_DRAFTS"); control && std::strcmp(control, "1") == 0) {
+                if (mtp_logit_reference.empty()) {
+                    SRV_ERR("%s", "MTP no-rejection control requires reference token IDs\n");
+                    return false;
+                }
+                mtp_logit_match_drafts = true;
+            }
+            llama_set_mtp_logit_trace(ctx_tgt, true);
         }
 
         if (!spec && params_base.speculative.has_synth()) {
@@ -2577,6 +2747,12 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            if (mtp_logit_trace && (task.params.sampling.temp != 0.0f || !task.params.sampling.grammar.empty() ||
+                    task.params.sampling.n_probs != 0 ||
+                    (task.params.n_predict != -1 && task.params.n_predict != params_base.n_predict))) {
+                send_error(task, "MTP logit trace requires a bounded greedy request without grammar or requested probabilities", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
@@ -2588,6 +2764,7 @@ private:
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
+            use_backend_sampling &= !mtp_logit_trace;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -2924,6 +3101,16 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (server_mtp_vocab_stats_enabled()) {
+            if (slots.size() != 1) {
+                SLT_WRN(slot, "%s", "mtp_vocab_request: unsupported_parallel=1\n");
+            } else {
+                SLT_INF(slot, "mtp_vocab_request: request=%d draft_wall_us=%" PRId64 " drafted=%" PRIu64
+                        " accepted=%" PRIu64 " generated=%" PRIu64 " single_slot=1\n",
+                        slot.task->id, common_speculative_mtp_draft_us(spec.get()) - slot.mtp_vocab_draft_start_us,
+                        slot.stats.n_draft_tokens, slot.stats.n_draft_accepted, slot.stats.n_gen);
+            }
+        }
         if (decode_telemetry.enabled && decode_telemetry.per_response && slots.size() == 1) {
             decode_telemetry.pending_response = string_format(
                 "response=%" PRIu64 " task=%d slot=%d prompt_tokens=%d cached_tokens=%d context_tokens=%d generated_tokens=%d"
@@ -4454,6 +4641,13 @@ private:
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
+                        if (slot.mtp_adaptive && n_draft_max >= 2) {
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dp.chain_mtp = [](void * data, float confidence_first) {
+                                return static_cast<server_mtp_depth *>(data)->chain(confidence_first);
+                            };
+                            dp.chain_mtp_data = &slot.mtp_depth;
+                        }
                         drafting.push_back(&slot);
                     }
                 }
@@ -4464,7 +4658,15 @@ private:
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
                 server_decode_telemetry::scope measure(decode_telemetry, ctx_dft, server_decode_telemetry::draft);
+                server_mtp_depth * depth = drafting.front()->mtp_adaptive ? &drafting.front()->mtp_depth : nullptr;
+                if (depth) {
+                    depth->choice = -1;
+                    depth->started_us = ggml_time_us();
+                }
                 common_speculative_draft(spec.get());
+                if (depth && depth->choice >= 0) {
+                    depth->drafted_us = ggml_time_us();
+                }
             });
         }
 
@@ -4473,20 +4675,37 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            if (mtp_logit_trace && (slot.n_remaining() <= 0 || draft.size() >= size_t(slot.n_remaining()))) {
+                throw std::runtime_error("MTP logit trace draft leaves no room for the final target sample");
+            }
+
             slot.stats.n_draft_tokens += draft.size();
 
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
             const llama_pos pos = slot.prompt.tokens.pos_next();
             const bool keep_anchor = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    !mtp_logit_match_drafts &&
                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && draft.size() == 1 &&
                     pos > 0 && pos - 1 == ckpt.pos_max && common_speculative_keep_mtp_anchor(spec.get(), slot.id, pos, slot.sampled);
             if (ctx_dft && !keep_anchor) {
+                const auto draft_tail = mtp_logit_trace ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                }
+                if (mtp_logit_trace) {
+                    SLT_INF(slot, "mtp logits draft reset: index=%zu from=%d to=-1 draft_before=%d draft_after=%d\n",
+                            size_t(slot.stats.n_gen), ckpt.pos_max + 1, draft_tail,
+                            llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id));
+                }
+            }
+
+            if (mtp_logit_match_drafts) {
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    draft[i] = mtp_logit_reference.at(size_t(slot.stats.n_gen) + i);
                 }
             }
 
@@ -4569,6 +4788,9 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        if (server_mtp_vocab_stats_enabled()) {
+                            slot.mtp_vocab_draft_start_us = common_speculative_mtp_draft_us(spec.get());
+                        }
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -5253,40 +5475,41 @@ private:
         bool has_output = false;
         bool prompt_only = true;
         bool prompt_wide = true;
+        bool prefill = false;
+        bool decode = false;
+        bool verify = false;
+        const int32_t view_width = batch.view.size();
+        bool mtp_verify = spec && (view_width == 2 || (view_width == 3 && llama_supports_mtp_verify_three(ctx_tgt)));
+        const bool classify = mtp_verify || decode_telemetry.enabled || decode_telemetry.expert_staging_copy || decode_telemetry.expert_decode_trace;
         const int prefill_policy = server_expert_prefill_policy();
         for (int i = off; i < off + batch.view.size(); ++i) {
-            has_output |= batch.tokens[i].output;
-            prompt_only &= batch.tokens[i].is_prompt;
-            if (batch.tokens[i].is_prompt) {
-                const auto & slot = slots[batch.tokens[i].id_slot];
+            const auto & token = batch.tokens[i];
+            has_output |= token.output;
+            prompt_only &= token.is_prompt;
+            if (token.is_prompt) {
+                prefill = true;
+                mtp_verify = false;
+                const auto & slot = slots[token.id_slot];
                 prompt_wide &= server_expert_prefill_wide(prefill_policy, slot.task->n_tokens() - slot.stats.n_prompt_cached);
+            } else if (classify) {
+                const auto & slot = slots[token.id_slot];
+                const auto & indices = slot.spec_i_batch;
+                const bool is_verify = std::find(indices.begin(), indices.end(), i) != indices.end();
+                mtp_verify = mtp_verify && is_verify && !slot.spec_is_replay && slot.spec_draft.size() + 1 == size_t(view_width) &&
+                        indices.size() == size_t(view_width) && indices.front() == off && indices.back() == off + view_width - 1 &&
+                        common_speculative_last_draft_type(spec.get(), slot.id) == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                decode |= !is_verify;
+                verify |= is_verify;
             }
         }
-
         auto phase = server_decode_telemetry::decode;
-        if (decode_telemetry.enabled || decode_telemetry.expert_staging_copy || decode_telemetry.expert_decode_trace) {
-            bool prefill = false;
-            bool decode = false;
-            bool verify = false;
-            for (int i = off; i < off + batch.view.size(); ++i) {
-                const auto & token = batch.tokens[i];
-                if (token.is_prompt) {
-                    prefill = true;
-                } else {
-                    const auto & indices = slots[token.id_slot].spec_i_batch;
-                    const bool is_verify = std::find(indices.begin(), indices.end(), i) != indices.end();
-                    decode |= !is_verify;
-                    verify |= is_verify;
-                }
-            }
-            const int n_phases = int(prefill) + int(decode) + int(verify);
-            if (n_phases > 1) {
-                phase = server_decode_telemetry::mixed;
-            } else if (prefill) {
-                phase = server_decode_telemetry::prefill;
-            } else if (verify) {
-                phase = server_decode_telemetry::verify;
-            }
+        const int n_phases = int(prefill) + int(decode) + int(verify);
+        if (n_phases > 1) {
+            phase = server_decode_telemetry::mixed;
+        } else if (prefill) {
+            phase = server_decode_telemetry::prefill;
+        } else if (verify) {
+            phase = server_decode_telemetry::verify;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -5333,8 +5556,12 @@ private:
                 }
             } prompt_trace_request{decode_telemetry.expert_prompt_trace,
                     decode_telemetry.expert_prompt_trace ? llama_set_expert_prompt_trace_request(trace_request) : -1};
-            ret = prompt_only && !prompt_wide ? llama_process_prefill_narrow(ctx_tgt, batch.view.get()) :
-                    llama_process(ctx_tgt, prompt_only ? LLAMA_PROCESS_TYPE_PREFILL : LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (mtp_verify && phase == server_decode_telemetry::verify) {
+                ret = llama_process_mtp_verify(ctx_tgt, batch.view.get());
+            } else {
+                ret = prompt_only && !prompt_wide ? llama_process_prefill_narrow(ctx_tgt, batch.view.get()) :
+                        llama_process(ctx_tgt, prompt_only ? LLAMA_PROCESS_TYPE_PREFILL : LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -5351,7 +5578,7 @@ private:
             {
                 std::string err;
 
-                if (n_batch == 1 && ret == 1) {
+                if (ret == 1 && (n_batch == 1 || (mtp_verify && view_width == 3))) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
@@ -5444,6 +5671,44 @@ private:
         return true;
     }
 
+    server_mtp_logit_row capture_mtp_logits(server_slot & slot, int32_t row, size_t index) const {
+        if (index >= size_t(slot.n_predict_max)) {
+            throw std::runtime_error("MTP logit trace sample exceeds the generation limit");
+        }
+        const auto & token = batch.view.tokens.at(row);
+        const float * logits = llama_get_logits_ith(ctx_tgt, row);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+        if (!token.output || !logits || n_vocab < 2) {
+            throw std::runtime_error("missing full-vocabulary target logits for MTP trace");
+        }
+        llama_token top = 0, second = 1;
+        if (logits[second] > logits[top]) {
+            std::swap(top, second);
+        }
+        for (llama_token id = 2; id < n_vocab; ++id) {
+            if (logits[id] > logits[top]) {
+                second = top;
+                top = id;
+            } else if (logits[id] > logits[second]) {
+                second = id;
+            }
+        }
+        const float top_logit = logits[top], second_logit = logits[second];
+        const llama_token natural = common_sampler_sample(slot.smpl.get(), ctx_tgt, row);
+        const llama_token chosen = mtp_logit_reference.empty() ? natural : mtp_logit_reference.at(index);
+        if (!std::isfinite(top_logit) || !std::isfinite(second_logit) || !std::isfinite(logits[chosen])) {
+            throw std::runtime_error("non-finite target logits in MTP trace");
+        }
+        return { row, token.pos[0], token.id, top, second, top_logit, second_logit, natural, chosen, logits[chosen] };
+    }
+
+    void print_mtp_logit_row(const server_slot & slot, const server_mtp_logit_row & row,
+            size_t index, size_t round, bool replay) const {
+        SLT_INF(slot, "mtp logits row: index=%zu round=%zu pos=%d input=%d width=%d row=%d replay=%d top=%d second=%d top_logit=%.9g second_logit=%.9g margin=%.9g natural=%d chosen=%d chosen_logit=%.9g\n",
+                index, round, row.pos, row.input, batch.view.size(), row.row, replay, row.top, row.second, row.top_logit,
+                row.second_logit, double(row.top_logit) - row.second_logit, row.natural, row.chosen, row.chosen_logit);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -5524,7 +5789,14 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                if (mtp_logit_trace) {
+                    const auto index = size_t(slot.stats.n_gen);
+                    const auto row = capture_mtp_logits(slot, tok_idx, index);
+                    print_mtp_logit_row(slot, row, index, index, false);
+                    id = row.chosen;
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
             }
 
             slot.i_batch = -1;
@@ -5593,6 +5865,9 @@ private:
 
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
+            std::vector<server_mtp_logit_row> mtp_logit_rows;
+            const size_t trace_round = slot.stats.n_gen;
+            const bool trace_replay = slot.spec_is_replay;
 
             // verify and try to accept the draft
             {
@@ -5606,7 +5881,16 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (mtp_logit_trace) {
+                    if (use_rejection || (trace_replay && slot.use_spec_rejection())) {
+                        throw std::runtime_error("MTP logit trace requires sample-and-match verification");
+                    }
+                    accepted = common_sampler_sample_and_accept_n_with(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
+                            [&](int32_t row, size_t index) {
+                                mtp_logit_rows.push_back(capture_mtp_logits(slot, row - off, trace_round + index));
+                                return mtp_logit_rows.back().chosen;
+                            });
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
@@ -5621,6 +5905,12 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                if (n_draft == 2 && !slot.spec_is_replay && llama_supports_mtp_verify_three(ctx_tgt) &&
+                        common_speculative_last_draft_type(spec.get(), slot.id) == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    ++slot.mtp_draft2_proposed;
+                    slot.mtp_draft2_first_accepted += accepted.size() >= 2;
+                    slot.mtp_draft2_both_accepted += accepted.size() >= 3;
+                }
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
@@ -5631,6 +5921,10 @@ private:
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
+                        if (mtp_logit_trace) {
+                            SLT_INF(slot, "mtp logits checkpoint: round=%zu proposed=%zu accepted=%zu from=%d to=-1 replay=%d\n",
+                                    trace_round, n_draft, accepted.size() - 1, slot.spec_ckpt.pos_max + 1, trace_replay);
+                        }
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -5673,6 +5967,7 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
+            const bool mtp_observe = !slot.spec_is_replay && slot.mtp_depth.choice >= 0;
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
@@ -5700,11 +5995,28 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            const llama_pos discard_from = slot.prompt.tokens.pos_next();
+            const auto target_tail = mtp_logit_trace ? llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) : -1;
+            const auto draft_tail = mtp_logit_trace ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
+            slot.mem.seq_rm(slot.id, discard_from, -1);
+            if (mtp_logit_trace) {
+                const auto draft0 = batch.view.tokens.at(spec_i_batch[1] - off).id;
+                const auto draft1 = n_draft == 2 ? batch.view.tokens.at(spec_i_batch[2] - off).id : LLAMA_TOKEN_NULL;
+                SLT_INF(slot, "mtp logits verify: round=%zu proposed=%zu accepted=%zu draft0=%d draft1=%d from=%d to=-1 replay=%d target_before=%d target_after=%d draft_before=%d draft_after=%d\n",
+                        trace_round, n_draft, n_accepted, draft0, draft1, discard_from, trace_replay, target_tail,
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id), draft_tail,
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id));
+            }
+            if (mtp_observe) {
+                slot.mtp_depth.observe(n_draft, n_accepted, ggml_time_us());
+            }
 
             const llama_pos expert_position = slot.expert_trace ?
                     slot.prompt.tokens.pos_next() - static_cast<llama_pos>(ids.size() - 1) : -1;
             for (size_t i = 0; i < ids.size(); ++i) {
+                if (mtp_logit_trace) {
+                    print_mtp_logit_row(slot, mtp_logit_rows.at(i), size_t(slot.stats.n_gen), trace_round, trace_replay);
+                }
                 completion_token_output result;
 
                 result.tok          = ids[i];

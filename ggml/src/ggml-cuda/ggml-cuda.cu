@@ -3132,6 +3132,63 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+static bool ggml_backend_cuda_get_shared_input(ggml_backend_t backend, const ggml_tensor * const * tensors,
+        ggml_backend_buffer_t host_buffer, void * data, const size_t * offsets, const size_t * sizes,
+        const size_t * data_offsets, size_t count) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend);
+    GGML_UNUSED(tensors);
+    GGML_UNUSED(host_buffer);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offsets);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(data_offsets);
+    GGML_UNUSED(count);
+    return false;
+#else
+    if (!ggml_backend_is_cuda(backend) || count != 3 || !tensors || !host_buffer || !data ||
+            !offsets || !sizes || !data_offsets || !ggml_backend_buft_is_cuda_host(host_buffer->buft)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->curr_stream_no != 0) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(host_buffer));
+    const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+    const size_t capacity = ggml_backend_buffer_get_size(host_buffer);
+    if (address < base || address - base > capacity) {
+        return false;
+    }
+    const size_t available = capacity - (address - base);
+    for (size_t i = 0; i < count; ++i) {
+        const auto * tensor = tensors[i];
+        const auto buffer = tensor ? (tensor->view_src ? tensor->view_src->buffer : tensor->buffer) : nullptr;
+        if (!tensor || !buffer || !tensor->data || buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+                !ggml_is_contiguous(tensor) || offsets[i] > ggml_nbytes(tensor) ||
+                sizes[i] > ggml_nbytes(tensor) - offsets[i] || data_offsets[i] > available ||
+                sizes[i] > available - data_offsets[i]) {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (data_offsets[i] < data_offsets[j] ? data_offsets[j] - data_offsets[i] < sizes[i] :
+                    data_offsets[i] - data_offsets[j] < sizes[j]) {
+                return false;
+            }
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    const cudaStream_t stream = ctx->stream();
+    // Graph branches join the main stream before the scheduler can hand off these inputs.
+    for (size_t i = 0; i < count; ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char *>(data) + data_offsets[i],
+                static_cast<const char *>(tensors[i]->data) + offsets[i], sizes[i], cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(ggml_cuda_stream_synchronize(stream));
+    return true;
+#endif
+}
+
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -7350,6 +7407,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_init_rank;
     }
 #endif // GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_cuda_get_shared_input") == 0) {
+        return (void *) ggml_backend_cuda_get_shared_input;
+    }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }

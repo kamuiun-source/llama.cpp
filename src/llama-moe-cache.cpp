@@ -384,6 +384,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         std::vector<int32_t> packed_scratch; // original expert ID per scratch slot, -1 if empty
         std::vector<ggml_tensor *> prefill_maps;
+        std::array<ggml_tensor *, 2> mtp_verify_maps{};
         std::array<int32_t, llama_expert_profile::n_experts> prefill_wave;
         std::vector<int32_t> prefill_ids;
         std::vector<int32_t> packed_scratch_slots; // physical slots when the permanent map can change
@@ -437,6 +438,14 @@ struct llama_moe_cache::impl {
     size_t pending_upload_bytes = 0;
     size_t packed_scratch_hits = 0;
     size_t packed_request_misses = 0;
+    const bool mtp_verify_three_enabled;
+    static constexpr int32_t mtp_pair_experts = 10;
+    std::vector<std::array<uint64_t, mtp_pair_experts + 1>> mtp_pair_histograms;
+    size_t mtp_verify_layers = 0;
+    size_t mtp_verify_overflow_layers = 0;
+    size_t mtp_verify_second_passes = 0;
+    size_t mtp_verify_empty_no_copy = 0;
+    int32_t mtp_verify_max_cold = 0;
     size_t prefill_layer_batches = 0;
     size_t prefill_waves_needed = 0;
     size_t prefill_waves_scheduled = 0;
@@ -460,6 +469,8 @@ struct llama_moe_cache::impl {
     defer_slot_map_t defer_slot_map = nullptr;
     using telemetry_cause_t = const char * (*)(const char *);
     telemetry_cause_t set_telemetry_cause = nullptr;
+    using gate_up_diag_ids_t = void (*)(ggml_backend_t, const ggml_tensor *, const int32_t *, const int32_t *);
+    gate_up_diag_ids_t gate_up_diag_ids = nullptr;
 
     struct telemetry_scope {
         telemetry_cause_t set;
@@ -616,8 +627,9 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), placement(model.expert_placement.get()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool mtp_verify_three_enabled) :
+            n_expert_used(model.hparams.n_expert_used_max()), placement(model.expert_placement.get()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)),
+            mtp_verify_three_enabled(mtp_verify_three_enabled) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -647,11 +659,19 @@ struct llama_moe_cache::impl {
                 throw std::runtime_error("packed expert scratch slots are already in use by another context");
             }
             placement_owner.reset(placement);
+            const char * pair_overlap = std::getenv("LLAMA_MTP_PAIR_EXPERT_OVERLAP");
+            if (!mtp_verify_three_enabled && n_expert_used == mtp_pair_experts && pair_overlap && std::strcmp(pair_overlap, "1") == 0) {
+                mtp_pair_histograms.resize(layers.size());
+            }
             LLAMA_LOG_INFO("packed expert router: reuse host IDs from CUDA to Vulkan copies\n");
             groups.emplace_back().id = static_cast<int32_t>(device - devices.begin());
             const int32_t n_prefill_waves = placement->prefill_waves(placement->prefill_tokens, n_expert_used);
-            const ggml_init_params params{
-                placement->maps.size() * ggml_tensor_overhead() * (1 + placement->overlap + n_prefill_waves), nullptr, true};
+            if (mtp_verify_three_enabled && (placement->overlap || placement->n_slots != 20 ||
+                    placement->max_ubatch != 2 || n_expert_used != 10)) {
+                throw std::runtime_error("3-position MTP requires packed Expert capacity 300+20 and top-10 routing");
+            }
+            const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
+            const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
             if (!ctx_host) {
                 throw std::runtime_error("could not allocate packed expert slot map context");
@@ -667,6 +687,14 @@ struct llama_moe_cache::impl {
                     ggml_format_name(map, "moe_cache.packed_slots-%zu-prefill-%d", il, wave);
                     l.prefill_maps.push_back(map);
                     layer_of.emplace(map, std::make_pair(static_cast<int32_t>(il), false));
+                }
+                if (mtp_verify_three_enabled) {
+                    for (size_t wave = 0; wave < l.mtp_verify_maps.size(); ++wave) {
+                        auto * map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                        ggml_format_name(map, "moe_cache.packed_slots-%zu-mtp3-%zu", il, wave);
+                        l.mtp_verify_maps[wave] = map;
+                        layer_of.emplace(map, std::make_pair(static_cast<int32_t>(il), false));
+                    }
                 }
                 if (placement->overlap) {
                     l.cold_slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
@@ -716,6 +744,11 @@ struct llama_moe_cache::impl {
                     histogram && std::strcmp(histogram, "1") == 0;
             if (reg && telemetry && std::strcmp(telemetry, "1") == 0) {
                 set_telemetry_cause = (telemetry_cause_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_telemetry_cause");
+                const char * gate_up_diag = std::getenv("GGML_VK_MTP_GATE_UP_TIMING");
+                if (gate_up_diag && std::strcmp(gate_up_diag, "1") == 0) {
+                    gate_up_diag_ids = reinterpret_cast<gate_up_diag_ids_t>(
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_gate_up_diagnostic_ids"));
+                }
             }
             defer_slot_map_requested = !placement->overlap;
             if (defer_slot_map_requested) {
@@ -1993,7 +2026,7 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,
-            ggml_backend_sched_t sched) {
+            ggml_backend_sched_t sched, bool fixed_mtp_pair) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -2007,7 +2040,11 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
         const auto wave_it = std::find(l.prefill_maps.begin(), l.prefill_maps.end(), src);
         const bool prefill = wave_it != l.prefill_maps.end();
-        const int32_t wave = static_cast<int32_t>(wave_it - l.prefill_maps.begin());
+        const bool mtp_verify = mtp_verify_three_enabled && !prefill &&
+                (src == l.mtp_verify_maps[0] || src == l.mtp_verify_maps[1]);
+        const bool use_waves = prefill || mtp_verify;
+        const int32_t wave = mtp_verify ? int32_t(src == l.mtp_verify_maps[1]) :
+                static_cast<int32_t>(wave_it - l.prefill_maps.begin());
 
         GGML_ASSERT(backend == devices[g.id].backend);
         // The scheduler's destination wait must commit the preceding promotion.
@@ -2073,7 +2110,7 @@ struct llama_moe_cache::impl {
 
         const size_t ids_bytes = ggml_nbytes(sel);
         ids.resize(ggml_nelements(sel));
-        if (prefill && wave > 0) {
+        if (use_waves && wave > 0) {
             GGML_ASSERT(l.prefill_ids.size() == ids.size());
             ids = l.prefill_ids;
         } else if (placement && sched && ggml_backend_sched_get_host_copy(sched, sel, ids.data(), ids_bytes)) {
@@ -2159,45 +2196,78 @@ struct llama_moe_cache::impl {
                     GGML_ABORT("invalid packed expert ID in layer %d", il);
                 }
             }
-            if (prefill) {
+            if (!mtp_pair_histograms.empty() && fixed_mtp_pair && src == l.slot_map && ids.size() == 2 * mtp_pair_experts) {
+                // Top-k produces distinct IDs in each row. The packed lookup flattens the rows in token order.
+                const auto second = ids.begin() + mtp_pair_experts;
+                size_t common = 0;
+                for (auto first = ids.begin(); first != second; ++first) {
+                    common += std::find(second, ids.end(), *first) != ids.end();
+                }
+                ++mtp_pair_histograms[il][common];
+            }
+            if (use_waves) {
                 if (wave == 0) {
                     // Each expert belongs to one wave, even if several tokens selected it.
                     l.prefill_ids = ids;
                     l.prefill_wave.fill(-1);
                     int32_t cold_count = 0;
+                    if (mtp_verify) {
+                        GGML_ASSERT(ids.size() == 3 * size_t(n_used));
+                        // Consume selected scratch hits before replacing their slots.
+                        for (const int32_t expert : l.packed_scratch) {
+                            if (expert >= 0 && map.resident[expert] < 0 &&
+                                    std::find(ids.begin(), ids.end(), expert) != ids.end()) {
+                                l.prefill_wave[expert] = 0;
+                                ++cold_count;
+                            }
+                        }
+                    }
                     for (const int32_t expert : ids) {
                         if (l.prefill_wave[expert] < 0) {
                             l.prefill_wave[expert] = map.resident[expert] >= 0 ? 0 : cold_count++ / placement->n_slots;
                         }
                     }
-                    ++prefill_layer_batches;
-                    prefill_max_tokens = std::max(prefill_max_tokens, ids.size() / n_used);
-                    prefill_unique_cold += cold_count;
-                    prefill_waves_needed += std::max(1, (cold_count + placement->n_slots - 1) / placement->n_slots);
-                    prefill_waves_scheduled += placement->prefill_waves(ids.size() / n_used, n_used);
+                    if (mtp_verify) {
+                        ++mtp_verify_layers;
+                        mtp_verify_overflow_layers += cold_count > placement->n_slots;
+                        mtp_verify_max_cold = std::max(mtp_verify_max_cold, cold_count);
+                    } else {
+                        ++prefill_layer_batches;
+                        prefill_max_tokens = std::max(prefill_max_tokens, ids.size() / n_used);
+                        prefill_unique_cold += cold_count;
+                        prefill_waves_needed += std::max(1, (cold_count + placement->n_slots - 1) / placement->n_slots);
+                        prefill_waves_scheduled += placement->prefill_waves(ids.size() / n_used, n_used);
+                    }
                 }
                 ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int32_t expert) {
                     return l.prefill_wave[expert] != wave;
                 }), ids.end());
-                if (wave > 0 && ids.empty() && prefill_active_waves && sched) {
+                if (wave > 0 && ids.empty() && (mtp_verify || prefill_active_waves)) {
                     constexpr const char accumulator_name[] = "ffn_moe_prefill_accumulator";
                     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                         auto * node = ggml_graph_node(graph, i);
                         if (std::strncmp(node->name, accumulator_name, sizeof(accumulator_name) - 1) == 0 &&
-                                ggml_backend_sched_carry_accumulator(sched, graph, node)) {
-                            ++prefill_waves_skipped;
+                                sched && ggml_backend_sched_carry_accumulator(sched, graph, node)) {
+                            prefill_waves_skipped += prefill;
+                            if (mtp_verify && node->data == node->src[0]->data) {
+                                ++mtp_verify_empty_no_copy;
+                            }
                             return true;
                         }
                     }
+                    if (mtp_verify) {
+                        throw std::runtime_error("could not skip the empty 3-position MTP Expert wave");
+                    }
                 }
-                ++prefill_waves_executed;
+                prefill_waves_executed += prefill;
+                mtp_verify_second_passes += mtp_verify && wave > 0;
             }
-            if (placement->dynamic_resident && (!prefill || wave == 0)) {
+            if (placement->dynamic_resident && (!use_waves || wave == 0)) {
                 ++l.packed_lookups;
                 if (placement->prefill_tokens == 512 && prompt_active) {
                     ++prefill_native_steps;
                 }
-                for (const int32_t expert : prefill ? l.prefill_ids : ids) {
+                for (const int32_t expert : use_waves ? l.prefill_ids : ids) {
                     l.packed_last_used[expert] = l.packed_lookups;
                 }
             }
@@ -2231,6 +2301,9 @@ struct llama_moe_cache::impl {
             std::array<int32_t, llama_expert_profile::n_experts> rtx_slots;
             size_t n_rtx = 0;
             size_t rtx_bytes = 0;
+            if (mtp_verify && rtx_expert) {
+                throw std::runtime_error("3-position MTP is incompatible with RTX Expert sharing");
+            }
             if (rtx_expert) {
                 if (!profile && sched && ggml_backend_sched_get_n_copies(sched) == 1) {
                     rtx_slots.fill(-1);
@@ -2307,7 +2380,7 @@ struct llama_moe_cache::impl {
             const int32_t evict = placement->dynamic_resident && promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
             bool upload_submitted = false;
             bool overlap_submitted = false;
-            const bool can_overlap = !prefill && overlap_expert_upload && !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
+            const bool can_overlap = !use_waves && overlap_expert_upload && !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
             if (batch && (!fills.empty() || can_overlap_promotion)) {
                 // A single-copy scheduler synchronizes the backend before each host-weight callback.
@@ -2345,12 +2418,19 @@ struct llama_moe_cache::impl {
             if (evict >= 0 && !overlap_submitted) {
                 promote_packed(l, il, promote_index, evict);
             }
-            if (prefill) {
+            if (use_waves) {
                 for (size_t expert = 0; expert < slots.size(); ++expert) {
                     if (l.prefill_wave[expert] != wave) {
                         slots[expert] = -1;
                     }
                 }
+            }
+            if (gate_up_diag_ids && fixed_mtp_pair && src == l.slot_map && ids.size() == 20) {
+                int32_t selected_slots[20];
+                for (uint32_t i = 0; i < ids.size(); ++i) {
+                    selected_slots[i] = slots[ids[i]];
+                }
+                gate_up_diag_ids(backend, lookup, ids.data(), selected_slots);
             }
             // The scheduler synchronizes after each copy callback while profiling.
             if (overlap_submitted) {
@@ -2465,6 +2545,26 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
+            if (!layers[il].slot_map) {
+                continue;
+            }
+            const auto & histogram = mtp_pair_histograms[il];
+            std::ostringstream bins;
+            uint64_t samples = 0;
+            for (size_t i = 0; i < histogram.size(); ++i) {
+                bins << (i == 0 ? "" : ",") << histogram[i];
+                samples += histogram[i];
+            }
+            LLAMA_LOG_INFO("MTP pair expert overlap: layer=%zu samples=%" PRIu64 " bins=%s\n",
+                    il, samples, bins.str().c_str());
+        }
+        if (mtp_verify_three_enabled) {
+            LLAMA_LOG_INFO("MTP 3-position expert: layers=%zu overflow_layers=%zu max_nonresident=%d\n",
+                    mtp_verify_layers, mtp_verify_overflow_layers, mtp_verify_max_cold);
+            LLAMA_LOG_INFO("MTP 3-position waves: second_passes=%zu empty_no_copy=%zu\n",
+                    mtp_verify_second_passes, mtp_verify_empty_no_copy);
+        }
         if (placement && prompt_stats) {
             LLAMA_LOG_INFO("packed expert prompt uploads: capacity=%d ubatches=%" PRIu64 " tokens=%" PRIu64
                     " max_tokens=%" PRIu64 " decode_max_tokens=%" PRIu64 " layer_steps=%" PRIu64 " uploads=%" PRIu64 " bytes=%" PRIu64
@@ -2574,8 +2674,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool mtp_verify_three_enabled) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, mtp_verify_three_enabled)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -2724,6 +2824,10 @@ ggml_tensor * llama_moe_cache::get_prefill_map(int32_t il, int32_t wave) const {
     return pimpl->layers.at(il).prefill_maps.at(wave);
 }
 
+ggml_tensor * llama_moe_cache::get_mtp_verify_map(int32_t il, int32_t wave) const {
+    return pimpl->layers.at(il).mtp_verify_maps.at(wave);
+}
+
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w, bool cold) const {
     return pimpl->get_experts(w, cold);
 }
@@ -2749,8 +2853,8 @@ bool llama_moe_cache::router_host_ids_enabled() const {
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,
-        ggml_backend_sched_t sched) {
-    return pimpl->copy(backend, src, dst, graph, profile, early, sched);
+        ggml_backend_sched_t sched, bool fixed_mtp_pair) {
+    return pimpl->copy(backend, src, dst, graph, profile, early, sched, fixed_mtp_pair);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

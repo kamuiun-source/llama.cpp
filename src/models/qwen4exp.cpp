@@ -662,7 +662,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (mtp_vocab_head) {
+        if (!loras->empty()) {
+            throw std::runtime_error("MTP draft vocabulary does not support output LoRA adapters");
+        }
+        cur = build_lora_mm(mtp_vocab_head, cur, model.output_s);
+        const int64_t count = cur->ne[1];
+        auto * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, model.vocab.n_tokens(), count), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits, ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], count),
+                ggml_reshape_3d(ctx0, mtp_vocab_ids, mtp_vocab_ids->ne[0], 1, 1));
+        cur = ggml_reshape_2d(ctx0, cur, model.vocab.n_tokens(), count);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
@@ -1149,7 +1161,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     auto * history = build_conv_history(inp, conv_states_all, conv_kernel_size - 1, conv_channels, il);
     ggml_tensor * conv_output_silu = nullptr;
-    if (cparams.n_rs_seq == 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
+    if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
             conv_kernel_size == 4 && conv_states_all->buffer && conv_kernel->buffer && conv_states_all->type == GGML_TYPE_F32 &&
             conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_states_all->ne[0])) {
         auto * dev = model.dev_layer(il);
