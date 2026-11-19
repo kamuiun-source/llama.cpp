@@ -17862,6 +17862,161 @@ static ggml_backend_buffer_t ggml_backend_vk_alloc_overlap_expert_staging(ggml_b
     return ggml_backend_vk_alloc_host_upload_buffer(dev, size);
 }
 
+struct ggml_vk_prefill_upload {
+    vk_device device;
+    vk_command_pool pool;
+    vk_context transfer;
+    vk::Semaphore ready;
+    vk::Fence transfer_fence;
+    vk::Fence joined_fence;
+    vk_buffer staging;
+    std::vector<vk_buffer_region> regions;
+    bool pending = false;
+    bool joining = false;
+};
+
+static bool ggml_backend_vk_prefill_upload_wait(void * handle) {
+    auto * job = static_cast<ggml_vk_prefill_upload *>(handle);
+    if (!job || !job->pending) {
+        return true;
+    }
+    vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eComputeShader;
+    vk::SubmitInfo wait{1, &job->ready, &stage, 0, nullptr, 0, nullptr};
+    if (!job->joining) {
+        job->device->compute_queue->handle->submit({wait}, job->joined_fence);
+        job->joining = true;
+    }
+    VK_CHECK(ggml_vk_wait_for_fences(job->device->device, job->joined_fence), "prefill upload join", job->device);
+    VK_CHECK(ggml_vk_wait_for_fences(job->device->device, job->transfer_fence), "prefill upload transfer", job->device);
+    job->device->device.resetFences({job->transfer_fence, job->joined_fence});
+    job->pending = false;
+    job->joining = false;
+    job->transfer.reset();
+    job->regions.clear();
+    job->staging.reset();
+    ggml_vk_command_pool_cleanup(job->device, job->pool);
+    return true;
+}
+
+static void ggml_backend_vk_prefill_upload_destroy(void * handle) {
+    auto * job = static_cast<ggml_vk_prefill_upload *>(handle);
+    if (!job) {
+        return;
+    }
+    try {
+        ggml_backend_vk_prefill_upload_wait(job);
+    } catch (const std::exception & err) {
+        GGML_LOG_ERROR("ggml_vulkan: prefill upload cleanup: %s\n", err.what());
+        try {
+            job->device->device.waitIdle();
+        } catch (...) {
+        }
+    }
+    job->transfer.reset();
+    job->pool.destroy(job->device->device);
+    job->device->device.destroySemaphore(job->ready);
+    job->device->device.destroyFence(job->transfer_fence);
+    job->device->device.destroyFence(job->joined_fence);
+    delete job;
+}
+
+static void * ggml_backend_vk_prefill_upload_create(ggml_backend_t backend) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(backend);
+    return nullptr;
+#else
+    if (!ggml_backend_is_vk(backend)) {
+        return nullptr;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!ggml_vk_expert_overlap_supported(ctx->device) || vk_perf_logger_enabled) {
+        return nullptr;
+    }
+    auto * job = new ggml_vk_prefill_upload;
+    job->device = ctx->device;
+    try {
+        job->pool.init(job->device, job->device->transfer_queue.get());
+        job->ready = job->device->device.createSemaphore({});
+        job->transfer_fence = job->device->device.createFence({});
+        job->joined_fence = job->device->device.createFence({});
+    } catch (...) {
+        ggml_backend_vk_prefill_upload_destroy(job);
+        throw;
+    }
+    return job;
+#endif
+}
+
+static bool ggml_backend_vk_prefill_upload_pending(void * handle) {
+    const auto * job = static_cast<const ggml_vk_prefill_upload *>(handle);
+    return job && job->pending && job->device->device.getFenceStatus(job->transfer_fence) == vk::Result::eNotReady;
+}
+
+static bool ggml_backend_vk_prefill_upload_start(void * handle, ggml_tensor * const * weights,
+        const void * staging, const size_t * offsets, const size_t * sizes, const size_t * staging_offsets, size_t n,
+        const int32_t * protected_slots, size_t n_protected) {
+    auto * job = static_cast<ggml_vk_prefill_upload *>(handle);
+    if (!job || job->pending || !weights || !staging || !offsets || !sizes || !staging_offsets || !n || n > 30 ||
+            n_protected > 10 || (n_protected && !protected_slots)) {
+        return false;
+    }
+    vk_buffer pinned;
+    size_t pinned_offset = 0;
+    ggml_vk_host_get(job->device, staging, pinned, pinned_offset);
+    if (!pinned || !pinned->expert_concurrent || pinned->device != job->device || pinned_offset > pinned->size) {
+        return false;
+    }
+    std::vector<vk_buffer_region> regions;
+    regions.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const auto * weight = weights[i];
+        if (!weight || !weight->buffer || weight->view_src || !weight->data ||
+                !weight->nb[2] || sizes[i] != weight->nb[2] || offsets[i] % weight->nb[2] ||
+                offsets[i] / weight->nb[2] >= uint64_t(weight->ne[2]) ||
+                weight->buffer->buft != &job->device->buffer_type) {
+            return false;
+        }
+        const auto & dst = static_cast<const ggml_backend_vk_buffer_context *>(weight->buffer->context)->dev_buffer;
+        for (size_t slot = 0; slot < n_protected; ++slot) {
+            if (offsets[i] / weight->nb[2] == uint64_t(protected_slots[slot])) {
+                return false;
+            }
+        }
+        const size_t base = vk_tensor_offset(weight);
+        if (!dst || !dst->expert_concurrent || dst->device != job->device || base > dst->size ||
+                offsets[i] > dst->size - base || sizes[i] > dst->size - base - offsets[i] ||
+                staging_offsets[i] > pinned->size - pinned_offset ||
+                sizes[i] > pinned->size - pinned_offset - staging_offsets[i] ||
+                (base + offsets[i]) % 4 || (pinned_offset + staging_offsets[i]) % 4 || sizes[i] % 4) {
+            return false;
+        }
+        regions.push_back({dst, base + offsets[i], const_cast<uint8_t *>(static_cast<const uint8_t *>(staging)) + staging_offsets[i], sizes[i]});
+    }
+    job->transfer = ggml_vk_create_temporary_context(job->pool);
+    ggml_vk_ctx_begin(job->device, job->transfer);
+    if (ggml_vk_buffer_write_n_async(job->transfer, regions.data(), regions.size()) != regions.size()) {
+        job->transfer.reset();
+        ggml_vk_command_pool_cleanup(job->device, job->pool);
+        return false;
+    }
+    // The private pool and semaphore stay alive across ordinary graph cleanup.
+    job->transfer->s->signal_semaphores.push_back({job->ready, 0});
+    ggml_vk_ctx_end(job->transfer);
+    job->regions = std::move(regions);
+    job->staging = std::move(pinned);
+    try {
+        ggml_vk_submit(job->transfer, job->transfer_fence);
+    } catch (...) {
+        try {
+            job->device->device.waitIdle();
+        } catch (...) {
+        }
+        throw;
+    }
+    job->pending = true;
+    return true;
+}
+
 static const ggml_tensor * ggml_vk_overlap_first_projection(const ggml_cgraph * graph, const ggml_tensor * map) {
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto * node = graph->nodes[i];
@@ -18237,6 +18392,21 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_overlap_expert_upload") == 0) {
         return (void *) ggml_backend_vk_overlap_expert_upload;
+    }
+    if (strcmp(name, "ggml_backend_vk_prefill_upload_create") == 0) {
+        return (void *) ggml_backend_vk_prefill_upload_create;
+    }
+    if (strcmp(name, "ggml_backend_vk_prefill_upload_start") == 0) {
+        return (void *) ggml_backend_vk_prefill_upload_start;
+    }
+    if (strcmp(name, "ggml_backend_vk_prefill_upload_wait") == 0) {
+        return (void *) ggml_backend_vk_prefill_upload_wait;
+    }
+    if (strcmp(name, "ggml_backend_vk_prefill_upload_pending") == 0) {
+        return (void *) ggml_backend_vk_prefill_upload_pending;
+    }
+    if (strcmp(name, "ggml_backend_vk_prefill_upload_destroy") == 0) {
+        return (void *) ggml_backend_vk_prefill_upload_destroy;
     }
     if (strcmp(name, "ggml_backend_vk_alloc_transfer_host_upload_buffer") == 0) {
         return (void *) ggml_backend_vk_alloc_transfer_host_upload_buffer;

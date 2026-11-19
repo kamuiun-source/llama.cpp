@@ -579,6 +579,28 @@ struct llama_moe_cache::impl {
     uint64_t prefill_tick_max_delta = 0;
     uint64_t prefill_tick_age_sum = 0;
     uint64_t prefill_native_steps = 0;
+    bool prefill_overlap_ten = false;
+    using prefill_create_t = void * (*)(ggml_backend_t);
+    using prefill_start_t = bool (*)(void *, ggml_tensor * const *, const void *, const size_t *, const size_t *, const size_t *, size_t, const int32_t *, size_t);
+    using prefill_wait_t = bool (*)(void *);
+    using prefill_pending_t = bool (*)(void *);
+    using prefill_destroy_t = void (*)(void *);
+    prefill_create_t prefill_create = nullptr;
+    prefill_start_t prefill_start = nullptr;
+    prefill_wait_t prefill_wait = nullptr;
+    prefill_pending_t prefill_pending = nullptr;
+    prefill_destroy_t prefill_destroy = nullptr;
+    void * compact_upload_job = nullptr;
+    bool compact_upload_attempted = false;
+    bool compact_transfer_pending = false;
+    bool compact_window_checked = false;
+    std::array<std::vector<float>, 3> compact_overlap_scales;
+    uint64_t prefill_overlap_submits = 0;
+    uint64_t prefill_overlap_bytes = 0;
+    uint64_t prefill_overlap_fallbacks = 0;
+    uint64_t prefill_overlap_windows = 0;
+    uint64_t prefill_overlap_pending_windows = 0;
+    uint64_t prefill_overlap_fallback_layers = 0;
 
     void write_prompt_trace(const std::string & row) {
         if (fwrite(row.data(), 1, row.size(), prompt_trace) != row.size() || fflush(prompt_trace) != 0) {
@@ -807,6 +829,16 @@ struct llama_moe_cache::impl {
             const char * logical_ticks = std::getenv("LLAMA_EXPERT_PREFILL_LOGICAL_TICKS");
             prefill_logical_ticks = placement->prefill_tokens == 512 &&
                 logical_ticks && std::strcmp(logical_ticks, "1") == 0;
+            const char * overlap_ten = std::getenv("LLAMA_EXPERT_PREFILL_OVERLAP_TEN");
+            prefill_overlap_ten = placement->prefill_tokens == 512 &&
+                (!overlap_ten || std::strcmp(overlap_ten, "0") != 0);
+            if (prefill_overlap_ten && reg) {
+                prefill_create = reinterpret_cast<prefill_create_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefill_upload_create"));
+                prefill_start = reinterpret_cast<prefill_start_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefill_upload_start"));
+                prefill_wait = reinterpret_cast<prefill_wait_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefill_upload_wait"));
+                prefill_pending = reinterpret_cast<prefill_pending_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefill_upload_pending"));
+                prefill_destroy = reinterpret_cast<prefill_destroy_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefill_upload_destroy"));
+            }
             return;
         }
 
@@ -1072,6 +1104,10 @@ struct llama_moe_cache::impl {
     ~impl() {
         // The context synchronizes its backends before destroying the cache.
         GGML_ASSERT(!pending_writeback);
+        if (compact_upload_job) {
+            prefill_destroy(compact_upload_job);
+            compact_upload_job = nullptr;
+        }
         restore_packed_ram_slots();
         log_stats();
         if (trace != nullptr) {
@@ -1369,8 +1405,13 @@ struct llama_moe_cache::impl {
             if (!scale) {
                 continue;
             }
-            std::vector<float> all(ggml_nelements(scale));
-            ggml_backend_tensor_get(scale, all.data(), 0, all.size() * sizeof(float));
+            std::vector<float> all;
+            if (compact_upload_job) {
+                all = compact_overlap_scales[plane];
+            } else {
+                all.resize(ggml_nelements(scale));
+                ggml_backend_tensor_get(scale, all.data(), 0, all.size() * sizeof(float));
+            }
             for (const auto lane : lanes) {
                 scales[plane].push_back(all[selected[lane]]);
             }
@@ -1436,18 +1477,117 @@ struct llama_moe_cache::impl {
             token_rows.push_back(lane / ranks);
             physical.push_back(slots[selected[lane]]);
         }
-        ggml_backend_tensor_set(rows, token_rows.data(), 0, count * sizeof(int32_t));
-        ggml_backend_tensor_set(mm_ids, physical.data(), 0, count * sizeof(int32_t));
-        ggml_backend_tensor_set(scatter, lanes.data(), 0, count * sizeof(int32_t));
+        auto set_input = [&](ggml_tensor * tensor, const void * data, size_t bytes) {
+            if (compact_transfer_pending) {
+                ggml_backend_tensor_set_async(backend, tensor, data, 0, bytes);
+            } else {
+                ggml_backend_tensor_set(tensor, data, 0, bytes);
+            }
+        };
+        set_input(rows, token_rows.data(), count * sizeof(int32_t));
+        set_input(mm_ids, physical.data(), count * sizeof(int32_t));
+        set_input(scatter, lanes.data(), count * sizeof(int32_t));
         for (size_t plane = 0; plane < scales.size(); ++plane) {
             if (scale_inputs[plane]) {
-                ggml_backend_tensor_set(scale_inputs[plane], scales[plane].data(), 0, count * sizeof(float));
+                set_input(scale_inputs[plane], scales[plane].data(), count * sizeof(float));
             }
         }
-        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        const auto status = compact_transfer_pending ? ggml_backend_graph_compute_async(backend, graph) :
+            ggml_backend_graph_compute(backend, graph);
+        if (compact_transfer_pending) {
+            if (!compact_window_checked) {
+                ++prefill_overlap_windows;
+                prefill_overlap_pending_windows += prefill_pending(compact_upload_job);
+                compact_window_checked = true;
+            }
+            ggml_backend_synchronize(backend);
+        }
+        if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("compact prefill execution failed");
         }
         ++compact_chunks;
+    }
+
+    void compact_wait_upload() {
+        if (compact_transfer_pending) {
+            if (!prefill_wait(compact_upload_job)) {
+                throw std::runtime_error("could not join compact prefill upload");
+            }
+            compact_transfer_pending = false;
+        }
+    }
+
+    std::vector<int32_t> compact_upload_ten(ggml_backend_t backend, layer & l, int32_t il,
+            const std::vector<int32_t> & cold, size_t begin, int32_t bank, const std::vector<int32_t> & protected_slots,
+            std::array<int32_t, llama_expert_profile::n_experts> & slots, size_t & uploaded) {
+        GGML_ASSERT(!compact_transfer_pending);
+        const auto & map = placement->maps[il];
+        constexpr size_t max_regions = 30;
+        std::array<ggml_tensor *, max_regions> weights{};
+        std::array<size_t, max_regions> offsets{}, sizes{}, staging_offsets{};
+        size_t regions = 0;
+        size_t tuple_bytes = 0;
+        for (const auto * host : l.experts) {
+            tuple_bytes += host->nb[2];
+        }
+        auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        const size_t capacity = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
+        size_t used = size_t(bank) * 10 * tuple_bytes;
+        const size_t start = used;
+        fills.clear();
+        std::vector<int32_t> wave;
+        for (size_t index = 0; index < 10 && begin + index < cold.size(); ++index) {
+            const int32_t scratch = bank * 10 + index;
+            const int32_t physical = packed_slot(l, scratch);
+            if (std::find(protected_slots.begin(), protected_slots.end(), physical) != protected_slots.end()) {
+                throw std::runtime_error("compact prefill upload would overwrite an active physical slot");
+            }
+            const auto expert = cold[begin + index];
+            fills.push_back({expert, scratch});
+            wave.push_back(expert);
+            slots[expert] = physical;
+        }
+        for (const auto & fill : fills) {
+            l.packed_scratch[fill.slot] = -1;
+        }
+        for (const auto & fill : fills) {
+            const int32_t host_slot = map.host[fill.expert];
+            for (auto * host : l.experts) {
+                const auto & binding = bindings.at(host);
+                const size_t stride = host->nb[2];
+                if (host_slot < 0 || regions == max_regions || used > capacity || stride > capacity - used) {
+                    throw std::runtime_error("invalid compact prefill upload staging range");
+                }
+                weights[regions] = binding.cached;
+                offsets[regions] = size_t(packed_slot(l, fill.slot)) * stride;
+                sizes[regions] = stride;
+                staging_offsets[regions++] = used;
+                size_t no_retry = 0;
+                copy_upload_staging(staging + used, packed_host_data(l, host, host_slot, binding.packed_offset), stride, no_retry);
+                used += stride;
+            }
+        }
+        const size_t bytes = used - start;
+        bool submitted = false;
+        try {
+            submitted = prefill_start(compact_upload_job, weights.data(), staging, offsets.data(), sizes.data(),
+                    staging_offsets.data(), regions, protected_slots.data(), protected_slots.size());
+        } catch (...) {
+            prefill_destroy(compact_upload_job);
+            compact_upload_job = nullptr;
+            throw;
+        }
+        if (submitted) {
+            compact_transfer_pending = true;
+            ++prefill_overlap_submits;
+            prefill_overlap_bytes += bytes;
+            uploaded += bytes;
+        } else {
+            // No transfer was submitted. The ordinary uploader can safely repack these planes.
+            ++prefill_overlap_fallbacks;
+            uploaded += upload_packed(backend, l, il, false, nullptr, bytes);
+        }
+        return wave;
     }
 
     void compact_execute(layer & l, ggml_tensor * dst) {
@@ -1514,30 +1654,90 @@ struct llama_moe_cache::impl {
                 compact_chunk(backend, l, dst, lanes, selected, slots);
             }
         };
+        if (prefill_overlap_ten && !compact_upload_attempted && !cold.empty()) {
+            compact_upload_attempted = true;
+            if (placement->n_slots == 20 && packed_staging && prefill_create && prefill_start && prefill_wait && prefill_pending && prefill_destroy) {
+                compact_upload_job = prefill_create(backend);
+            }
+        }
+        if (compact_upload_job) {
+            for (size_t plane = 0; plane < l.compact_scales.size(); ++plane) {
+                auto * scale = l.compact_scales[plane];
+                auto & values = compact_overlap_scales[plane];
+                values.clear();
+                if (scale) {
+                    values.resize(ggml_nelements(scale));
+                    ggml_backend_tensor_get(scale, values.data(), 0, values.size() * sizeof(float));
+                }
+            }
+        }
+        struct upload_scope {
+            impl & owner;
+            ~upload_scope() {
+                try {
+                    owner.compact_wait_upload();
+                } catch (const std::exception & err) {
+                    LLAMA_LOG_ERROR("compact prefill upload cleanup: %s\n", err.what());
+                    owner.prefill_destroy(owner.compact_upload_job);
+                    owner.compact_upload_job = nullptr;
+                    owner.compact_transfer_pending = false;
+                }
+            }
+        } upload_cleanup{*this};
+        // All initial scratch hits must finish before either scratch bank is overwritten.
         execute(hot);
         size_t uploaded = 0;
-        for (size_t begin = 0; begin < cold.size(); begin += placement->n_slots) {
-            fills.clear();
-            std::vector<int32_t> wave;
-            for (size_t index = 0; index < size_t(placement->n_slots) && begin + index < cold.size(); ++index) {
-                const auto expert = cold[begin + index];
-                l.packed_scratch[index] = -1;
-                fills.push_back({expert, int32_t(index)});
-                slots[expert] = packed_slot(l, index);
-                wave.push_back(expert);
+        if (compact_upload_job && !cold.empty()) {
+            auto wave = compact_upload_ten(backend, l, il, cold, 0, 0, {}, slots, uploaded);
+            compact_wait_upload();
+            for (const auto & fill : fills) {
+                l.packed_scratch[fill.slot] = fill.expert;
             }
-            try {
-                uploaded += upload_packed(backend, l, il, false);
-                for (const auto & fill : fills) {
-                    l.packed_scratch[fill.slot] = fill.expert;
+            for (size_t begin = 0; begin < cold.size(); begin += 10) {
+                std::vector<int32_t> next;
+                if (begin + 10 < cold.size()) {
+                    std::vector<int32_t> protected_slots;
+                    for (const auto expert : wave) {
+                        protected_slots.push_back(slots[expert]);
+                    }
+                    next = compact_upload_ten(backend, l, il, cold, begin + 10, ((begin / 10) + 1) % 2,
+                            protected_slots, slots, uploaded);
                 }
-            } catch (...) {
-                for (const auto & fill : fills) {
-                    l.packed_scratch[fill.slot] = -1;
+                compact_window_checked = false;
+                execute(wave);
+                if (!next.empty()) {
+                    compact_wait_upload();
+                    for (const auto & fill : fills) {
+                        l.packed_scratch[fill.slot] = fill.expert;
+                    }
+                    wave = std::move(next);
                 }
-                throw;
             }
-            execute(wave);
+        } else {
+    for (size_t begin = 0; begin < cold.size(); begin += placement->n_slots) {
+                prefill_overlap_fallback_layers += prefill_overlap_ten && begin == 0;
+                fills.clear();
+                std::vector<int32_t> wave;
+                for (size_t index = 0; index < size_t(placement->n_slots) && begin + index < cold.size(); ++index) {
+                    const auto expert = cold[begin + index];
+                    l.packed_scratch[index] = -1;
+                    fills.push_back({expert, int32_t(index)});
+                    slots[expert] = packed_slot(l, index);
+                    wave.push_back(expert);
+                }
+                try {
+                    uploaded += upload_packed(backend, l, il, false);
+                    for (const auto & fill : fills) {
+                        l.packed_scratch[fill.slot] = fill.expert;
+                    }
+                } catch (...) {
+                    for (const auto & fill : fills) {
+                        l.packed_scratch[fill.slot] = -1;
+                    }
+                    throw;
+                }
+                execute(wave);
+            }
         }
         stats_small.hits += hot_lanes;
         packed_scratch_hits += scratch_lanes;
@@ -2272,6 +2472,13 @@ struct llama_moe_cache::impl {
                     placement->prefill_tokens ? placement->prefill_tokens : placement->max_ubatch,
                     prompt_ubatches, prompt_tokens, prompt_max_tokens, decode_max_tokens, prompt_layer_steps, prompt_uploads, prompt_upload_bytes,
                     compact_chunks, compact_workspace ? ggml_backend_buffer_get_size(compact_workspace.get()) : 0);
+            if (prefill_overlap_ten) {
+                LLAMA_LOG_INFO("packed expert prefill overlap10: enabled=1 job=%d scratch_slots=20 bank_slots=10"
+                        " transfer_submits=%" PRIu64 " transfer_bytes=%" PRIu64 " compute_windows=%" PRIu64
+                        " pending_windows=%" PRIu64 " fallback_groups=%" PRIu64 " fallback_layers=%" PRIu64 "\n",
+                        compact_upload_job != nullptr, prefill_overlap_submits, prefill_overlap_bytes, prefill_overlap_windows,
+                        prefill_overlap_pending_windows, prefill_overlap_fallbacks, prefill_overlap_fallback_layers);
+            }
             if (placement->prefill_tokens == 512) {
                 LLAMA_LOG_INFO("packed expert prefill ticks: enabled=%d layer_steps=%" PRIu64 " tokens=%" PRIu64
                         " advanced_ticks=%" PRIu64 " min_delta=%" PRIu64 " max_delta=%" PRIu64

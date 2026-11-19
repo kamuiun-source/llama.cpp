@@ -90,6 +90,7 @@ def build_environment():
         "LLAMA_DECODE_TELEMETRY": None,
         "LLAMA_DECODE_TELEMETRY_PER_RESPONSE": None,
         "LLAMA_EXPERT_PREFILL_STATS": "1",
+        "LLAMA_EXPERT_PREFILL_OVERLAP_TEN": "0",
     })
     return settings
 
@@ -559,6 +560,15 @@ def historical_upload_reference(archived_case, result):
         return {"source": str(source), "historical_prompt_uploads": None, "note": f"Reference unavailable: {error}"}
 
 
+def archived_environment(case, environment):
+    environment = dict(environment)
+    if environment.get("LLAMA_EXPERT_PREFILL_OVERLAP_TEN") in (None, "0"):
+        log = (case / "llama.log").read_text(encoding="utf-8", errors="replace")
+        require("packed expert prefill overlap10:" not in log, "archived OFF environment has overlap10 activation")
+        environment["LLAMA_EXPERT_PREFILL_OVERLAP_TEN"] = "0"
+    return environment
+
+
 def recover_baseline(directory, expected_environment, *, archived=True, decode_expert_window=False, last_use_off=False):
     case = directory / ("width-512-last-use-off" if last_use_off else "width-2")
     provenance = read_json(directory / "run.json")
@@ -579,7 +589,7 @@ def recover_baseline(directory, expected_environment, *, archived=True, decode_e
     require(message == (f"--- File: {INPUT_PATH} ---\n".encode() + attachment) * 2 + QUESTION.encode("utf-8"),
             "archived message differs from the reconstructed benchmark input")
     settings = read_json(case / "settings.json")
-    environment = settings["environment"]
+    environment = archived_environment(case, settings["environment"])
     required_environment = dict(expected_environment, LLAMA_EXPERT_PREFILL_512="1" if last_use_off else None)
     if last_use_off:
         required_environment.update({LAST_USE_ENV: None, EARLY_DECODE_ENV: "1"})
@@ -680,7 +690,7 @@ def recover_report(directory):
     for option, filename in (("--log-file", "llama.log"), ("--output-file", "transcript.txt")):
         args[argument_index(args, option)] = str(case / filename)
     require(candidate_settings["arguments"] == args
-            and candidate_settings["environment"] == dict(environment, LLAMA_EXPERT_PREFILL_512="1"),
+            and archived_environment(case, candidate_settings["environment"]) == dict(environment, LLAMA_EXPERT_PREFILL_512="1"),
             "recovered width-512 arguments or environment differ")
     exit_status = case / "exit.txt"
     has_exit_status = exit_status.is_file()
