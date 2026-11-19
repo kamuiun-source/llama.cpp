@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -62,7 +63,16 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
     }()), dynamic_resident(!overlap &&
-        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0) {
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0), prefill_tokens([] {
+        const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
+        const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
+        const bool small = value && std::strcmp(value, "1") == 0;
+        const bool large = wide && std::strcmp(wide, "1") == 0;
+        if (small && large) {
+            throw std::runtime_error("select only one packed expert prefill experiment");
+        }
+        return large ? 512 : small ? 32 : 0;
+    }()) {
     if (max_ubatch > 1 && !dynamic_resident) {
         throw std::runtime_error("packed expert batching requires dynamic Vulkan residency");
     }
@@ -74,6 +84,10 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     if (overlap && (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
             !std::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE"))) {
         throw std::runtime_error("expert overlap requires Vulkan and GGML_VK_ASYNC_USE_TRANSFER_QUEUE");
+    }
+    const char * rtx_cold = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
+    if (prefill_tokens && (max_ubatch != 2 || !dynamic_resident || (rtx_cold && std::strcmp(rtx_cold, "0") != 0))) {
+        throw std::runtime_error("packed expert prefill requires two-token dynamic residency and RTX cold assist off");
     }
     const auto selected = read_profile(path);
     for (int il = 0; il < n_layers; ++il) {
@@ -94,6 +108,14 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     if (!host_ctx || !bank_ctx || (overlap && !cold_ctx)) {
         throw std::runtime_error("could not create packed expert contexts");
     }
+}
+
+int32_t llama_expert_placement::prefill_waves(int64_t n_tokens, int64_t n_used) const {
+    if (prefill_tokens > 32 || n_tokens <= max_ubatch || n_tokens > prefill_tokens || n_used <= 0 || n_used > n_slots / max_ubatch) {
+        return 0;
+    }
+    const int32_t max_cold = std::min<int64_t>(n_experts - n_resident, n_tokens * n_used);
+    return (max_cold + n_slots - 1) / n_slots;
 }
 
 ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * source, uint16_t shard, size_t offset) {

@@ -9,16 +9,25 @@ param(
     [switch]$HcInjectSplit,
     [switch]$HcAll,
     [switch]$ExpertRamCopyTiming,
+    [switch]$ExpertPrefill32,
+    [switch]$ExpertPrefillActiveWaves,
+    [switch]$ExpertPrefillTrace,
     [string]$BuildDirectory = 'G:\AI\build-prefill32'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($ExpertPrefillActiveWaves -and !$ExpertPrefill32) {
+    throw 'ExpertPrefillActiveWaves requires ExpertPrefill32.'
+}
 $projections = @(
     @{ Name='down'; Enabled=($HcAll -or $HcDownReuse); Key='GGML_CUDA_HC_DOWN_REUSE'; Marker='CUDA HC down reuse applied' }
     @{ Name='up'; Enabled=($HcAll -or $HcUpReuse); Key='GGML_CUDA_HC_UP_REUSE'; Marker='CUDA HC up reuse applied' }
     @{ Name='inject'; Enabled=($HcAll -or $HcInjectSplit); Key='GGML_CUDA_HC_INJECT_SPLIT'; Marker='CUDA HC inject split applied' }
 )
 $activeProjections = @($projections | Where-Object { $_.Enabled })
+if ($ExpertPrefillTrace -and ($Mode -ne 'speed' -or $ExpertPrefill32 -or $ExpertRamCopyTiming -or $HcUpPair -or $HcScaleSilu -or $activeProjections.Count)) {
+    throw 'ExpertPrefillTrace requires -Mode speed and the standard Expert and HC settings.'
+}
 if (($HcUpPair -and $HcScaleSilu) -or (($HcUpPair -or $HcScaleSilu) -and $activeProjections.Count)) {
     throw 'Run the legacy HC experiment separately from the new projection experiments.'
 }
@@ -39,7 +48,7 @@ $retiredKeys = @(
     'LLAMA_MTP_DEVICE_PENDING', 'GGML_CUDA_SSM_CONV_HISTORY', 'GGML_SCHED_OVERLAP_SHARED_READBACK'
 )
 $baselineEnvironment = @($settings.Environment.PSObject.Properties | Where-Object { $_.Name -notin $retiredKeys })
-$keys = @($baselineEnvironment.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_PROFILE_RAM_COPY') + @($projections | ForEach-Object { $_.Key })
+$keys = @($baselineEnvironment.Name) + @('PATH', 'LLAMA_DECODE_TELEMETRY_PER_RESPONSE', 'GGML_CUDA_HC_MIX_FUSE', 'GGML_CUDA_HC_SCALE_SILU_FUSE', 'GGML_CUDA_HC_UP_PAIR', 'LLAMA_EXPERT_RTX_COLD_SLOTS', 'LLAMA_EXPERT_PROFILE_RAM_COPY', 'LLAMA_EXPERT_PREFILL_32', 'LLAMA_EXPERT_PREFILL_ACTIVE_WAVES', 'LLAMA_EXPERT_PREFILL_TRACE') + @($projections | ForEach-Object { $_.Key })
 $keys = @($keys | Select-Object -Unique)
 $saved = @{}
 foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
@@ -47,8 +56,15 @@ $projectionLabel = if ($activeProjections.Count -eq $projections.Count) { 'hc-al
     elseif ($activeProjections.Count) { 'hc-' + (($activeProjections | ForEach-Object { $_.Name }) -join '-') + '-' }
     else { '' }
 $ramLabel = if ($ExpertRamCopyTiming) { 'ram-timing-' } else { '' }
-$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
+$prefillLabel = if ($ExpertPrefill32) { 'prefill32-' } else { '' }
+if ($ExpertPrefillActiveWaves) { $prefillLabel += 'active-waves-' }
+$runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-$Mode-$projectionLabel$ramLabel$prefillLabel" + (Get-Date -Format yyyyMMdd-HHmmss))
+if ($ExpertPrefillTrace) {
+    $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $runDir = Join-Path 'G:\AI\llama-hetero-moe-local\logs' ("dialogue-prefill-trace-" + (Get-Date -Format yyyyMMdd-HHmmss) + "-$suffix")
+}
 New-Item -ItemType Directory -Path $runDir | Out-Null
+$tracePath = Join-Path $runDir 'expert-prefill.jsonl'
 
 try {
     foreach ($item in $baselineEnvironment) {
@@ -57,6 +73,9 @@ try {
     if ($env:CUDA_PATH) { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH" }
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_RTX_COLD_SLOTS', $null, 'Process')
     [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PROFILE_RAM_COPY', $(if ($ExpertRamCopyTiming) { '1' } else { $null }), 'Process')
+    [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PREFILL_32', $(if ($ExpertPrefill32) { '1' } else { $null }), 'Process')
+    [Environment]::SetEnvironmentVariable('LLAMA_EXPERT_PREFILL_ACTIVE_WAVES', $(if ($ExpertPrefillActiveWaves) { '1' } else { $null }), 'Process')
+    $env:LLAMA_EXPERT_PREFILL_TRACE = if ($ExpertPrefillTrace) { $tracePath } else { $null }
     [Environment]::SetEnvironmentVariable('LLAMA_DECODE_TELEMETRY_PER_RESPONSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_MIX_FUSE', $null, 'Process')
     [Environment]::SetEnvironmentVariable('GGML_CUDA_HC_SCALE_SILU_FUSE', $(if ($HcScaleSilu) { '1' } else { $null }), 'Process')
@@ -79,7 +98,7 @@ try {
     foreach ($key in $keys) {
         if ($key -ne 'PATH') { $effective[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
     }
-    @{ Mode=$Mode; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed' -or $ExpertRamCopyTiming) } |
+    @{ Mode=$Mode; Cli=$cli; Environment=$effective; Instrumented=($Mode -ne 'speed' -or $ExpertRamCopyTiming -or $ExpertPrefillTrace) } |
         ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'settings.json') -Encoding UTF8
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\research\dialogue-benchmark-prompts.md') -Destination $runDir
     $runArgs = @('-lv', '4', '--log-file', (Join-Path $runDir 'dialogue.log'), '--simple-io', '--color', 'off',
@@ -89,7 +108,14 @@ try {
         '--spec-type', 'draft-mtp', '-md', $draft, '-devd', 'CUDA0', '-ngld', 'all',
         '--spec-draft-n-max', '1', '--spec-draft-n-ubatch', '1')
     $runArgs | ConvertTo-Json | Set-Content (Join-Path $runDir 'arguments.json') -Encoding UTF8
-    Write-Host "Mode: $Mode. Send the five saved prompts in order, then /exit."
+    if ($ExpertPrefillTrace) {
+        Write-Host 'Send the five saved prompts in order, then /exit.'
+        Write-Host 'For a separate long-prompt trace, start a fresh run and enter this command before asking one short question:'
+        Write-Host ("/read " + [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\research\dialogue-benchmark-prompts.md')))
+        Write-Host 'Enter it twice to give the wider windows enough tokens, then ask one short question and /exit after the answer.'
+    } else {
+        Write-Host "Mode: $Mode. Send the five saved prompts in order, then /exit."
+    }
     try {
         $ErrorActionPreference = 'Continue'
         & $cli @runArgs 2> (Join-Path $runDir 'stderr.log')
@@ -99,6 +125,13 @@ try {
     }
     "exit_code=$code" | Set-Content (Join-Path $runDir 'exit.txt')
     if ($code -ne 0) { throw "llama-cli failed: $code" }
+    if ($ExpertPrefillTrace -and (!(Test-Path -LiteralPath $tracePath -PathType Leaf) -or (Get-Item -LiteralPath $tracePath).Length -eq 0)) {
+        throw 'Expert Prefill trace was not recorded. Check the binary and prompt coverage.'
+    }
+    if ($ExpertPrefillTrace) {
+        $compareScript = Join-Path $PSScriptRoot 'compare-expert-prefill.py'
+        Write-Host "Compare the trace with: python `"$compareScript`" `"$runDir`" --per-layer"
+    }
     $dialogueLog = Join-Path $runDir 'dialogue.log'
     if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch 'CUDA SSM convolution history applied' -Quiet)) {
         Write-Warning 'CUDA SSM convolution history was not observed.'
@@ -112,8 +145,13 @@ try {
     if (!(Select-String -LiteralPath $dialogueLog -Pattern 'shared host expert return: copies=[1-9][0-9]*' -Quiet)) {
         Write-Warning 'Shared host Expert return copies were not observed.'
     }
-    if ($ExpertRamCopyTiming -and !(Select-String -LiteralPath $dialogueLog -SimpleMatch 'packed expert promotion RAM memcpy:' -Quiet)) {
-        throw 'Expert RAM copy timing did not activate. Check the binary and dynamic Expert placement.'
+    if ($ExpertRamCopyTiming) {
+        if (!(Select-String -LiteralPath $dialogueLog -Pattern 'expert_staging_copy: phase=target_verify verify_calls=[1-9][0-9]*\b' -Quiet)) {
+            throw 'Expert staging copy timing recorded no target verification calls. Check the binary and MTP draft activity.'
+        }
+        if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch 'packed expert promotion RAM memcpy:' -Quiet)) {
+            throw 'Expert RAM copy timing did not activate. Check the binary and dynamic Expert placement.'
+        }
     }
     if (!(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: rotations=[1-9][0-9]*' -Quiet)) {
         if (!(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert RAM rotation: .*pool_bytes=[1-9][0-9]*' -Quiet)) {
@@ -121,6 +159,12 @@ try {
         } else {
             Write-Warning 'The Expert RAM rotation pool was allocated, but this run performed no rotations.'
         }
+    }
+    if ($ExpertPrefill32 -and !(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert prefill: layer_batches=[1-9][0-9]* max_tokens=(?:[3-9]|[1-3][0-9]) ' -Quiet)) {
+        throw 'The grouped Expert prefill path did not process a batch larger than two tokens.'
+    }
+    if ($ExpertPrefillActiveWaves -and !(Select-String -LiteralPath $dialogueLog -Pattern 'packed expert prefill waves: active_only=1 executed=[1-9][0-9]* skipped=[1-9][0-9]*' -Quiet)) {
+        throw 'Active Expert prefill did not skip any waves. Check the binary and prompt coverage.'
     }
     foreach ($projection in $activeProjections) {
         if (!(Select-String -LiteralPath $dialogueLog -SimpleMatch $projection.Marker -Quiet)) {

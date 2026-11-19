@@ -165,7 +165,7 @@ struct llama_context {
                               bool   profile = false);
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true);
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -276,6 +276,7 @@ private:
 
 public:
     uint32_t graph_max_nodes() const;
+    uint32_t n_ubatch_prefill() const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -283,6 +284,7 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool profile = false);
     void get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const;
+    llama_expert_round_stats get_expert_round_stats() const;
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(

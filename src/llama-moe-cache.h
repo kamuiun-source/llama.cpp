@@ -7,6 +7,8 @@
 #include <vector>
 
 struct llama_model;
+struct llama_ubatch;
+struct llama_expert_round_stats;
 class llama_rtx_expert;
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
@@ -21,10 +23,20 @@ public:
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
     bool requires_slots(int32_t il) const;
+    bool compact_prefill(int64_t n_tokens) const;
+    ggml_tensor * build_compact_prefill(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * ids, int32_t il,
+            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, ggml_tensor * gate_up,
+            ggml_tensor * up_scale, ggml_tensor * gate_scale, ggml_tensor * down_scale) const;
+    void begin_prompt_trace(const llama_ubatch & ubatch, uint32_t batch_tokens, uint32_t batch_offset);
+    void end_prompt_trace(bool success);
+    void record_decode_width(uint32_t tokens);
+    llama_expert_round_stats round_stats() const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
+    int32_t get_prefill_waves(int32_t il, int64_t n_tokens, int64_t n_used) const;
+    ggml_tensor * get_prefill_map(int32_t il, int32_t wave) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w, bool cold = false) const;

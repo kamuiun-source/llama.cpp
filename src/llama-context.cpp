@@ -369,6 +369,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: packed expert batch capacity = %d, n_ubatch = %u, n_rs_seq = %u\n",
                     __func__, placement->max_ubatch, cparams.n_ubatch, cparams.n_rs_seq);
         }
+        if (placement->prefill_tokens) {
+            LLAMA_LOG_INFO("%s: packed expert prefill capacity = %u\n", __func__, n_ubatch_prefill());
+        }
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
@@ -568,7 +571,9 @@ llama_context::llama_context(
             /*.no_alloc  =*/ model.no_alloc(),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        auto cparams_mem = cparams;
+        cparams_mem.n_ubatch = n_ubatch_prefill();
+        memory.reset(model.create_memory(params_mem, cparams_mem));
     }
 
     // init backends
@@ -838,7 +843,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_prefill());
 
     const size_t max_nodes = this->graph_max_nodes();
 
@@ -1053,6 +1058,12 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+uint32_t llama_context::n_ubatch_prefill() const {
+    const auto * placement = model.expert_placement.get();
+    const uint32_t n_prefill = placement ? static_cast<uint32_t>(placement->prefill_tokens) : 0;
+    return std::max(cparams.n_ubatch, std::min(cparams.n_batch, n_prefill));
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -1114,7 +1125,7 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_prefill());
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -2232,7 +2243,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2346,9 +2357,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     memory_update(false);
 
     llama_memory_context_ptr mctx;
+    const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() : cparams.n_ubatch;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -2463,8 +2475,27 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        struct prompt_trace_scope {
+            llama_moe_cache * cache;
+            bool success = false;
+            ~prompt_trace_scope() {
+                if (cache) {
+                    try {
+                        cache->end_prompt_trace(success);
+                    } catch (const std::exception & err) {
+                        LLAMA_LOG_ERROR("prompt trace: %s\n", err.what());
+                    }
+                }
+            }
+        } prompt_trace{prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? moe_cache.get() : nullptr};
+        if (prompt_trace.cache) {
+            prompt_trace.cache->begin_prompt_trace(ubatch, n_tokens_all, n_tokens_prev);
+        } else if (moe_cache && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            moe_cache->record_decode_width(ubatch.n_tokens);
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
                 decode_profile && n_tokens_all == 1);
+        prompt_trace.success = res != nullptr;
 
         if (!res) {
             if (mtp_device_pending && state_backend) {
@@ -3281,6 +3312,10 @@ ggml_status llama_context::graph_compute(
 void llama_context::get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const {
     graphs = telemetry_graphs;
     splits = telemetry_splits;
+}
+
+llama_expert_round_stats llama_context::get_expert_round_stats() const {
+    return moe_cache ? moe_cache->round_stats() : llama_expert_round_stats{};
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -5350,6 +5385,7 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
     switch (type) {
         case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
         case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+        case LLAMA_PROCESS_TYPE_PREFILL: return ctx->decode(*batch, true);
     }
     return -1;
 }
@@ -5357,6 +5393,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 //
 // ext
 //
+
+int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode(*batch, true, false);
+}
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
@@ -5368,4 +5408,8 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 
 void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uint64_t & splits) {
     ctx->get_sched_telemetry(graphs, splits);
+}
+
+llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx) {
+    return ctx->get_expert_round_stats();
 }

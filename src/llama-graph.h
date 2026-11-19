@@ -1260,7 +1260,9 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                     bool   cpu_part,
                      int   il,
-                    bool   cold = false) const;
+                    bool   cold = false,
+                 int32_t   prefill_wave = -1,
+             ggml_tensor * prefill_ids = nullptr) const;
 
     //
     // inputs

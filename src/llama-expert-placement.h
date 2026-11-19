@@ -35,6 +35,8 @@ struct llama_expert_placement {
     const int32_t n_slots;
     const bool overlap;
     const bool dynamic_resident;
+    const int32_t prefill_tokens;
+    int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;
     mutable std::atomic<bool> context_in_use{false};
     std::array<layer_map, llama_expert_profile::n_layers> maps;
     std::vector<weight> weights;

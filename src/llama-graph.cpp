@@ -2436,7 +2436,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const std::array<ggml_tensor *, 4> exps = { up_exps, gate_exps, down_exps, gate_up_exps };
     const bool can_cpu_share = !weight_before_ffn && loras->empty() &&
         std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; });
-    const llm_graph_moe_cache_slots cache = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
+    const int32_t prefill_waves = moe_cache ? moe_cache->get_prefill_waves(il, n_tokens, n_expert_used) : 0;
+    const bool compact_prefill = moe_cache && moe_cache->compact_prefill(n_tokens);
+    if (compact_prefill && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || down_exps_b || post_exp_norm ||
+            type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f ||
+            (prec_policy && std::any_of(exps.begin(), exps.end(), [&](ggml_tensor * w) {
+                return w && (prec_policy->prec_src1.count(w) || prec_policy->prec_acc.count(w));
+            })))) {
+        throw std::runtime_error("compact prefill requires unclamped SiLU Experts without bias, rotation, LoRA, post norm or custom precision");
+    }
+    if (prefill_waves && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || type_op != LLM_FFN_SILU)) {
+        throw std::runtime_error("packed expert prefill requires bias-free gate/up projections, SiLU and no LoRA");
+    }
+    const llm_graph_moe_cache_slots cache = prefill_waves || compact_prefill ? llm_graph_moe_cache_slots{nullptr, nullptr} :
+        build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2609,7 +2622,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    ggml_tensor * experts = nullptr;
+    if (compact_prefill) {
+        experts = moe_cache->build_compact_prefill(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), selected_experts, il,
+                up_exps, gate_exps, down_exps, gate_up_exps, up_exps_s, gate_exps_s, down_exps_s);
+        if (!ggml_backend_sched_set_custom_op_backend(sched, experts, moe_cache->backend(il))) {
+            throw std::runtime_error("compact prefill requires single-copy custom dispatch on the placement backend");
+        }
+    } else if (prefill_waves) {
+        auto * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+        ggml_build_forward_expand(gf, ids);
+        for (int32_t wave = 0; wave < prefill_waves; ++wave) {
+            auto slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, false, wave, ids);
+            auto * out = build_experts(cur, selected_experts, slots.slots, true);
+            experts = experts ? ggml_add(ctx0, experts, out) : out;
+            if (wave > 0) {
+                ggml_set_name(experts, "ffn_moe_prefill_accumulator");
+            }
+            ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
+            // Complete one wave before the next slot map can replace its scratch weights.
+            ggml_build_forward_expand(gf, experts);
+        }
+    } else {
+        experts = build_experts(cur, selected_experts, cache.slots, true);
+    }
     if (moe_cache && moe_cache->get_cold_slot_map(il)) {
         if (gate_up_exps_b || gate_exps_b || up_exps_b || !loras->empty()) {
             throw std::runtime_error("expert overlap requires bias-free gate/up projections and no LoRA");
@@ -2646,8 +2683,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    if (down_exps_s) {
-        cb(experts, "ffn_moe_down_scaled", il);
+    if (down_exps_s && !compact_prefill) {
+        cb(experts, prefill_waves ? "ffn_moe_prefill_accumulator" : "ffn_moe_down_scaled", il);
     }
 
     if (down_exps_b) {
@@ -2711,7 +2748,9 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_up_exps,
                 bool   cpu_part,
                  int   il,
-                bool   cold) const {
+                bool   cold,
+             int32_t   prefill_wave,
+         ggml_tensor * prefill_ids) const {
     if (moe_cache == nullptr) {
         return { nullptr, nullptr };
     }
@@ -2724,7 +2763,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     };
 
     ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
-    ggml_tensor * slot_map = cold ? moe_cache->get_cold_slot_map(il) :
+    ggml_tensor * slot_map = prefill_wave >= 0 ? moe_cache->get_prefill_map(il, prefill_wave) :
+            cold ? moe_cache->get_cold_slot_map(il) :
             moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
     if (slot_map == nullptr) {
         return unavailable(format("no slots for %" PRId64 " tokens and %" PRId64 " selected experts", selected_experts->ne[1], selected_experts->ne[0]).c_str());
@@ -2745,11 +2785,11 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         }
     }
 
-    ggml_tensor * ids = selected_experts;
-    if (!ggml_is_contiguous(ids)) {
-        ids = ggml_cont(ctx0, ids);
+    ggml_tensor * ids = prefill_ids;
+    if (!ids) {
+        ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
     }
-    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
@@ -2770,7 +2810,11 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         cpu_ids = ggml_reshape_2d(ctx0, cpu_ids, selected_experts->ne[0], selected_experts->ne[1]);
     }
 
-    return { ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]), cpu_ids };
+    slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
+    if (prefill_wave >= 0) {
+        ggml_set_name(slots, "ffn_moe_prefill_slots");
+    }
+    return { slots, cpu_ids };
 }
 
 // input embeddings with optional lora

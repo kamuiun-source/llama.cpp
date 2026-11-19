@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+// Keep prompt accounting while using the normal decode microbatch capacity.
+LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
+
 //
 // llama architecture queries
 //
@@ -190,6 +193,31 @@ struct llama_expert_transfer_telemetry {
     uint64_t writeback_bytes = 0;
 };
 LLAMA_API llama_expert_transfer_telemetry llama_get_expert_transfer_telemetry();
+
+struct llama_expert_staging_telemetry {
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+    uint64_t us = 0;
+    uint64_t fill_ge2_bytes = 0;
+    uint64_t fill_ge2_us = 0;
+    uint64_t retry_bytes = 0;
+    uint64_t retry_us = 0;
+};
+LLAMA_API llama_expert_staging_telemetry llama_get_expert_staging_telemetry();
+LLAMA_API int64_t llama_set_expert_prompt_trace_request(int64_t request);
+
+struct llama_expert_round_stats {
+    uint64_t requests = 0;
+    uint64_t misses = 0;
+    uint64_t uploads = 0;
+    uint64_t bytes = 0;
+    uint64_t permanent_hits = 0;
+    uint64_t scratch_hits = 0;
+    uint64_t promotions = 0;
+    uint64_t writeback_bytes = 0;
+    bool supported = false;
+};
+LLAMA_API llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx);
 
 // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
 // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,

@@ -23,6 +23,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1227,6 +1228,10 @@ struct ggml_backend_sched_split {
     // graph view of this split
     struct ggml_cgraph graph;
     uint64_t shared_plan_uid;
+    uint64_t carry_plan_uid;
+    ggml_tensor * carry_plan_node;
+    int carry_plan_end;
+    bool has_custom;
     struct ggml_cgraph shared_prefix;
     struct ggml_cgraph after_shared;
 };
@@ -1336,6 +1341,10 @@ struct ggml_backend_sched {
     bool capture_host_copies;
     const ggml_backend_sched_host_copies * active_host_copies;
     const ggml_backend_sched_split * active_copy_split;
+    int carry_prefix_end;
+    ggml_tensor * carry_accumulator;
+    ggml_custom_op_t custom_dispatch;
+    ggml_backend_t custom_backend;
     struct ggml_backend_sched_split_profile profile;
 
     ggml_backend_sched_realloc_callback callback_realloc;
@@ -2029,8 +2038,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        split->carry_plan_uid = 0;
+        split->carry_plan_node = nullptr;
+        split->carry_plan_end = 0;
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        split->has_custom = false;
+        if (sched->custom_dispatch && sched->backends[split->backend_id] == sched->custom_backend) {
+            for (int j = 0; j < split->graph.n_nodes; ++j) {
+                auto * node = split->graph.nodes[j];
+                if (node->op == GGML_OP_CUSTOM) {
+                    ggml_custom_op_params params;
+                    memcpy(&params, node->op_params, sizeof(params));
+                    split->has_custom |= params.fun == sched->custom_dispatch;
+                }
+            }
+        }
     }
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
@@ -2965,6 +2988,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 !sched->events[split_backend_id][sched->cur_copy] ? &split_host_copies : nullptr;
         const int64_t input_start_us = profile.enabled ? ggml_time_us() : 0;
         ggml_cgraph * main_graph = &split->graph;
+        sched->carry_prefix_end = 0;
+        sched->carry_accumulator = nullptr;
         ggml_backend_sched_upload upload;
 
         if (sched->overlap_shared && split_id > 0 && !profile.enabled && !sched->callback_eval) {
@@ -3185,8 +3210,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             return status;
         };
 
+        auto dispatch = [&](ggml_cgraph * graph) {
+            if (!split->has_custom) {
+                return graph->n_nodes ? compute(graph) : GGML_STATUS_SUCCESS;
+            }
+            int begin = 0;
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                auto * node = graph->nodes[i];
+                if (node->op != GGML_OP_CUSTOM || split_backend != sched->custom_backend) {
+                    continue;
+                }
+                ggml_custom_op_params params;
+                memcpy(&params, node->op_params, sizeof(params));
+                if (params.fun != sched->custom_dispatch) {
+                    continue;
+                }
+                if (i > begin) {
+                    auto prefix = ggml_graph_view(graph, begin, i);
+                    const auto status = compute(&prefix);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+                ggml_backend_synchronize(split_backend);
+                if (params.n_tasks != 1) {
+                    return GGML_STATUS_FAILED;
+                }
+                params.fun(node, 0, 1, params.userdata);
+                begin = i + 1;
+            }
+            if (begin == graph->n_nodes) {
+                return GGML_STATUS_SUCCESS;
+            }
+            auto suffix = ggml_graph_view(graph, begin, graph->n_nodes);
+            return compute(&suffix);
+        };
+
+        ggml_cgraph after_carry;
+        if (sched->carry_accumulator) {
+            auto * dst = sched->carry_accumulator;
+            auto * src = dst->src[0];
+            if (dst->data != src->data) {
+                ggml_backend_tensor_copy_async(split_backend, split_backend, src, dst);
+            }
+            after_carry = ggml_graph_view(&split->graph, sched->carry_prefix_end, split->graph.n_nodes);
+            main_graph = &after_carry;
+        }
         if (!sched->callback_eval) {
-            enum ggml_status ec = compute(main_graph);
+            enum ggml_status ec = dispatch(main_graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -3208,7 +3279,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = compute(&gv);
+                enum ggml_status ec = dispatch(&gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
@@ -3540,6 +3611,99 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+bool ggml_backend_sched_set_custom_op_backend(ggml_backend_sched_t sched, ggml_tensor * op, ggml_backend_t backend) {
+    if (sched->n_copies != 1 || op->op != GGML_OP_CUSTOM || !backend) {
+        return false;
+    }
+    ggml_custom_op_params params;
+    memcpy(&params, op->op_params, sizeof(params));
+    if (params.n_tasks != 1 || !params.fun ||
+            (sched->custom_dispatch && (sched->custom_dispatch != params.fun || sched->custom_backend != backend))) {
+        return false;
+    }
+    sched->custom_dispatch = params.fun;
+    sched->custom_backend = backend;
+    ggml_backend_sched_set_tensor_backend(sched, op, backend);
+    return true;
+}
+
+bool ggml_backend_sched_carry_accumulator(ggml_backend_sched_t sched, const ggml_cgraph * graph, ggml_tensor * accumulator) {
+    auto * split = const_cast<ggml_backend_sched_split *>(sched->active_copy_split);
+    if (!accumulator || !split || graph != &split->graph || sched->n_copies != 1 || sched->callback_eval ||
+            sched->carry_accumulator || split->shared_prefix.n_nodes || accumulator->op != GGML_OP_ADD ||
+            !ggml_is_contiguous(accumulator) || !ggml_are_same_layout(accumulator, accumulator->src[0]) ||
+            !accumulator->data || !accumulator->src[0]->data ||
+            tensor_backend_id(accumulator) != split->backend_id ||
+            tensor_backend_id(accumulator->src[0]) != split->backend_id) {
+        return false;
+    }
+    const auto * source = accumulator->src[0];
+    const auto dst_addr = reinterpret_cast<uintptr_t>(accumulator->data);
+    const auto src_addr = reinterpret_cast<uintptr_t>(source->data);
+    if (dst_addr != src_addr && (dst_addr < src_addr ? src_addr - dst_addr : dst_addr - src_addr) < ggml_nbytes(accumulator)) {
+        return false;
+    }
+    if (split->carry_plan_uid == graph->uid && split->carry_plan_node == accumulator) {
+        sched->carry_prefix_end = split->carry_plan_end;
+        sched->carry_accumulator = accumulator;
+        return true;
+    }
+    int end = -1;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == accumulator) {
+            end = i;
+            break;
+        }
+    }
+    if (end < 0) {
+        return false;
+    }
+    std::unordered_set<const ggml_tensor *> skipped_nodes;
+    for (int i = 0; i <= end; ++i) {
+        const auto * skipped = graph->nodes[i];
+        if (skipped == accumulator) {
+            continue;
+        }
+        if (skipped == accumulator->src[0] || (skipped->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        switch (skipped->op) {
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_GLU:
+            case GGML_OP_MUL:
+            case GGML_OP_SCALE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_CONT:
+                break;
+            default:
+                return false;
+        }
+        skipped_nodes.insert(skipped);
+    }
+    // Validate once for this allocated graph, including views and injected copy nodes.
+    for (int j = 0; j < sched->graph.n_nodes; ++j) {
+        const auto * node = sched->graph.nodes[j];
+        if (node == accumulator || skipped_nodes.count(node)) {
+            continue;
+        }
+        for (const auto * src : node->src) {
+            for (const auto * view = src; view; view = view->view_src) {
+                if (skipped_nodes.count(view)) {
+                    return false;
+                }
+            }
+        }
+    }
+    split->carry_plan_uid = graph->uid;
+    split->carry_plan_node = accumulator;
+    split->carry_plan_end = end + 1;
+    sched->carry_prefix_end = end + 1;
+    sched->carry_accumulator = accumulator;
+    return true;
 }
 
 const struct ggml_tensor * ggml_backend_sched_get_post_copy_source(ggml_backend_sched_t sched,

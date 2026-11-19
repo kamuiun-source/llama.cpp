@@ -389,6 +389,9 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    // Carry an accumulator through an empty prefix from the active weight copy callback.
+    GGML_API bool ggml_backend_sched_carry_accumulator(ggml_backend_sched_t sched, const struct ggml_cgraph * graph, struct ggml_tensor * accumulator);
+    GGML_API bool ggml_backend_sched_set_custom_op_backend(ggml_backend_sched_t sched, struct ggml_tensor * op, ggml_backend_t backend);
 
     // Internal: prepare a host weight before the split's input copies and their waits.
     // Return true after preparing one weight. Do not write the input copy or need other split inputs.

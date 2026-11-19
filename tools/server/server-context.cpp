@@ -52,6 +52,51 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static int server_expert_prefill_policy() {
+    static const int policy = [] {
+        const char * enabled = std::getenv("LLAMA_EXPERT_PREFILL_512");
+        if (!enabled || std::strcmp(enabled, "1") != 0) {
+            return 0;
+        }
+        const char * value = std::getenv("LLAMA_EXPERT_PREFILL_512_POLICY");
+        if (!value || std::strcmp(value, "auto") == 0) {
+            return -1;
+        }
+        if (std::strcmp(value, "2") == 0) {
+            return 2;
+        }
+        if (std::strcmp(value, "512") == 0) {
+            return 512;
+        }
+        throw std::runtime_error("LLAMA_EXPERT_PREFILL_512_POLICY must be auto, 2 or 512");
+    }();
+    return policy;
+}
+
+static bool server_expert_prefill_wide(int policy, int64_t uncached_tokens) {
+    return policy == 0 || policy == 512 || (policy == -1 && uncached_tokens >= 80);
+}
+
+static bool server_expert_decode_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_EXPERT_EARLY_DECODE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static void server_add_expert_delta(llama_expert_round_stats & total,
+        const llama_expert_round_stats & before, const llama_expert_round_stats & after) {
+    total.requests += after.requests - before.requests;
+    total.misses += after.misses - before.misses;
+    total.uploads += after.uploads - before.uploads;
+    total.bytes += after.bytes - before.bytes;
+    total.permanent_hits += after.permanent_hits - before.permanent_hits;
+    total.scratch_hits += after.scratch_hits - before.scratch_hits;
+    total.promotions += after.promotions - before.promotions;
+    total.writeback_bytes += after.writeback_bytes - before.writeback_bytes;
+}
+
 struct server_decode_telemetry {
     enum phase { prefill, decode, verify, mixed, draft, catchup, server_step, phase_count };
 
@@ -88,6 +133,9 @@ struct server_decode_telemetry {
         uint64_t calls = 0;
         uint64_t wall_us = 0;
         uint64_t target_tokens = 0;
+        uint64_t staging_calls = 0;
+        uint64_t staging_wall_us = 0;
+        llama_expert_staging_telemetry staging;
     };
 
     const bool enabled = [] {
@@ -98,6 +146,15 @@ struct server_decode_telemetry {
         const char * env = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
         return env && std::strcmp(env, "1") == 0;
     }();
+    const bool expert_staging_copy = [] {
+        const char * env = std::getenv("LLAMA_EXPERT_PROFILE_RAM_COPY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const bool expert_prompt_trace = [] {
+        const char * path = std::getenv("LLAMA_EXPERT_PREFILL_TRACE");
+        return path && *path;
+    }();
+    const bool expert_decode_trace = server_expert_decode_trace_enabled();
     bool initialized = false;
     const bool per_response = [] {
         const char * env = std::getenv("LLAMA_DECODE_TELEMETRY_PER_RESPONSE");
@@ -165,11 +222,15 @@ struct server_decode_telemetry {
         phase kind;
         uint64_t target_tokens;
         std::optional<snapshot> before;
+        std::optional<llama_expert_staging_telemetry> staging_before;
         int64_t wall_start_us = 0;
         int previous_cuda_phase = -1;
 
         scope(server_decode_telemetry & owner, llama_context * ctx, phase kind, uint64_t tokens = 0)
             : owner(owner), ctx(ctx), kind(kind), target_tokens(tokens) {
+            if (owner.expert_staging_copy) {
+                staging_before = llama_get_expert_staging_telemetry();
+            }
             if (owner.enabled) {
                 before.emplace(owner.read(ctx));
                 if (owner.set_cuda_stream && owner.finish_cuda_stream) {
@@ -179,9 +240,26 @@ struct server_decode_telemetry {
                 }
                 wall_start_us = ggml_time_us();
             }
+            if (!owner.enabled && owner.expert_staging_copy) {
+                wall_start_us = ggml_time_us();
+            }
         }
 
         ~scope() {
+            if (staging_before) {
+                const auto after = llama_get_expert_staging_telemetry();
+                auto & item = owner.phases[kind];
+                ++item.staging_calls;
+                item.staging_wall_us += ggml_time_us() - wall_start_us;
+                auto & total = item.staging;
+                total.calls += after.calls - staging_before->calls;
+                total.bytes += after.bytes - staging_before->bytes;
+                total.us += after.us - staging_before->us;
+                total.fill_ge2_bytes += after.fill_ge2_bytes - staging_before->fill_ge2_bytes;
+                total.fill_ge2_us += after.fill_ge2_us - staging_before->fill_ge2_us;
+                total.retry_bytes += after.retry_bytes - staging_before->retry_bytes;
+                total.retry_us += after.retry_us - staging_before->retry_us;
+            }
             if (!before) {
                 return;
             }
@@ -279,6 +357,15 @@ struct server_decode_telemetry {
         static constexpr const char * names[] = {"target_prefill", "target_decode", "target_verify", "target_mixed", "draft", "draft_catchup", "server_step_total"};
         for (size_t i = 0; i < phases.size(); ++i) {
             const auto & item = phases[i];
+            if (expert_staging_copy && item.staging_calls) {
+                const auto & copy = item.staging;
+                SRV_INF("expert_staging_copy: phase=%s verify_calls=%" PRIu64 " phase_calls=%" PRIu64
+                        " calls=%" PRIu64 " bytes=%" PRIu64 " cpu_ms=%.3f fill_ge2_bytes=%" PRIu64
+                        " fill_ge2_cpu_ms=%.3f retry_bytes=%" PRIu64 " retry_cpu_ms=%.3f phase_wall_ms=%.3f\n",
+                        names[i], i == verify ? item.staging_calls : 0, item.staging_calls,
+                        copy.calls, copy.bytes, copy.us / 1e3, copy.fill_ge2_bytes, copy.fill_ge2_us / 1e3,
+                        copy.retry_bytes, copy.retry_us / 1e3, item.staging_wall_us / 1e3);
+            }
             if (item.calls == 0) {
                 continue;
             }
@@ -611,6 +698,66 @@ struct server_batch {
 };
 
 struct server_slot {
+    struct expert_round {
+        uint64_t before = 0;
+        uint64_t calls = 0;
+        uint64_t tokens = 0;
+        bool verify = false;
+        llama_expert_round_stats totals;
+    };
+    bool expert_trace = server_expert_decode_trace_enabled();
+    bool expert_supported = true;
+    uint64_t expert_rounds = 0;
+    uint64_t expert_initial = 0;
+    std::optional<expert_round> expert_pending;
+    llama_expert_round_stats expert_total;
+
+    void record_expert_round(const llama_expert_round_stats & before, const llama_expert_round_stats & after,
+            bool verify, uint64_t tokens) {
+        if (!before.supported || !after.supported) {
+            if (expert_supported) {
+                SLT_WRN(*this, "%s", "expert decode trace: packed batch-2 target counters unavailable\n");
+            }
+            expert_supported = false;
+            return;
+        }
+        if (!expert_pending) {
+            expert_pending.emplace();
+            expert_pending->before = stats.n_gen;
+            expert_pending->verify = verify;
+        }
+        auto & pending = *expert_pending;
+        if (pending.verify != verify) {
+            expert_supported = false;
+        }
+        ++pending.calls;
+        pending.tokens += tokens;
+        server_add_expert_delta(pending.totals, before, after);
+        server_add_expert_delta(expert_total, before, after);
+    }
+
+    void finish_expert_round(uint64_t proposed, uint64_t accepted, const char * status, llama_pos position = -1) {
+        if (!expert_trace || !expert_pending) {
+            return;
+        }
+        const auto & round = *expert_pending;
+        const auto & counts = round.totals;
+        const uint64_t emitted = stats.n_gen - round.before;
+        if (emitted && position < 0) {
+            expert_supported = false;
+        }
+        const int64_t end = emitted && position >= 0 ? int64_t(position) + emitted - 1 : -1;
+        SLT_INF(*this, "expert_decode_round: request=%d round=%" PRIu64 " kind=%s before=%" PRIu64 " after=%" PRIu64
+                " position_begin=%d position_end=%" PRId64 " proposed=%" PRIu64 " accepted=%" PRIu64
+                " emitted_candidates=%" PRIu64 " emitted=%" PRIu64 " target_calls=%" PRIu64 " target_tokens=%" PRIu64
+                " requests=%" PRIu64 " misses=%" PRIu64 " uploads=%" PRIu64 " bytes=%" PRIu64
+                " permanent_hits=%" PRIu64 " scratch_hits=%" PRIu64 " promotions=%" PRIu64 " writeback_bytes=%" PRIu64 " status=%s\n",
+                task->id, ++expert_rounds, round.verify ? "verify" : "decode", round.before, uint64_t(stats.n_gen),
+                emitted ? position : -1, end, proposed, accepted, std::min(accepted, emitted), emitted, round.calls, round.tokens,
+                counts.requests, counts.misses, counts.uploads, counts.bytes, counts.permanent_hits, counts.scratch_hits,
+                counts.promotions, counts.writeback_bytes, status);
+        expert_pending.reset();
+    }
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -803,6 +950,11 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        expert_supported = true;
+        expert_rounds = 0;
+        expert_initial = 0;
+        expert_pending.reset();
+        expert_total = {};
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -1013,6 +1165,14 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+            if (expert_trace) {
+                finish_expert_round(0, 0, "aborted");
+                SLT_INF(*this, "expert_decode_summary: request=%d rounds=%" PRIu64 " initial=%" PRIu64 " generated=%" PRIu64
+                        " requests=%" PRIu64 " misses=%" PRIu64 " uploads=%" PRIu64 " bytes=%" PRIu64
+                        " promotions=%" PRIu64 " writeback_bytes=%" PRIu64 " supported=%d\n",
+                        task->id, expert_rounds, expert_initial, uint64_t(stats.n_gen), expert_total.requests, expert_total.misses,
+                        expert_total.uploads, expert_total.bytes, expert_total.promotions, expert_total.writeback_bytes, expert_supported);
+            }
             common_speculative_discard_mtp_anchor(spec, id);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
@@ -1492,7 +1652,7 @@ private:
     server_decode_telemetry decode_telemetry;
 
     void destroy() {
-        if (decode_telemetry.enabled) {
+        if (decode_telemetry.enabled || decode_telemetry.expert_staging_copy) {
             decode_telemetry.log_and_reset();
         }
         spec.reset();
@@ -4723,6 +4883,14 @@ private:
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
+                        const int prefill_policy = server_expert_prefill_policy();
+                        if (prefill_policy) {
+                            const int64_t uncached_tokens = slot.task->n_tokens() - n_past;
+                            SLT_INF(slot, "packed expert prefill policy: policy=%s uncached_tokens=%" PRId64 " requested_width=%d threshold=80\n",
+                                    prefill_policy == -1 ? "auto" : prefill_policy == 2 ? "2" : "512", uncached_tokens,
+                                    server_expert_prefill_wide(prefill_policy, uncached_tokens) ? 512 : 2);
+                        }
+
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
@@ -5083,12 +5251,20 @@ private:
         }
 
         bool has_output = false;
+        bool prompt_only = true;
+        bool prompt_wide = true;
+        const int prefill_policy = server_expert_prefill_policy();
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            prompt_only &= batch.tokens[i].is_prompt;
+            if (batch.tokens[i].is_prompt) {
+                const auto & slot = slots[batch.tokens[i].id_slot];
+                prompt_wide &= server_expert_prefill_wide(prefill_policy, slot.task->n_tokens() - slot.stats.n_prompt_cached);
+            }
         }
 
         auto phase = server_decode_telemetry::decode;
-        if (decode_telemetry.enabled) {
+        if (decode_telemetry.enabled || decode_telemetry.expert_staging_copy || decode_telemetry.expert_decode_trace) {
             bool prefill = false;
             bool decode = false;
             bool verify = false;
@@ -5118,9 +5294,56 @@ private:
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             server_decode_telemetry::scope measure(decode_telemetry, ctx_tgt, phase, batch.view.size());
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            server_slot * expert_slot = nullptr;
+            std::optional<llama_expert_round_stats> expert_before;
+            if (decode_telemetry.expert_decode_trace && !prompt_only) {
+                const int id_slot = batch.tokens[off].id_slot;
+                bool single = phase == server_decode_telemetry::decode || phase == server_decode_telemetry::verify;
+                for (int i = off; i < off + batch.view.size(); ++i) {
+                    single &= batch.tokens[i].id_slot == id_slot;
+                }
+                if (single) {
+                    expert_slot = &slots[id_slot];
+                    expert_before = llama_get_expert_round_stats(ctx_tgt);
+                } else {
+                    SRV_WRN("%s", "expert decode trace: omitted a mixed-phase or multi-sequence target batch\n");
+                    for (int i = off; i < off + batch.view.size(); ++i) {
+                        slots[batch.tokens[i].id_slot].expert_supported = false;
+                    }
+                }
+            }
+            int64_t trace_request = -1;
+            if (decode_telemetry.expert_prompt_trace && prompt_only) {
+                trace_request = slots[batch.tokens[off].id_slot].task->id;
+                for (int i = off; i < off + batch.view.size(); ++i) {
+                    if (slots[batch.tokens[i].id_slot].task->id != trace_request) {
+                        trace_request = -1;
+                        SRV_WRN("%s", "packed prompt trace: omitted a batch containing multiple requests\n");
+                        break;
+                    }
+                }
+            }
+            struct prompt_trace_request_scope {
+                bool active;
+                int64_t previous;
+                ~prompt_trace_request_scope() {
+                    if (active) {
+                        llama_set_expert_prompt_trace_request(previous);
+                    }
+                }
+            } prompt_trace_request{decode_telemetry.expert_prompt_trace,
+                    decode_telemetry.expert_prompt_trace ? llama_set_expert_prompt_trace_request(trace_request) : -1};
+            ret = prompt_only && !prompt_wide ? llama_process_prefill_narrow(ctx_tgt, batch.view.get()) :
+                    llama_process(ctx_tgt, prompt_only ? LLAMA_PROCESS_TYPE_PREFILL : LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (expert_before) {
+                expert_slot->record_expert_round(*expert_before, llama_get_expert_round_stats(ctx_tgt),
+                        phase == server_decode_telemetry::verify, batch.view.size());
+                if (ret != 0) {
+                    expert_slot->finish_expert_round(0, 0, "retry");
+                }
             }
         });
 
@@ -5255,6 +5478,7 @@ private:
                 return;
             }
 
+            const bool expert_prefill_sample = slot.expert_trace && slot.state == SLOT_STATE_DONE_PROMPT;
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
@@ -5329,7 +5553,21 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            const auto expert_position = slot.expert_trace ? slot.prompt.tokens.pos_next() : -1;
+            const bool keep_generating = process_token(result, slot);
+            if (slot.expert_trace) {
+                if (slot.expert_pending) {
+                    slot.finish_expert_round(0, 0, keep_generating ? "accepted" : "stopped", expert_position);
+                } else if (expert_prefill_sample && slot.stats.n_gen == 1) {
+                    ++slot.expert_initial;
+                    SLT_INF(slot, "expert_decode_initial: request=%d before=0 after=1 count=1 position_begin=%d position_end=%d\n",
+                            slot.task->id, expert_position, expert_position);
+                } else {
+                    slot.expert_supported = false;
+                    SLT_WRN(slot, "%s", "expert decode trace: generated token has no target round\n");
+                }
+            }
+            if (!keep_generating) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -5399,6 +5637,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.finish_expert_round(n_draft, accepted.size() - 1, "deferred");
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -5463,6 +5702,8 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            const llama_pos expert_position = slot.expert_trace ?
+                    slot.prompt.tokens.pos_next() - static_cast<llama_pos>(ids.size() - 1) : -1;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -5478,6 +5719,7 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    slot.finish_expert_round(n_draft, n_accepted, "stopped", expert_position);
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -5486,6 +5728,7 @@ private:
                 }
             }
 
+            slot.finish_expert_round(n_draft, n_accepted, "accepted", expert_position);
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
