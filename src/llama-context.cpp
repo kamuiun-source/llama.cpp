@@ -368,6 +368,7 @@ llama_context::llama_context(
                 model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
                 cparams.n_seq_max == 1 && cparams.n_batch >= 3 && cparams.n_ubatch == 2 &&
                 placement->n_slots == 20 && !placement->overlap && placement->prefill_tokens == 512 &&
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(placement->target)), "Vulkan") == 0 &&
                 cparams.n_rs_seq == 2;
         if (cparams.n_rs_seq >= cparams.n_ubatch && !mtp_verify_three_enabled) {
             LLAMA_LOG_INFO("%s: packed expert microbatch cannot hold the requested recurrent snapshots, using checkpoint rollback\n",
