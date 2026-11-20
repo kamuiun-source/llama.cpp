@@ -2253,6 +2253,21 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_routed_swiglu_fusion_disabled(const ggml_tensor * up, const ggml_tensor * glu) {
+#ifdef GGML_USE_HIP
+    static const bool disabled = ggml_cuda_env_flag("GGML_HIP_GFX906_DISABLE_ROUTED_SWIGLU_FUSION");
+    return disabled && up->op == GGML_OP_MUL_MAT_ID &&
+           ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && up->src[1]->ne[1] == 1 &&
+           up->src[0]->ne[0] == 2560 && up->ne[0] == 640 && up->ne[1] == 10 &&
+           (up->ne[2] == 1 || up->ne[2] == 2) &&
+           (up->src[0]->type == GGML_TYPE_IQ3_XXS || up->src[0]->type == GGML_TYPE_IQ2_S) &&
+           ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
+#else
+    GGML_UNUSED_VARS(up, glu);
+    return false;
+#endif
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, const ggml_tensor * gate = nullptr) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -4477,6 +4492,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+            !ggml_cuda_routed_swiglu_fusion_disabled(cgraph->nodes[i + 2]->src[1], cgraph->nodes[i + 2]) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
@@ -5008,7 +5024,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) ||
                       (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
 
-            if (!ok) {
+            if (!ok || ggml_cuda_routed_swiglu_fusion_disabled(up, glu)) {
                 continue;
             }
 
