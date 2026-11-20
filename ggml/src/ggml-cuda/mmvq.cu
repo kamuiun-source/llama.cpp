@@ -1124,6 +1124,41 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
+#ifdef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        static const int swiglu_rows = [] {
+            const char * value = std::getenv("GGML_HIP_GFX906_MOE_SWIGLU_ROWS");
+            if (value && std::strcmp(value, "1") == 0) {
+                return 1;
+            }
+            return value && std::strcmp(value, "4") == 0 ? 4 : 2;
+        }();
+        if (swiglu_rows != 2 && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
+                (ncols_dst == 2 || ncols_dst == 3) && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
+                !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
+                !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
+            const auto launch = [&](auto rows) {
+                constexpr int rows_per_block = decltype(rows)::value;
+                const dim3 block_nums(nrows_x / rows_per_block, nchannels_dst);
+                const dim3 block_dims(warp_size, ncols_dst);
+                const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            };
+            if (swiglu_rows == 1) {
+                launch(std::integral_constant<int, 1>{});
+            } else {
+                launch(std::integral_constant<int, 4>{});
+            }
+            return;
+        }
+    }
+#endif
+
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
