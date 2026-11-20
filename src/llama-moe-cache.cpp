@@ -741,7 +741,8 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
             const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
-            const auto reg = target_reg && std::strcmp(ggml_backend_reg_name(target_reg), "Vulkan") == 0 ? target_reg : nullptr;
+            const char * target_name = target_reg ? ggml_backend_reg_name(target_reg) : "";
+            const auto reg = std::strcmp(target_name, "Vulkan") == 0 ? target_reg : nullptr;
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
             const char * telemetry = std::getenv("LLAMA_DECODE_TELEMETRY");
             packed_miss_histogram = telemetry && std::strcmp(telemetry, "1") == 0 &&
@@ -797,6 +798,20 @@ struct llama_moe_cache::impl {
             if (!packed_staging && alloc_host_upload_buffer) {
                 packed_staging.reset(alloc_host_upload_buffer(placement->target, staging_bytes));
             }
+            const char * hip_pinned = std::getenv("LLAMA_EXPERT_HIP_PINNED_UPLOAD");
+            const bool hip_upload_requested = std::strcmp(target_name, "ROCm") == 0 && hip_pinned && std::strcmp(hip_pinned, "1") == 0;
+            if (hip_upload_requested) {
+                const auto buft = ggml_backend_dev_host_buffer_type(placement->target);
+                ggml_backend_buffer_ptr buffer(buft ? ggml_backend_buft_alloc_buffer(buft, staging_bytes) : nullptr);
+                // The HIP allocator can return a pageable CPU buffer on failure.
+                if (buffer && ggml_backend_buffer_get_type(buffer.get()) == buft) {
+                    packed_staging = std::move(buffer);
+                    LLAMA_LOG_INFO("packed expert HIP pinned upload: %zu bytes of staging on %s\n",
+                            ggml_backend_buffer_get_size(packed_staging.get()), ggml_backend_dev_name(placement->target));
+                } else {
+                    LLAMA_LOG_WARN("packed expert HIP pinned upload unavailable, using serial uploads\n");
+                }
+            }
             if (packed_staging) {
                 fills.reserve(placement->n_slots);
                 if (placement->overlap) {
@@ -810,7 +825,7 @@ struct llama_moe_cache::impl {
                         ggml_backend_dev_name(placement->target), ggml_backend_dev_description(placement->target));
             } else if (placement->overlap) {
                 throw std::runtime_error("expert overlap requires native Vulkan host staging on the target and an async transfer queue without serialized submissions");
-            } else {
+            } else if (!hip_upload_requested) {
                 LLAMA_LOG_WARN("packed expert batch upload unavailable on %s, using serial uploads\n",
                         ggml_backend_dev_name(placement->target));
             }
@@ -822,7 +837,7 @@ struct llama_moe_cache::impl {
                     return std::strcmp(ggml_backend_dev_name(ggml_backend_get_device(d.backend)), "CUDA0") == 0;
                 });
                 if (end == rtx_slots_env || *end || slots < 1 || slots >= placement->n_slots ||
-                        !packed_staging || placement->overlap || !placement->dynamic_resident ||
+                        !reg || !packed_staging || placement->overlap || !placement->dynamic_resident ||
                         placement->max_ubatch != 2 || cuda == devices.end()) {
                     LLAMA_LOG_WARN("packed expert RTX offload unavailable: need CUDA0, dynamic packed batch-2 placement, native staging and a valid slot cap\n");
                 } else {
@@ -1825,20 +1840,28 @@ struct llama_moe_cache::impl {
         auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
         const size_t staging_bytes = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         size_t bytes = 0;
-        for (const auto & fill : fills) {
-            const int32_t slot = cold ? fill.slot : packed_slot(l, fill.slot);
-            for (ggml_tensor * host : l.experts) {
-                const auto & binding = bindings.at(host);
-                const size_t stride = host->nb[2];
-                const auto * data = packed_host_data(l, host, map.host[fill.expert], binding.packed_offset);
-                GGML_ASSERT(stride <= staging_bytes - bytes);
-                copy_upload_staging(staging + bytes, data, stride, retry_bytes);
-                ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, staging + bytes, slot * stride, stride);
-                bytes += stride;
+        try {
+            for (const auto & fill : fills) {
+                const int32_t slot = cold ? fill.slot : packed_slot(l, fill.slot);
+                for (ggml_tensor * host : l.experts) {
+                    const auto & binding = bindings.at(host);
+                    const size_t stride = host->nb[2];
+                    const auto * data = packed_host_data(l, host, map.host[fill.expert], binding.packed_offset);
+                    GGML_ASSERT(stride <= staging_bytes - bytes);
+                    copy_upload_staging(staging + bytes, data, stride, retry_bytes);
+                    ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, staging + bytes, slot * stride, stride);
+                    bytes += stride;
+                }
             }
-        }
-        if (submitted) {
-            *submitted = submit_expert_upload(backend);
+            if (submitted) {
+                *submitted = submit_expert_upload(backend);
+            }
+        } catch (...) {
+            // Queued copies can still read the staging buffer after a failed fill.
+            if (bytes != 0) {
+                ggml_backend_synchronize(backend);
+            }
+            throw;
         }
         if (!submitted || !*submitted) {
             ggml_backend_synchronize(backend);
