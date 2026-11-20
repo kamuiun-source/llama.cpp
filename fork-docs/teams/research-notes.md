@@ -1,6 +1,12 @@
 # 調査メモと未解決事項
 
-更新: 2026-11-17。確定ルールは `../agent.md`、再開時の作業状態は `coordinator-memory.md`。
+現行の優先順位は [現在の作業メモ](current-work.md)、運用設定は [フラグ一覧](runtime-flags.md)、経緯は [作業・決定履歴](coordinator-memory.md) を参照する。
+
+## 再調査の起点
+
+- ExpertのRAM内コピー、書き戻し、連続配置は [転送実装の比較](../research/vllm-strata-transfers.md) と [RAMコピー計測](../research/improvement1-upload-memcpy-results.md) を参照。短文の初期配置比較を行う場合は、転送件数と待ち時間を別々に記録する。
+- 参考投稿の処理構成との差分は [デコード比較](../research/reference-decode-comparison-20261119.md)。Qwen3.8特化フォークからの候補は [実装調査](../research/qwen38-forks-decode.md) を参照する。
+- Vulkan Submit・Fence待ちの読み方は [待ち時間の内訳](../research/vulkan-wait-breakdown.md)。固定3幅の後段Submit削減とAutoの修正結果は [作業・決定履歴](coordinator-memory.md) の「高速3幅の統合検証」に記録済み。
 
 ## Windows gfx906 / HIP
 
@@ -30,4 +36,4 @@
 
 ## メモ更新方法
 
-新しい調査では「日付・根拠URLまたはコード・確認事実・推測・未検証・次の判断」を短く追記する。決定になった事項はagent.mdへ反映し、古い仮説は撤回済みと示す。生ログやJSONLはコピーしない。
+新しい調査では「日付・根拠URLまたはコード・確認事実・推測・未検証・次の判断」を短く追記する。採否や優先順位が変わったら現在の作業メモを更新する。恒常的な進め方の変更はagent.mdに反映する。生ログやJSONLはコピーしない。
