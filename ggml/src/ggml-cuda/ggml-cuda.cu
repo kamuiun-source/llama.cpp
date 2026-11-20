@@ -2088,6 +2088,19 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
+#if defined(GGML_USE_HIP)
+    static const bool qsa_k_f32 = ggml_cuda_env_flag("GGML_HIP_GFX906_QSA_K_F32");
+    if (qsa_k_f32 && cc == GGML_CUDA_CC_VEGA20 && compute_type == GGML_TYPE_BF16) {
+        constexpr std::string_view prefix = "blk.";
+        const std::string_view name(src0->name);
+        const size_t suffix_pos = name.find_first_not_of("0123456789", prefix.size());
+        if (name.substr(0, prefix.size()) == prefix && suffix_pos != std::string_view::npos &&
+                suffix_pos > prefix.size() && name.substr(suffix_pos) == ".indexer.k_proj.weight") {
+            compute_type = GGML_TYPE_F32;
+        }
+    }
+#endif
+
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
     if (env_c != nullptr) {
         std::string env_cpp = env_c;

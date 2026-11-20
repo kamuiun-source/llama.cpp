@@ -2,6 +2,7 @@
 
 - [共通の決定事項](../agent.md)
 - [現在の作業と次の優先順位](current-work.md)
+- [Linux CUDA＋HIP の引き継ぎ](linux-cuda-hip.md)
 - [採用設定とON/OFFフラグ](runtime-flags.md)
 - [親エージェントの作業・決定履歴](coordinator-memory.md)
 - [調査メモ・未検証事項](research-notes.md)
