@@ -24,6 +24,7 @@ struct llama_expert_placement {
     struct layer_map {
         std::array<int32_t, llama_expert_profile::n_experts> resident;
         std::array<int32_t, llama_expert_profile::n_experts> host;
+        int32_t hip_spare_hot_slot = llama_expert_profile::n_resident + 1;
 
         std::vector<int32_t> scratch_slots(int32_t n_slots) const;
     };
@@ -36,6 +37,7 @@ struct llama_expert_placement {
     const int32_t max_ubatch;
     const int32_t n_slots;
     const hip_overlap_mode hip_overlap;
+    const bool hip_overlap_promotion;
     const bool overlap;
     const bool dynamic_resident;
     const int32_t prefill_tokens;

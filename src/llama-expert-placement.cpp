@@ -76,7 +76,10 @@ static llama_expert_placement::hip_overlap_mode packed_hip_overlap(ggml_backend_
 
 llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used)
     : target(target), max_ubatch(packed_max_ubatch()), n_slots(packed_scratch_capacity(n_expert_used, max_ubatch)),
-        hip_overlap(packed_hip_overlap(target)), overlap([&] {
+        hip_overlap(packed_hip_overlap(target)), hip_overlap_promotion([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_OVERLAP_PROMOTION");
+        return value && std::strcmp(value, "1") == 0;
+    }()), overlap([&] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return hip_overlap != hip_overlap_mode::off || (value && std::strcmp(value, "1") == 0);
     }()), dynamic_resident([&] {
@@ -99,6 +102,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()) {
     const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
+    if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
+        throw std::runtime_error("HIP expert promotion requires the HIP split placement");
+    }
     if (hip_overlap != hip_overlap_mode::off && (max_ubatch != 1 || (hip_dynamic && std::strcmp(hip_dynamic, "1") == 0))) {
         throw std::runtime_error("HIP expert overlap requires one position and dynamic residency off");
     }
@@ -152,7 +158,8 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
         throw std::runtime_error(format("cannot pack expert tensor %s", source->name));
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
-    auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1], n_resident + (overlap ? 1 : n_slots));
+    auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1],
+            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots));
     auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
