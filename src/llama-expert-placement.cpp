@@ -62,8 +62,15 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     : target(target), max_ubatch(packed_max_ubatch()), n_slots(packed_scratch_capacity(n_expert_used, max_ubatch)), overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
-    }()), dynamic_resident(!overlap &&
-        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0), prefill_tokens([] {
+    }()), dynamic_resident([&] {
+        if (overlap) {
+            return false;
+        }
+        const char * backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(target));
+        const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
+        return std::strcmp(backend, "Vulkan") == 0 ||
+               (std::strcmp(backend, "ROCm") == 0 && hip_dynamic && std::strcmp(hip_dynamic, "1") == 0);
+    }()), prefill_tokens([] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
         const bool small = value && std::strcmp(value, "1") == 0;
@@ -73,21 +80,21 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         }
         return large ? 512 : small ? 32 : 0;
     }()) {
+    const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     if (max_ubatch > 1 && !dynamic_resident) {
-        throw std::runtime_error("packed expert batching requires dynamic Vulkan residency");
+        throw std::runtime_error("packed expert batching requires dynamic residency");
     }
     if (dynamic_resident) {
         if (n_slots <= 0 || n_slots > n_experts - n_resident) {
-            throw std::runtime_error("dynamic expert residency requires synchronous Vulkan placement with scratch reuse");
+            throw std::runtime_error("dynamic expert residency requires synchronous placement with scratch reuse");
         }
     }
-    if (overlap && (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") != 0 ||
-            !std::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE"))) {
+    if (overlap && (!vulkan || !std::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE"))) {
         throw std::runtime_error("expert overlap requires Vulkan and GGML_VK_ASYNC_USE_TRANSFER_QUEUE");
     }
     const char * rtx_cold = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
-    if (prefill_tokens && (max_ubatch != 2 || !dynamic_resident || (rtx_cold && std::strcmp(rtx_cold, "0") != 0))) {
-        throw std::runtime_error("packed expert prefill requires two-token dynamic residency and RTX cold assist off");
+    if (prefill_tokens && (!vulkan || max_ubatch != 2 || !dynamic_resident || (rtx_cold && std::strcmp(rtx_cold, "0") != 0))) {
+        throw std::runtime_error("packed expert prefill requires two-token dynamic Vulkan residency and RTX cold assist off");
     }
     const auto selected = read_profile(path);
     for (int il = 0; il < n_layers; ++il) {
@@ -144,7 +151,7 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     alloc_overlap_bank_t alloc_overlap_bank = nullptr;
     if (!overlap && dynamic_resident && max_ubatch == 2) {
         const auto reg = ggml_backend_dev_backend_reg(target);
-        if (reg) {
+        if (reg && std::strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
             alloc_overlap_bank = reinterpret_cast<alloc_overlap_bank_t>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_alloc_overlap_expert_bank"));
         }

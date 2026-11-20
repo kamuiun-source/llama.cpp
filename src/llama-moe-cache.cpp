@@ -740,7 +740,8 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
-            const auto reg = ggml_backend_dev_backend_reg(placement->target);
+            const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
+            const auto reg = target_reg && std::strcmp(ggml_backend_reg_name(target_reg), "Vulkan") == 0 ? target_reg : nullptr;
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
             const char * telemetry = std::getenv("LLAMA_DECODE_TELEMETRY");
             packed_miss_histogram = telemetry && std::strcmp(telemetry, "1") == 0 &&
@@ -763,7 +764,7 @@ struct llama_moe_cache::impl {
             if (defer_upload_requested && defer_slot_map) {
                 submit_expert_upload = (submit_expert_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_submit_expert_upload");
             }
-            overlap_upload_requested = !placement->overlap && placement->dynamic_resident && placement->max_ubatch == 2;
+            overlap_upload_requested = reg && !placement->overlap && placement->dynamic_resident && placement->max_ubatch == 2;
             if (placement->n_slots <= 0 || tuple_bytes > SIZE_MAX / placement->n_slots) {
                 throw std::runtime_error("packed expert staging is too large");
             }
@@ -1412,6 +1413,10 @@ struct llama_moe_cache::impl {
         }
         commit_packed_promotion(move, packed_writeback.data());
         packed_writeback_us += ggml_time_us() - start;
+        if (!packed_staging) {
+            LLAMA_LOG_DEBUG("packed expert serial promotion: layer=%d promoted=%d resident_slot=%d evicted=%d scratch_slot=%d host_slot=%d\n",
+                    il, move.promote, move.new_gpu_slot, move.evict, move.old_gpu_slot, move.host_slot);
+        }
     }
 
     void compact_chunk(ggml_backend_t backend, layer & l, ggml_tensor * dst,
@@ -2369,6 +2374,10 @@ struct llama_moe_cache::impl {
                         const auto * data = packed_host_data(l, host, map.host[expert], bindings.at(host).packed_offset);
                         ggml_backend_tensor_set(bank, data, slot * stride, stride);
                         bytes += stride;
+                    }
+                    if (placement->dynamic_resident) {
+                        LLAMA_LOG_DEBUG("packed expert serial upload: layer=%d expert=%d scratch_slot=%d host_slot=%d\n",
+                                il, expert, slot, map.host[expert]);
                     }
                 }
                 *victim = expert;
