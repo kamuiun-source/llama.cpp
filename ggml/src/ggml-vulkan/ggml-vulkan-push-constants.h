@@ -79,6 +79,18 @@ struct vk_mat_vec_id_push_constants {
     uint32_t ne11;
     uint32_t expert_i1;
     uint32_t nbi1;
+    uint32_t expert_mask;
+};
+
+struct vk_mat_vec_id_pair_push_constants {
+    vk_mat_vec_id_push_constants base;
+    uint32_t expert_mask_1;
+    uint32_t n_experts;
+};
+
+struct vk_mat_vec_id_pair_precomputed_push_constants {
+    vk_mat_vec_id_pair_push_constants pair;
+    uint32_t partners[2];
 };
 
 struct vk_flash_attn_push_constants {
@@ -260,6 +272,7 @@ struct vk_op_glu_push_constants {
     uint32_t ne2_012mp; uint32_t ne2_012L;
     uint32_t ne2_01mp;  uint32_t ne2_01L;
     uint32_t ne2_0mp;   uint32_t ne2_0L;
+    uint32_t expert_masks[2];
 };
 
 static_assert(sizeof(vk_op_glu_push_constants) <= 128, "sizeof(vk_op_glu_push_constants) must be <= 128");

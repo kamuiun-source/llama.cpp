@@ -752,6 +752,44 @@ static void test_keep_tail(testing & t) {
         t.assert_equal(0u, ba.split_equal(4, false, 2).n_tokens);
     });
 
+    t.test("tail_can_fill_microbatch", [&](testing & t) {
+        for (int n : {2, 3, 5}) {
+            batch_builder bb;
+            make_batch(bb, {n});
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            int remaining = n;
+            while (remaining > 0) {
+                const llama_ubatch ub = ba.split_equal(2, false, 2);
+                const uint32_t expected = remaining == 3 ? 1u : 2u;
+                t.assert_equal(expected, ub.n_tokens);
+                if (ub.n_tokens != expected) {
+                    break;
+                }
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    t.assert_equal(n - remaining + static_cast<int>(i), ub.pos[i]);
+                }
+                remaining -= ub.n_tokens;
+            }
+            t.assert_equal(0, remaining);
+            t.assert_equal(static_cast<uint32_t>(n), ba.get_n_used());
+        }
+    });
+
+    t.test("singletons_respect_microbatch_capacity", [&](testing & t) {
+        batch_builder bb;
+        make_batch(bb, {1, 1, 1});
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        const auto first = ba.split_equal(2, false, 2);
+        t.assert_equal(2u, first.n_tokens);
+        const auto last = ba.split_equal(2, false, 2);
+        t.assert_equal(1u, last.n_tokens);
+        t.assert_equal(3u, ba.get_n_used());
+    });
+
     t.test("defers_seq_with_short_remainder", [&](testing & t) {
         batch_builder bb;
         make_batch(bb, {2, 3});

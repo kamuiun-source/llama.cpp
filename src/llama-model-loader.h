@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+struct llama_expert_placement;
+
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
@@ -81,6 +83,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    llama_expert_placement * expert_placement = nullptr;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

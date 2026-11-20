@@ -298,6 +298,7 @@ extern "C" {
     enum llama_process_type {
         LLAMA_PROCESS_TYPE_ENCODE,
         LLAMA_PROCESS_TYPE_DECODE,
+        LLAMA_PROCESS_TYPE_PREFILL, // prompt-only decode; may use a larger microbatch
     };
 
     struct llama_model_kv_override {

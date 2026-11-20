@@ -136,6 +136,8 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);
     bool supports_state_row() const;
+    bool enable_mtp_device_pending();
+    bool copy_mtp_pending_row(int64_t row);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -159,10 +161,14 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   profile = false);
+
+    bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
+    void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false);
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -273,12 +279,16 @@ private:
 
 public:
     uint32_t graph_max_nodes() const;
+    uint32_t n_ubatch_prefill() const;
+    bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool profile = false);
+    void get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const;
+    llama_expert_round_stats get_expert_round_stats() const;
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -402,7 +412,16 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    void init_mtp_vocab_subset();
+    ggml_context_ptr mtp_vocab_ctx;
+    ggml_backend_buffer_ptr mtp_vocab_buffer;
+    ggml_tensor * mtp_vocab_head = nullptr;
+    ggml_tensor * mtp_vocab_ids = nullptr;
+
     ggml_backend_sched_ptr sched;
+    bool mtp_verify_three_enabled = false;
+    bool mtp_logit_trace_enabled = false;
+    uint32_t target_mtp_verify_width = 0;
 
     sched_params sched_params_cur;
 
@@ -475,7 +494,7 @@ private:
     bool ev_layer_inp_read_recorded = false;
 
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
-    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+    // Row r < n_batch is the token at batch index r of the last decode; row n_batch + s is reserved for seq s.
     // ordered with the reader context like the layer input buffer
     ggml_context_ptr        ctx_h_nextn_dev;
     ggml_backend_buffer_ptr buf_h_nextn_dev;
@@ -486,6 +505,7 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+    bool mtp_device_pending         = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -494,6 +514,11 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    bool decode_profile = false;
+    bool decode_profile_active = false;
+    uint64_t telemetry_graphs = 0;
+    uint64_t telemetry_splits = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

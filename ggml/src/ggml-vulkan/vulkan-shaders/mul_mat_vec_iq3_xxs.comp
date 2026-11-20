@@ -13,32 +13,43 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 
     uint ibi = a_offset + first_row * num_blocks_per_row + i;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const float d = float(data_a[ibi].d);
+        const float d = float(MOE_WEIGHT(data_a, ibi, d));
         const uint signscale = pack32(u16vec2(
-            data_a_packed16[ibi].qs[QUANT_K / 8 + 2 * ib32],
-            data_a_packed16[ibi].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+            MOE_WEIGHT(data_a_packed16, ibi, qs[QUANT_K / 8 + 2 * ib32]),
+            MOE_WEIGHT(data_a_packed16, ibi, qs[QUANT_K / 8 + 2 * ib32 + 1])));
         const float db = d * 0.5 * (0.5 + (signscale >> 28));
         [[unroll]] for (uint l = 0; l < 2; ++l) {
-            const uint qs0 = data_a[ibi].qs[8 * ib32 + 4 * (itid & 1) + 2 * l];
-            const uint qs1 = data_a[ibi].qs[8 * ib32 + 4 * (itid & 1) + 2 * l + 1];
+            const uint qs0 = MOE_WEIGHT(data_a, ibi, qs[8 * ib32 + 4 * (itid & 1) + 2 * l]);
+            const uint qs1 = MOE_WEIGHT(data_a, ibi, qs[8 * ib32 + 4 * (itid & 1) + 2 * l + 1]);
             const uint sign = bitfieldExtract(signscale, 7 * int(2 * (itid & 1) + l), 7);
             const uint sign7 = bitCount(sign);
             const vec4 grid0 = vec4(unpack8(iq3xxs_grid[qs0]));
             const vec4 grid1 = vec4(unpack8(iq3xxs_grid[qs1]));
 
+            const vec4 decoded0 = vec4(FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z), FLOAT_TYPE((sign &   8) != 0 ? -grid0.w : grid0.w));
+            const vec4 decoded1 = vec4(FLOAT_TYPE((sign &  16) != 0 ? -grid1.x : grid1.x), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z), FLOAT_TYPE((sign7 &  1) != 0 ? -grid1.w : grid1.w));
+
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
-                const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+#ifdef MUL_MAT_ID_PAIR
+                if (j != 0 && !pair_active) {
+                    continue;
+                }
+                const uint activation_offset = j == 0 ? b_offset : pair_b_offset;
+#else
+                const uint activation_offset = j*p.batch_stride_b + b_offset;
+#endif
+                const vec4 b0 = vec4(data_b_v4[(activation_offset + y_idx) / 4 + 2*l + 0]);
+                const vec4 b4 = vec4(data_b_v4[(activation_offset + y_idx) / 4 + 2*l + 1]);
 
                 FLOAT_TYPE sum =
-                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
-                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
-                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z),
-                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE((sign &   8) != 0 ? -grid0.w : grid0.w),
-                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE((sign &  16) != 0 ? -grid1.x : grid1.x),
-                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y),
-                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
-                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign7 &  1) != 0 ? -grid1.w : grid1.w),
+                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(decoded0.x),
+                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(decoded0.y),
+                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(decoded0.z),
+                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(decoded0.w),
+                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE(decoded1.x),
+                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE(decoded1.y),
+                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE(decoded1.z),
+                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE(decoded1.w),
                       FLOAT_TYPE(0.0)))))))));
                 temp[j][n] = fma(db, sum, temp[j][n]);
             }
@@ -49,7 +60,18 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
+#ifdef MUL_MAT_ID_PAIR
+    if (!get_pair_offsets(a_offset, b_offset, d_offset)) {
+        return;
+    }
+#else
     get_offsets(a_offset, b_offset, d_offset);
+#endif
+#ifdef MUL_MAT_ID
+    if (zero_skipped_expert(d_offset, first_row, num_rows)) {
+        return;
+    }
+#endif
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
@@ -59,6 +81,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint itid = tid % 16;  // 0...15
     const uint ix = tid / 16;
 
+#ifdef MOE_GATE_UP
+    [[unroll]] for (uint projection = 0; projection < 2; ++projection) {
+        gate_up_second = projection != 0;
+#endif
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
             temp[j][i] = FLOAT_TYPE(0);
@@ -69,6 +95,15 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
+#ifdef MOE_GATE_UP
+#ifndef USE_SUBGROUP_ADD_NO_SHMEM
+        // Finish reading the gate reduction before reusing the shared sums.
+        if (!gate_up_second) {
+            barrier();
+        }
+#endif
+    }
+#endif
 }
 
 void main() {

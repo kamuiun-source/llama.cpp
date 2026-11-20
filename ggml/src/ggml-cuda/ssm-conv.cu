@@ -205,3 +205,101 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+static void ggml_cuda_ssm_conv_history_cpu(ggml_tensor *, int, int, void *) {
+    GGML_ABORT("SSM convolution with history requires the owning CUDA backend");
+}
+
+bool ggml_cuda_is_ssm_conv_history(const ggml_tensor * op) {
+    if (op->op != GGML_OP_CUSTOM) {
+        return false;
+    }
+    ggml_custom_op_params params;
+    std::memcpy(&params, op->op_params, sizeof(params));
+    return params.fun == ggml_cuda_ssm_conv_history_cpu;
+}
+
+ggml_tensor * ggml_cuda_make_ssm_conv_history(ggml_context * ctx, ggml_tensor * history, ggml_tensor * x,
+                                             ggml_tensor * weights, ggml_tensor * slots) {
+    const int64_t channels = x->ne[0];
+    const int64_t tokens = x->ne[1];
+    if (channels <= 0 || channels > INT_MAX / 3 || channels % 128 != 0 || (tokens != 1 && tokens != 2) ||
+            x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            x->nb[1] % sizeof(float) != 0 || x->nb[1] < size_t(channels) * sizeof(float) ||
+            history->type != GGML_TYPE_F32 || history->ne[0] != 3 || history->ne[1] != channels ||
+            !ggml_is_matrix(history) || !ggml_is_contiguous(history) ||
+            weights->type != GGML_TYPE_F32 || weights->ne[0] != 4 || weights->ne[1] != channels ||
+            !ggml_is_matrix(weights) || !ggml_is_contiguous(weights) ||
+            slots->type != GGML_TYPE_F32 || slots->ne[0] != 3 * channels || slots->ne[1] != 2 ||
+            !ggml_is_matrix(slots) || slots->nb[0] != sizeof(float) || slots->nb[1] % sizeof(float) != 0 ||
+            slots->nb[1] < 3 * size_t(channels) * sizeof(float)) {
+        return nullptr;
+    }
+
+    ggml_tensor * args[] = {history, x, weights, slots};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, channels, tokens, 1, 1, args, 4,
+            ggml_cuda_ssm_conv_history_cpu, 1, nullptr);
+}
+
+template <int tokens>
+static __global__ void ssm_conv_history_f32(const float * history, const float * x, const float * weights, float * y,
+                                            float * slots, size_t x_stride, size_t slot_stride, int channels) {
+    ggml_cuda_pdl_lc();
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    const float old0 = history[3 * channel];
+    const float old1 = history[3 * channel + 1];
+    const float old2 = history[3 * channel + 2];
+    const float x0 = x[channel];
+    const float w0 = weights[4 * size_t(channel)];
+    const float w1 = weights[4 * size_t(channel) + 1];
+    const float w2 = weights[4 * size_t(channel) + 2];
+    const float w3 = weights[4 * size_t(channel) + 3];
+
+    float sum = 0.0f;
+    sum += old0 * w0;
+    sum += old1 * w1;
+    sum += old2 * w2;
+    sum += x0 * w3;
+    y[channel] = ggml_cuda_op_silu_single(sum + 0.0f);
+
+    float * first = slots + 3 * channel;
+    if constexpr (tokens == 2) {
+        const float x1 = x[x_stride + channel];
+        sum = 0.0f;
+        sum += old1 * w0;
+        sum += old2 * w1;
+        sum += x0 * w2;
+        sum += x1 * w3;
+        y[channels + channel] = ggml_cuda_op_silu_single(sum + 0.0f);
+
+        first[0] = old2;
+        first[1] = x0;
+        first[2] = x1;
+        first += slot_stride;
+    }
+    first[0] = old1;
+    first[1] = old2;
+    first[2] = x0;
+}
+
+void ggml_cuda_op_ssm_conv_history(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const auto * history = dst->src[0];
+    const auto * x = dst->src[1];
+    const auto * weights = dst->src[2];
+    auto * slots = dst->src[3];
+    auto * y = static_cast<float *>(dst->data);
+    const int channels = dst->ne[0];
+    constexpr int threads = 128;
+    const auto params = ggml_cuda_kernel_launch_params(dim3(channels / threads), threads, 0, ctx.stream());
+    const auto kernel = dst->ne[1] == 2 ? ssm_conv_history_f32<2> : ssm_conv_history_f32<1>;
+    ggml_cuda_kernel_launch(kernel, params, static_cast<const float *>(history->data),
+            static_cast<const float *>(x->data), static_cast<const float *>(weights->data), y,
+            static_cast<float *>(slots->data), x->nb[1] / sizeof(float), slots->nb[1] / sizeof(float), channels);
+
+    static const bool logged = [] {
+        GGML_LOG_INFO("CUDA SSM convolution history applied\n");
+        return true;
+    }();
+    GGML_UNUSED(logged);
+}

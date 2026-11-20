@@ -687,7 +687,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+template <typename Sample>
+static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const Sample & sample) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -697,7 +698,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(idxs[i], i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -711,7 +712,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(idxs[i], i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -719,6 +720,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    return common_sampler_sample_and_accept_n_impl(gsmpl, ctx, idxs, draft, [&](int32_t row, size_t) {
+        return common_sampler_sample(gsmpl, ctx, row, grammar_first);
+    });
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_with(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::function<llama_token(int32_t, size_t)> & sample) {
+    return common_sampler_sample_and_accept_n_impl(gsmpl, ctx, idxs, draft, sample);
 }
 
 static float prob_of(const llama_token_data * data, size_t n, llama_token id) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-vulkan.h"
+#include "ggml-cpp.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -328,6 +329,9 @@ struct vk_queue_handle {
     vk::Queue queue;
     vk_device_ref device;
     std::mutex * device_submit_mutex = nullptr;
+    bool transfer_only = false;
+    // Only the externally synchronized queue tracks its latest successful submit.
+    vk::Fence last_submit_fence;
     virtual void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) = 0;
     virtual void lock()   {}   // no-op by default (internally synchronized case)
     virtual void unlock() {}
@@ -824,6 +828,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[DMMV_WG_SIZE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up_pair[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up_pair_precomputed[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -851,6 +859,8 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_mtp_routed_reduce;
+    vk_pipeline pipeline_mtp_routed_weighted;
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -1078,6 +1088,7 @@ struct vk_buffer_struct {
     void * ptr;
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
+    bool expert_concurrent = false;
 
     vk_device device;
 
@@ -1120,6 +1131,62 @@ struct vk_event {
     uint64_t cmd_buffer_use_counter = 0;
 };
 
+struct vk_gate_up_diagnostic {
+    static constexpr uint32_t capacity = 128;
+    struct group {
+        uint64_t dispatches = 0, timed = 0, dropped = 0, ticks = 0;
+        uint64_t phases = 0, proven = 0, matched = 0, shared = 0;
+    };
+    vk::QueryPool pool;
+    uint32_t valid_bits = 0;
+    uint32_t count = 0;
+    std::array<uint8_t, capacity> groups;
+    std::array<group, 6> totals;
+    const ggml_tensor * lookup = nullptr;
+    std::array<int32_t, 20> experts;
+    std::array<int32_t, 20> slots;
+};
+
+struct vk_gpu_telemetry {
+    static constexpr uint32_t capacity = 128;
+    enum sample_state : uint8_t { free, recording, submitted };
+
+    vk::QueryPool pool;
+    uint32_t valid_bits = 0;
+    std::array<sample_state, capacity> samples{};
+};
+
+struct vk_expert_overlap {
+    const ggml_tensor * projection = nullptr;
+    uint32_t hot_masks[2] = {};
+    uint32_t excluded_masks[2] = {};
+    ggml_backend_buffer_ptr ffn_scratch;
+    std::vector<ggml_backend_buffer_ptr> ffn_retired_scratch;
+    uint64_t split_ffns = 0;
+    uint64_t split_ffn_scratch = 0;
+    uint64_t split_ffn_fallbacks = 0;
+    uint64_t split_ffn_fallback_down_q8 = 0;
+    bool enabled = false;
+    bool transfer_pending = false;
+    bool wait_recorded = false;
+    bool wait_submitted = false;
+    uint64_t transfer_submits = 0;
+    uint64_t transfer_bytes = 0;
+    uint64_t split_projections = 0;
+    uint64_t hot_positions = 0;
+    uint64_t cold_positions = 0;
+    uint64_t fallback_joins = 0;
+    uint64_t paired_submits = 0;
+    uint64_t transfer_pending_at_compute_submit = 0;
+    void (*promotion_commit)(void *) = nullptr;
+    void * promotion_userdata = nullptr;
+    bool promotion_compute_submitted = false;
+    uint64_t promotion_submits = 0;
+    uint64_t promotion_writeback_bytes = 0;
+    uint64_t promotion_commits = 0;
+    uint64_t promotion_pending_at_compute_submit = 0;
+};
+
 struct vk_submission {
     vk_command_buffer* buffer = nullptr;
     std::vector<vk_semaphore> wait_semaphores;
@@ -1127,6 +1194,9 @@ struct vk_submission {
     // submit waits until *ready >= ready_value
     const std::atomic<uint64_t> * ready = nullptr;
     uint64_t ready_value = 0;
+    int32_t gpu_sample = -1;
+    bool expert_hot = false;
+    bool expert_wait = false;
 };
 
 typedef std::vector<vk_submission> vk_sequence;
@@ -1183,6 +1253,8 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+    vk_gpu_telemetry * gpu_telemetry = nullptr;
+    struct ggml_backend_vk_context * expert_overlap_owner = nullptr;
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1287,6 +1359,10 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    bool final_fence_pending {};
+    vk::Fence completion_fallback_fence;
+    bool final_fence_reuse_logged {};
+    bool compact_expert_logged {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -1324,8 +1400,49 @@ struct ggml_backend_vk_context {
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
+    vk_gpu_telemetry gpu_telemetry;
+    vk_gate_up_diagnostic gate_up_diagnostic;
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+    vk_expert_overlap expert_overlap;
+    uint64_t expert_pair_dispatches = 0;
+    bool mtp_routed_stats_active = false;
+    bool mtp_routed_stats_seen = false;
+    bool target_mtp_verify = false;
+    const ggml_tensor * fused_mtp_routed_experts = nullptr;
+    bool fused_mtp_routed_weighted = false;
+    bool fused_mtp_gate_up = false;
+    uint64_t mtp_gate_up_dispatches = 0;
+    uint64_t mtp_three_gate_up_dispatches = 0;
+    uint64_t mtp_three_weighted_dispatches = 0;
+    uint64_t mtp_three_reduce_dispatches = 0;
+    uint64_t mtp_gate_up_pair_dispatches = 0;
+    uint64_t mtp_gate_up_pair_slots = 0;
+    uint64_t mtp_gate_up_pair_precomputed = 0;
+    uint64_t mtp_gate_up_pair_workgroups_y = 0;
+    uint64_t mtp_gate_up_compact_phases = 0;
+    uint64_t mtp_gate_up_compact_dispatches = 0;
+    uint64_t mtp_gate_up_compact_singles = 0;
+    uint64_t mtp_gate_up_proof_phases = 0;
+    uint64_t mtp_gate_up_proof_covered = 0;
+    uint64_t mtp_gate_up_proof_matching = 0;
+    uint64_t mtp_gate_up_proof_shared = 0;
+    uint64_t mtp_gate_up_ordinary = 0;
+    uint64_t mtp_gate_up_full_hot = 0;
+    uint64_t mtp_gate_up_quant[GGML_TYPE_COUNT] {};
+    uint64_t mtp_routed_add_dispatches = 0;
+    uint64_t mtp_routed_multi_add_dispatches = 0;
+    uint64_t mtp_routed_reduce_dispatches = 0;
+    uint64_t mtp_routed_weighted_dispatches = 0;
+    uint64_t mtp_routed_other_fused_groups = 0;
+    uint64_t mtp_routed_recorded_adds = 0;
+    uint64_t mtp_routed_aggregates = 0;
+    uint64_t mtp_routed_aggregate_layers = 0;
+    uint64_t mtp_routed_full_hot = 0;
+    uint64_t mtp_routed_scratch_copies = 0;
+    uint64_t mtp_routed_scratch_bytes = 0;
+    uint64_t mtp_routed_scratch_layers = 0;
+    uint64_t mtp_routed_scratch_unknown_layer = 0;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -1370,6 +1487,7 @@ struct ggml_backend_vk_buffer_context {
 struct vk_host_allocation {
     void *    base = nullptr;
     size_t    size = 0;
+    bool      importable = false;
     vk_buffer views[GGML_VK_MAX_DEVICES];  // indexed by device->idx; null = not (yet) mapped here
 };
 

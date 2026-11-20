@@ -1,9 +1,12 @@
 #include "mmvq.cuh"
+#include "hc-fused.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -451,6 +454,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (small_k && type == GGML_TYPE_Q8_0 && ncols_dst == 2 &&
+            (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
+        return 1;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -619,8 +626,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+          bool hc_reuse = false, int row_groups = 1>
+__launch_bounds__(row_groups*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -644,7 +652,8 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int group = row_groups == 1 ? 0 : threadIdx.z;
+    const     int row0 = rows_per_cuda_block*(row_groups*blockIdx.x + group);
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -768,23 +777,53 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+        if constexpr (hc_reuse) {
+            static_assert(type == GGML_TYPE_Q8_0 && ncols_dst == 2 && rows_per_cuda_block == 2 && !has_fusion);
+            constexpr int n = VDR_Q8_0_Q8_1_MMVQ;
+            int u[2][n];
+            float dy[2];
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < 2; ++j) {
+                const block_q8_1 & activation = y[j*stride_col_y + kby];
+                dy[j] = __low2half(activation.ds);
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                for (int k = 0; k < n; ++k) {
+                    u[j][k] = get_int_b4(activation.qs, kqs + k);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const block_q8_0 & weight = ((const block_q8_0 *) vx)[kbx_offset + i*stride_row_x + kbx];
+                const float dx = weight.d;
+                int v[n];
+#pragma unroll
+                for (int k = 0; k < n; ++k) {
+                    v[k] = get_int_b2(weight.qs, kqs + k);
+                }
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, n>(v, u[j], dx, dy[j]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[row_groups][nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
     [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
     if (threadIdx.y > 0) {
@@ -792,7 +831,7 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                tmp_shared[group][threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
@@ -815,7 +854,7 @@ static __global__ void mul_mat_vec_q(
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                tmp[j][i] += tmp_shared[group][l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
@@ -1579,6 +1618,72 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool hc_up_pair = [] {
+        const char * value = std::getenv("GGML_CUDA_HC_UP_PAIR");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool hc_down_reuse = [] {
+        const char * value = std::getenv("GGML_CUDA_HC_DOWN_REUSE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool hc_up_reuse = [] {
+        const char * value = std::getenv("GGML_CUDA_HC_UP_REUSE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if ((hc_down_reuse || hc_up_reuse) && !ids && !fusion && src0->type == GGML_TYPE_Q8_0 &&
+            device.cc == GGML_CUDA_CC_ADA_LOVELACE && ne11 == 2 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ((hc_down_reuse && ne00 == 10240 && ne01 == 320) || (hc_up_reuse && ne00 == 320 && ne01 == 10240)) &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const auto projection = ggml_cuda_hc_projection_for_weight(src0->name);
+        const bool down = hc_down_reuse && ne00 == 10240 && projection == GGML_CUDA_HC_DOWN;
+        const bool up = hc_up_reuse && ne00 == 320 && projection == GGML_CUDA_HC_UP;
+        if (down || up) {
+            const auto launch = [&](auto groups) {
+                constexpr int row_groups = decltype(groups)::value;
+                auto dims = calc_launch_params<GGML_TYPE_Q8_0>(2, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
+                dims.first.x /= row_groups;
+                dims.second.z = row_groups;
+                const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
+                ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, 2, false, false, false, true, row_groups>, params,
+                    src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
+                    uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                    init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
+            };
+            if (down) {
+                launch(std::integral_constant<int, 1>{});
+                static const bool logged = (GGML_LOG_INFO("CUDA HC down reuse applied\n"), true);
+                GGML_UNUSED(logged);
+            } else {
+                // Pack two row pairs without changing the reduction for either pair.
+                launch(std::integral_constant<int, 2>{});
+                static const bool logged = (GGML_LOG_INFO("CUDA HC up reuse applied\n"), true);
+                GGML_UNUSED(logged);
+            }
+            return;
+        }
+    }
+    if (hc_up_pair && !ids && !fusion && src0->type == GGML_TYPE_Q8_0 &&
+            device.cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            ne00 == 320 && ne01 == 10240 && ne11 == 2 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            (std::strstr(src0->name, ".hc_attn_up.weight") || std::strstr(src0->name, ".hc_ffn_up.weight"))) {
+        // Short reductions need fewer warps; keep the Q8_1 input and dot product unchanged.
+        const auto dims = calc_launch_params<GGML_TYPE_Q8_0>(2, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc), true);
+        mul_mat_vec_q_switch_fusion<GGML_TYPE_Q8_0, 2, true>(
+            src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, ne00, make_uint3(0, 0, 0), s01, s11, s1,
+            init_fastdiv_values(1), s02, s12, s2, init_fastdiv_values(1), s03, s13, s3,
+            dims.first, dims.second, 0, 0, stream);
+        static const bool logged = [] {
+            GGML_LOG_INFO("CUDA HC up pair applied: Q8_0 K=320 rows=10240 tokens=2 warps=1\n");
+            return true;
+        }();
+        GGML_UNUSED(logged);
+        return;
+    }
+#endif
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

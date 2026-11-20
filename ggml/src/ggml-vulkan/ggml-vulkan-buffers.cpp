@@ -80,6 +80,14 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         nullptr,
     };
 
+    const uint32_t families[] = { device->compute_queue ? device->compute_queue->queue_family_index : 0,
+                                 device->transfer_queue ? device->transfer_queue->queue_family_index : 0 };
+    if (ggml_vk_alloc_overlap_expert_buffer && families[0] != families[1]) {
+        buffer_create_info.sharingMode = vk::SharingMode::eConcurrent;
+        buffer_create_info.setQueueFamilyIndices(families);
+        buf->expert_concurrent = true;
+    }
+
     vk::ExternalMemoryBufferCreateInfo external_memory_bci;
     if (import_ptr) {
         external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
@@ -279,12 +287,12 @@ static size_t ggml_vk_host_allocation_find(const void * ptr) {
     return SIZE_MAX;
 }
 
-void * ggml_vk_host_malloc(size_t size) {
+void * ggml_vk_host_malloc(size_t size, int device_idx) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
 
     ggml_vk_instance_init();
 
-    if (vk_instance.multi_device) {
+    if (device_idx < 0 && vk_instance.multi_device) {
         const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
         const size_t alloc_size = (size + align - 1) / align * align;
 
@@ -295,16 +303,17 @@ void * ggml_vk_host_malloc(size_t size) {
         vk_host_allocation entry;
         entry.base = ptr;
         entry.size = alloc_size;
+        entry.importable = true;
 
         std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
         vk_instance.host_allocations.push_back(std::move(entry));
         return ptr;
     }
 
-    vk_device dev0 = ggml_vk_get_device(0);
+    vk_device device = ggml_vk_get_device(device_idx < 0 ? 0 : device_idx);
     vk_buffer buf;
     try {
-        buf = ggml_vk_create_buffer(dev0, size,
+        buf = ggml_vk_create_buffer(device, size,
             {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
     } catch (vk::SystemError&) {
@@ -320,7 +329,7 @@ void * ggml_vk_host_malloc(size_t size) {
     vk_host_allocation entry;
     entry.base             = buf->ptr;
     entry.size             = size;
-    entry.views[dev0->idx] = buf;
+    entry.views[device->idx] = buf;
 
     std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
     vk_instance.host_allocations.push_back(std::move(entry));
@@ -348,7 +357,7 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    if (entry.importable) {
         portable_aligned_free(entry.base);
     }
 }
@@ -367,7 +376,7 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
 
     if (entry.views[device->idx] == nullptr) {
         const uint32_t bit = 1u << device->idx;
-        if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
+        if (!entry.importable || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
             return;
         }
         GGML_ASSERT(device->external_memory_host);
@@ -410,7 +419,8 @@ static vk_context ggml_vk_begin_sync_ctx(vk_device & device, vk_command_pool & p
     return subctx;
 }
 
-static void ggml_vk_submit_sync(vk_device & device, vk_context & subctx) {
+static void ggml_vk_submit_sync(vk_device & device, vk_context & subctx, vk_telemetry_cause cause) {
+    vk_telemetry_scope scope(cause);
     ggml_vk_ctx_end(subctx);
 
     for (auto & cpy : subctx->in_memcpys) {
@@ -422,7 +432,7 @@ static void ggml_vk_submit_sync(vk_device & device, vk_context & subctx) {
     }
 
     ggml_vk_submit(subctx, device->fence);
-    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_submit_sync waitForFences", device);
+    VK_CHECK(ggml_vk_wait_for_fences(device->device, device->fence), "vk_submit_sync waitForFences", device);
     device->device.resetFences({ device->fence });
     ggml_vk_queue_command_pools_cleanup(device);
 
@@ -620,7 +630,7 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
         vk_context subctx = ggml_vk_begin_sync_ctx(dst->device, dst->device->transfer_queue->cmd_pool);
         bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
-        ggml_vk_submit_sync(dst->device, subctx);
+        ggml_vk_submit_sync(dst->device, subctx, VK_TEL_SYNC_WRITE);
     }
 }
 
@@ -733,7 +743,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
             { { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
                 vk::AccessFlagBits::eHostRead } },
             {}, {});
-        ggml_vk_submit_sync(src->device, subctx);
+        ggml_vk_submit_sync(src->device, subctx, VK_TEL_SYNC_READ);
 
         if (width == spitch && width == dpitch) {
             memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
@@ -748,7 +758,7 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
         vk_context subctx = ggml_vk_begin_sync_ctx(src->device, src->device->transfer_queue->cmd_pool);
         bool ret = ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
-        ggml_vk_submit_sync(src->device, subctx);
+        ggml_vk_submit_sync(src->device, subctx, VK_TEL_SYNC_READ);
     }
 }
 
@@ -774,7 +784,7 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         // Copy within the device
         vk_context subctx = ggml_vk_begin_sync_ctx(src->device, src->device->transfer_queue->cmd_pool);
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
-        ggml_vk_submit_sync(src->device, subctx);
+        ggml_vk_submit_sync(src->device, subctx, VK_TEL_SYNC_COPY);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
         // Copy device to device
@@ -812,7 +822,7 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
     vk_context subctx = ggml_vk_begin_sync_ctx(dst->device, dst->device->transfer_queue->cmd_pool);
     subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
-    ggml_vk_submit_sync(dst->device, subctx);
+    ggml_vk_submit_sync(dst->device, subctx, VK_TEL_SYNC_COPY);
 }
 
 static size_t ggml_vk_staging_size_n(const vk_device & device, const std::vector<vk_buffer_region> & regions) {
@@ -934,7 +944,7 @@ void ggml_vk_buffer_write_n(const vk_buffer_region * regions, size_t n) {
         size_t staging_offset = 0;
         const size_t recorded = ggml_vk_buffer_write_n_async(subctx, pending.data() + i, pending.size() - i, &device->sync_staging, &staging_offset);
         GGML_ASSERT(recorded > 0);
-        ggml_vk_submit_sync(device, subctx);
+        ggml_vk_submit_sync(device, subctx, VK_TEL_SYNC_WRITE);
         i += recorded;
     }
 }
@@ -974,7 +984,7 @@ void ggml_vk_buffer_read_n(const vk_buffer_region * regions, size_t n) {
             { { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
                 vk::AccessFlagBits::eHostRead } },
             {}, {});
-        ggml_vk_submit_sync(device, subctx);
+        ggml_vk_submit_sync(device, subctx, VK_TEL_SYNC_READ);
 
         for (const auto & r : direct) {
             memcpy(r.host, (const uint8_t *) r.buf->ptr + r.offset, r.size);
@@ -995,7 +1005,7 @@ void ggml_vk_buffer_read_n(const vk_buffer_region * regions, size_t n) {
         size_t staging_offset = 0;
         const size_t recorded = ggml_vk_buffer_read_n_async(subctx, pending.data() + i, pending.size() - i, &device->sync_staging, &staging_offset);
         GGML_ASSERT(recorded > 0);
-        ggml_vk_submit_sync(device, subctx);
+        ggml_vk_submit_sync(device, subctx, VK_TEL_SYNC_READ);
         i += recorded;
     }
 }
@@ -1025,7 +1035,7 @@ void ggml_vk_buffer_copy_n(const vk_buffer_copy_region * regions, size_t n) {
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
     vk_context subctx = ggml_vk_begin_sync_ctx(device, device->transfer_queue->cmd_pool);
     ggml_vk_buffer_copy_n_async(subctx, same_device.data(), same_device.size());
-    ggml_vk_submit_sync(device, subctx);
+    ggml_vk_submit_sync(device, subctx, VK_TEL_SYNC_COPY);
 }
 
 ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
