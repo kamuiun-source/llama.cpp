@@ -88,6 +88,11 @@ struct vk_mat_vec_id_pair_push_constants {
     uint32_t n_experts;
 };
 
+struct vk_mat_vec_id_pair_precomputed_push_constants {
+    vk_mat_vec_id_pair_push_constants pair;
+    uint32_t partners[2];
+};
+
 struct vk_flash_attn_push_constants {
     uint32_t N;
     uint32_t KV;

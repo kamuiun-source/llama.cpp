@@ -746,7 +746,11 @@ struct llama_moe_cache::impl {
                 set_telemetry_cause = (telemetry_cause_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_telemetry_cause");
             }
             const char * gate_up_diag = std::getenv("GGML_VK_MTP_GATE_UP_TIMING");
-            if (gate_up_diag && std::strcmp(gate_up_diag, "1") == 0) {
+            const char * gate_up_precompute = std::getenv("GGML_VK_MTP_GATE_UP_PRECOMPUTE");
+            const char * gate_up_proof = std::getenv("GGML_VK_MTP_GATE_UP_PROOF");
+            if ((gate_up_diag && std::strcmp(gate_up_diag, "1") == 0) ||
+                    (gate_up_precompute && std::strcmp(gate_up_precompute, "1") == 0) ||
+                    (gate_up_proof && std::strcmp(gate_up_proof, "1") == 0)) {
                 gate_up_diag_ids = reg ? reinterpret_cast<gate_up_diag_ids_t>(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_gate_up_diagnostic_ids")) : nullptr;
                 LLAMA_LOG_INFO("mtp gate-up host IDs: callback=%s\n", gate_up_diag_ids ? "available" : "unavailable");

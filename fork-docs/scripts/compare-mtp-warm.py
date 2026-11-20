@@ -33,6 +33,9 @@ ROUTED_REDUCE = "GGML_VK_MTP_ROUTED_REDUCE"
 ROUTED_WEIGHTED = "GGML_VK_MTP_ROUTED_WEIGHTED"
 GATE_UP = "GGML_VK_MTP_ROUTED_GATE_UP"
 GATE_UP_PAIR = "GGML_VK_MTP_ROUTED_GATE_UP_PAIR"
+GATE_UP_PRECOMPUTE = "GGML_VK_MTP_GATE_UP_PRECOMPUTE"
+GATE_UP_COMPACT = "GGML_VK_MTP_GATE_UP_COMPACT"
+GATE_UP_PROOF = "GGML_VK_MTP_GATE_UP_PROOF"
 
 
 def arm_order(rotation, reverse):
@@ -289,12 +292,12 @@ def routed_dispatch_metrics(log, result, required_fusions=()):
                       "Other backend/op counts are logical scheduled layer endpoints and do not imply dispatch counts.")
 
 
-def gate_up_metrics(log, routed, require_pair=False):
+def gate_up_metrics(log, routed, require_pair=False, require_precomputed=False, compact_singles=0):
     keys = ("dispatches", "ordinary", "full_hot", "iq2_s", "iq3_xxs", "iq4_xs")
     rows = re.findall(r"mtp gate-up Vulkan: device=Vulkan1 ([^\r\n]+)", log)
     require(rows, "missing Vulkan1 gate/up counters")
     pair_keys = ("pair_dispatches", "pair_slots")
-    counts = dict.fromkeys((*keys, *pair_keys), 0)
+    counts = dict.fromkeys((*keys, *pair_keys, "precomputed_dispatches"), 0)
     for row in rows:
         fields = dict(re.findall(r"(\w+)=(\d+)", row))
         for key in keys:
@@ -302,17 +305,61 @@ def gate_up_metrics(log, routed, require_pair=False):
         for key in pair_keys:
             if require_pair or key in fields:
                 counts[key] += int(fields[key])
+        if require_precomputed or "precomputed_dispatches" in fields:
+            counts["precomputed_dispatches"] += int(fields["precomputed_dispatches"])
     layers = counts["ordinary"] + counts["full_hot"]
     pair_dispatches = counts["pair_dispatches"]
-    equivalent_single_dispatches = counts["dispatches"] + pair_dispatches
+    equivalent_single_dispatches = counts["dispatches"] + pair_dispatches - compact_singles
     require(layers == sum(counts[key] for key in keys[3:])
             and 2 * layers <= equivalent_single_dispatches <= 2 * layers + 2 * counts["full_hot"]
-            and pair_dispatches <= counts["dispatches"] and 2 * pair_dispatches <= counts["pair_slots"] <= 20 * pair_dispatches
+            and 0 <= counts["precomputed_dispatches"] <= pair_dispatches <= counts["dispatches"] and 2 * pair_dispatches <= counts["pair_slots"] <= 20 * pair_dispatches
             and counts["full_hot"] <= routed["vulkan1"]["full_hot"] and layers <= routed["expected_layer_invocations"],
             "gate/up dispatch and layer counts disagree")
     return dict(counts, layers=layers, other_layers=routed["expected_layer_invocations"] - layers,
                 equivalent_single_dispatches=equivalent_single_dispatches,
                 pair_scope="Pair slots are submitted lanes, including unmatched lanes that compute singly.")
+
+
+def gate_up_compact_metrics(log):
+    require("mtp gate-up host IDs: callback=available" in log, "missing native gate/up host-ID callback")
+    rows = re.findall(r"mtp gate-up compact: ([^\r\n]+)", log)
+    require(rows, "missing native gate/up compact counters")
+    keys = ("pair_groups_y", "compact_phases", "compact_dispatches", "compact_singles", "phases", "proven", "matched", "shared")
+    result = dict.fromkeys(keys, 0)
+    for row in rows:
+        values = dict(re.findall(r"(\w+)=(\d+)", row))
+        for key in keys:
+            result[key] += int(values[key])
+    require(result["proven"] == result["phases"] > 0
+            and 0 <= result["shared"] <= result["matched"] <= 10 * result["proven"]
+            and result["compact_dispatches"] <= result["compact_phases"] <= result["proven"]
+            and result["compact_singles"] <= 2 * result["compact_dispatches"],
+            "gate/up compact match proof is incomplete or inconsistent")
+    return result
+
+
+def check_gate_up_compact_comparison(results):
+    off, precomputed, compact = (results[key] for key in ("off", "precomputed", "compact"))
+    baseline, pre, short = (arm["compact_gate_up"] for arm in (off, precomputed, compact))
+    projections = tuple(arm["gate_up"] for arm in (off, precomputed, compact))
+    require(baseline["shared"] == baseline["pair_groups_y"] == projections[0]["pair_dispatches"] == 0
+            and baseline["matched"] == pre["matched"] == short["matched"]
+            and baseline["phases"] == pre["phases"] == short["phases"]
+            and pre["shared"] == short["shared"] > 0,
+            "shared Expert proof differs across arms")
+    require(pre["compact_phases"] == 0 and pre["pair_groups_y"] == projections[1]["pair_slots"]
+            and projections[1]["precomputed_dispatches"] == projections[1]["pair_dispatches"] > 0
+            and short["compact_phases"] == projections[1]["pair_dispatches"]
+            and projections[2]["precomputed_dispatches"] == projections[2]["pair_dispatches"] == short["compact_dispatches"] > 0
+            and short["pair_groups_y"] == short["shared"]
+            and projections[2]["pair_slots"] == 2 * short["shared"],
+            "pair and compact command counts disagree or fell back")
+    for key in ("ordinary", "full_hot", "iq2_s", "iq3_xxs", "iq4_xs", "equivalent_single_dispatches"):
+        require(len({row[key] for row in projections}) == 1, f"gate/up workload differs for {key}")
+    for key in ("reduce_dispatches", "weighted_dispatches", "aggregates"):
+        counts = [arm["routed_dispatch"]["vulkan1"][key] for arm in (off, precomputed, compact)]
+        require(counts[0] == counts[1] == counts[2] and (key != "weighted_dispatches" or counts[0] > 0),
+                f"adopted router path differs for {key}")
 
 
 def gate_up_timing_metrics(log):
@@ -359,10 +406,14 @@ def main():
     pair_options.add_argument("--routed-gate-up-pair", action="store_true", help="compare shared expert weight loads/decode with gate/up enabled in both arms")
     pair_options.add_argument("--fast-three", action="store_true", help="compare adopted fixed width 2 against fast fixed width 3")
     pair_options.add_argument("--routed-gate-up-pair-timing", action="store_true", help="diagnose MI50 gate/up pair dispatch GPU time and shared experts")
+    pair_options.add_argument("--routed-gate-up-pair-precompute", action="store_true", help="compare shader rank matching against host-precomputed ranks with pair ON in both arms")
+    pair_options.add_argument("--routed-gate-up-pair-compact", action="store_true", help="compare pair OFF, precomputed pairs, and compact pairs")
     parser.add_argument("--on-first", action="store_true", help="run the experiment's ON arm before OFF")
     args = parser.parse_args()
-    pair_timing = args.routed_gate_up_pair_timing
-    args.routed_gate_up_pair |= pair_timing
+    pair_compact = args.routed_gate_up_pair_compact
+    pair_precompute = args.routed_gate_up_pair_precompute
+    pair_timing = args.routed_gate_up_pair_timing or pair_precompute
+    args.routed_gate_up_pair |= pair_timing or pair_compact
     if os.name != "nt":
         parser.error("this benchmark requires Windows")
     gate_up = args.routed_gate_up or args.routed_gate_up_pair
@@ -392,7 +443,9 @@ def main():
     if args.fast_three:
         prefix = "mtp-fast-three-warm"
     if pair_timing:
-        prefix = "mtp-routed-gate-up-pair-timing"
+        prefix = "mtp-routed-gate-up-pair-precompute" if pair_precompute else "mtp-routed-gate-up-pair-timing"
+    if pair_compact:
+        prefix = "mtp-routed-gate-up-pair-compact"
     directory = COMMON["LOG_ROOT"] / f"{prefix}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
     try:
         library = args.build_directory.resolve() / "bin/llama-server-impl.dll"
@@ -418,6 +471,11 @@ def main():
         if pair_timing:
             require_binary_strings(library.with_name("ggml-vulkan.dll"), ("mtp gate-up timing:",))
             require_binary_strings(library.with_name("llama.dll"), ("mtp gate-up host IDs:",))
+        if pair_precompute:
+            require_binary_strings(library.with_name("ggml-vulkan.dll"), (GATE_UP_PRECOMPUTE, "precomputed_dispatches="))
+        if pair_compact:
+            require_binary_strings(library.with_name("ggml-vulkan.dll"), (GATE_UP_COMPACT, "mtp gate-up compact:"))
+            require_binary_strings(library.with_name("llama.dll"), ("mtp gate-up host IDs:",))
         baseline = COMMON["build_environment"]()
         baseline.update({"LLAMA_EXPERT_PREFILL_512": "1", "LLAMA_EXPERT_PREFILL_512_POLICY": "auto",
                          "LLAMA_EXPERT_PREFILL_LOGICAL_TICKS": "1", "LLAMA_EXPERT_PREFILL_OVERLAP_TEN": "1",
@@ -428,7 +486,9 @@ def main():
                          EMPTY_RESET: "0", "GGML_VK_GPU_TIMESTAMPS_DEVICE": None, ROUTED_STATS: None,
                          ROUTED_REDUCE: "1" if args.routed_weighted or gate_up else "0",
                          ROUTED_WEIGHTED: "1" if gate_up else "0", GATE_UP: "1" if args.routed_gate_up_pair else "0",
-                         GATE_UP_PAIR: "0", "LLAMA_MTP_VERIFY_THREE_FAST": "0",
+                         GATE_UP_PAIR: "1" if pair_precompute else "0", GATE_UP_PRECOMPUTE: "0",
+                         "LLAMA_MTP_VERIFY_THREE_FAST": "0",
+                         GATE_UP_COMPACT: "0", GATE_UP_PROOF: "1" if pair_compact else "0",
                          "GGML_VK_MTP_GATE_UP_TIMING": "1" if pair_timing else "0"})
         if gate_up or args.fast_three:
             baseline["LLAMA_MTP_PAIR_EXPERT_OVERLAP"] = None
@@ -448,7 +508,12 @@ def main():
         _, message = COMMON["prepare_inputs"](directory)
         order = arm_order(args.rotation, args.reverse)
         if paired:
-            order = ("on", "off") if args.on_first else ("off", "on")
+            if pair_compact:
+                order = ("off", "precomputed", "compact")
+                if args.on_first:
+                    order = order[::-1]
+            else:
+                order = ("on", "off") if args.on_first else ("off", "on")
             producer = runpy.run_path(str(HERE / "compare-shared-input-producer.py"))
         elif args.routed_dispatch:
             order = ("width-2",)
@@ -483,10 +548,16 @@ def main():
             metadata.update(routed_reduce=True, toggled_flag=ROUTED_WEIGHTED)
         if gate_up:
             metadata.update(routed_reduce=True, routed_weighted=True,
-                            toggled_flag=GATE_UP_PAIR if args.routed_gate_up_pair else GATE_UP)
+                            toggled_flag=GATE_UP_PRECOMPUTE if pair_precompute else GATE_UP_PAIR if args.routed_gate_up_pair else GATE_UP)
         if args.fast_three:
             metadata.update(width_3_fast=True, hc_all=True, router_weighted=True, routed_reduce=True, gate_up=True,
                             output_scope="Reports exact token-ID agreement and per-arm MTP acceptance. Depth may change generated IDs.")
+        if pair_compact:
+            metadata.pop("toggled_flag", None)
+            metadata["compact_scope"] = (
+                "Warm wall and generation timings with no GPU queries. Native counters include warmup. "
+                "pair_groups_y counts launched workgroups along expert rank before output-width multiplication. "
+                "Compact selects only matched ranks; remaining ranks use the existing single shader.")
         if pair_timing:
             metadata["gpu_timing_scope"] = (
                 "Only MI50 gate/up+SwiGLU dispatch timestamps, including warmup. Resident/nonresident are "
@@ -503,9 +574,14 @@ def main():
                 enabled = label == "on"
                 toggles = (HC_PROJECTIONS if args.hc_all else (EMPTY_RESET,) if args.empty_reset
                            else (ROUTED_REDUCE,) if args.routed_reduce else (ROUTED_WEIGHTED,) if args.routed_weighted
-                           else (GATE_UP,) if args.routed_gate_up else (GATE_UP_PAIR,) if args.routed_gate_up_pair
+                           else (GATE_UP,) if args.routed_gate_up else (GATE_UP_PRECOMPUTE,) if pair_precompute
+                           else (GATE_UP_PAIR,) if args.routed_gate_up_pair
                            else (producer["FLAG"],))
                 environment = dict(baseline, **dict.fromkeys(toggles, "1" if enabled else "0"))
+                if pair_compact:
+                    environment.update({GATE_UP_PAIR: "0" if label == "off" else "1",
+                                        GATE_UP_PRECOMPUTE: "0" if label == "off" else "1",
+                                        GATE_UP_COMPACT: "1" if label == "compact" else "0"})
                 result, token_ids = run_arm(case, library, "width-2", environment, message, token_ids)
                 log = (case / "server.log").read_text(encoding="utf-8", errors="replace")
                 result["producer_including_warmup"] = checked_producer_metrics(
@@ -517,8 +593,14 @@ def main():
                 if routed_pair:
                     required = ("reduce_dispatches", "weighted_dispatches") if args.routed_weighted or gate_up else ("reduce_dispatches",)
                     result["routed_dispatch"] = routed_dispatch_metrics(log, result, required)
+                if pair_compact:
+                    result["compact_gate_up"] = gate_up_compact_metrics(log)
                 if gate_up:
-                    result["gate_up"] = gate_up_metrics(log, result["routed_dispatch"], require_pair=args.routed_gate_up_pair)
+                    compact_singles = result["compact_gate_up"]["compact_singles"] if pair_compact else 0
+                    result["gate_up"] = gate_up_metrics(log, result["routed_dispatch"], require_pair=args.routed_gate_up_pair,
+                                                       require_precomputed=pair_precompute or pair_compact, compact_singles=compact_singles)
+                    if pair_compact and label == "compact":
+                        result["gate_up"]["pair_scope"] = "Two output positions per compact pair workgroup along the expert-rank axis."
                 if pair_timing:
                     result["gate_up_timing"] = gate_up_timing_metrics(log)
                 write_json(case / "metrics.json", result)
@@ -536,7 +618,12 @@ def main():
                     write_json(case / "metrics.json", result)
             results[label] = result
         require(hashes == COMMON["binary_hashes"](library), "binaries changed during comparison")
-        if paired:
+        if pair_compact:
+            comparisons = {
+                f"{right}_vs_{left}": paired_comparison(results[left], results[right])
+                for left, right in (("off", "precomputed"), ("off", "compact"), ("precomputed", "compact"))
+            }
+        elif paired:
             comparisons = {"on_vs_off": paired_comparison(results["off"], results["on"])}
             if routed_pair:
                 off, on = (results[mode]["routed_dispatch"] for mode in ("off", "on"))
@@ -560,6 +647,8 @@ def main():
                     comparable = (0 < left["phases"] == right["phases"]
                                   and left["proven"] == right["proven"] == left["phases"]
                                   and left["matched"] == right["matched"]
+                                  and (not pair_precompute or (left["shared"] == right["shared"] and
+                                                              left["dispatches"] == right["dispatches"]))
                                   and not (left["dropped"] or right["dropped"]))
                     delta = right["mean_gpu_ns_per_phase"] - left["mean_gpu_ns_per_phase"] if comparable else None
                     timing_comparison[group] = dict(off=left, on=right, comparable=comparable, on_minus_off_ns_per_phase=delta)
@@ -578,20 +667,36 @@ def main():
                     "prompt_token_ids_sha256": COMMON["sha256"](prompt_path.read_bytes())})
         for mode, result in results.items():
             print(f"{mode}: pooled {result['pooled_decode_tok_s']:.2f} decode tok/s")
+            if pair_compact:
+                proof = result["compact_gate_up"]
+                print(f"  gate/up dispatches={result['gate_up']['dispatches']} "
+                      f"pair groups y={proof['pair_groups_y']} shared experts={proof['shared']}")
         print(json.dumps(results["width-2"]["routed_dispatch"] if args.routed_dispatch else comparisons, indent=2))
         if pair_timing:
             off, on = (results[mode]["gate_up_timing"] for mode in ("off", "on"))
-            require(sum(group["shared"] for group in off.values()) == 0
-                    and sum(group["shared"] for group in on.values()) > 0,
-                    "no matching Expert pairs were proven in recorded ON dispatches")
-        if routed_pair:
+            shared_off, shared_on = (sum(group["shared"] for group in arm.values()) for arm in (off, on))
+            if pair_precompute:
+                require(shared_off == shared_on > 0, "the two arms did not prove the same actual Expert pairs")
+            else:
+                require(shared_off == 0 < shared_on, "no matching Expert pairs were proven in recorded ON dispatches")
+        if pair_compact:
+            check_gate_up_compact_comparison(results)
+            require(all(summary["observed_workload_matches"] for summary in comparisons.values()),
+                    "compact gate/up comparison changed tokens or observed workload")
+        elif routed_pair:
             outcome = comparisons["on_vs_off"]
             if gate_up:
                 off, on = outcome["gate_up"]["off"], outcome["gate_up"]["on"]
                 if args.routed_gate_up_pair:
-                    require(off["dispatches"] > 0 and off["pair_dispatches"] == 0 and on["pair_dispatches"] > 0,
-                            "gate/up pair did not activate exclusively in ON")
                     keys = ("ordinary", "full_hot", "iq2_s", "iq3_xxs", "iq4_xs", "equivalent_single_dispatches")
+                    if pair_precompute:
+                        require(off["pair_dispatches"] > 0 and off["precomputed_dispatches"] == 0
+                                and on["precomputed_dispatches"] == on["pair_dispatches"] > 0,
+                                "host-precomputed ranks did not cover every ON pair dispatch")
+                        keys += ("dispatches", "pair_dispatches", "pair_slots")
+                    else:
+                        require(off["dispatches"] > 0 and off["pair_dispatches"] == 0 and on["pair_dispatches"] > 0,
+                                "gate/up pair did not activate exclusively in ON")
                     require(all(off[key] == on[key] for key in keys), "gate/up pair changed projection coverage")
                 else:
                     require(off["dispatches"] == 0 and on["dispatches"] > 0,

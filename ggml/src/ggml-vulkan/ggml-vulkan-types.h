@@ -831,6 +831,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_id_iq4_nl_pair[DMMV_WG_SIZE_COUNT];
     vk_pipeline pipeline_mtp_gate_up[GGML_TYPE_COUNT];
     vk_pipeline pipeline_mtp_gate_up_pair[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_mtp_gate_up_pair_precomputed[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1417,6 +1418,15 @@ struct ggml_backend_vk_context {
     uint64_t mtp_three_reduce_dispatches = 0;
     uint64_t mtp_gate_up_pair_dispatches = 0;
     uint64_t mtp_gate_up_pair_slots = 0;
+    uint64_t mtp_gate_up_pair_precomputed = 0;
+    uint64_t mtp_gate_up_pair_workgroups_y = 0;
+    uint64_t mtp_gate_up_compact_phases = 0;
+    uint64_t mtp_gate_up_compact_dispatches = 0;
+    uint64_t mtp_gate_up_compact_singles = 0;
+    uint64_t mtp_gate_up_proof_phases = 0;
+    uint64_t mtp_gate_up_proof_covered = 0;
+    uint64_t mtp_gate_up_proof_matching = 0;
+    uint64_t mtp_gate_up_proof_shared = 0;
     uint64_t mtp_gate_up_ordinary = 0;
     uint64_t mtp_gate_up_full_hot = 0;
     uint64_t mtp_gate_up_quant[GGML_TYPE_COUNT] {};

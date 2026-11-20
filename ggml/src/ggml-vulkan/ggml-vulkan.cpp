@@ -92,6 +92,30 @@ static bool ggml_vk_packed_experts_configured() {
     return configured;
 }
 
+static bool ggml_vk_gate_up_precompute() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_VK_MTP_GATE_UP_PRECOMPUTE");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_gate_up_compact() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_VK_MTP_GATE_UP_COMPACT");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_gate_up_proof() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_VK_MTP_GATE_UP_PROOF");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_vk_mtp_three_fast() {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_MTP_VERIFY_THREE_FAST");
@@ -3577,6 +3601,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (gate_up_pair && strcmp(gate_up_pair, "1") == 0) {
                 CREATE_GATE_UP(GGML_TYPE_IQ2_S, mul_mat_vec_id_iq2_s_gate_up_pair, pipeline_mtp_gate_up_pair, vk_mat_vec_id_pair_push_constants)
                 CREATE_GATE_UP(GGML_TYPE_IQ3_XXS, mul_mat_vec_id_iq3_xxs_gate_up_pair, pipeline_mtp_gate_up_pair, vk_mat_vec_id_pair_push_constants)
+                if (ggml_vk_gate_up_precompute()) {
+                    CREATE_GATE_UP(GGML_TYPE_IQ2_S, mul_mat_vec_id_iq2_s_gate_up_pair_precomputed,
+                            pipeline_mtp_gate_up_pair_precomputed, vk_mat_vec_id_pair_precomputed_push_constants)
+                    CREATE_GATE_UP(GGML_TYPE_IQ3_XXS, mul_mat_vec_id_iq3_xxs_gate_up_pair_precomputed,
+                            pipeline_mtp_gate_up_pair_precomputed, vk_mat_vec_id_pair_precomputed_push_constants)
+                }
             }
 #undef CREATE_GATE_UP
         }
@@ -8521,6 +8551,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
+    auto & precomputed = ctx->device->pipeline_mtp_gate_up_pair_precomputed[src0->type];
+    const bool compact_requested = gate_up && nei1 == 2 && precomputed && ggml_vk_gate_up_compact();
+    const bool count_proof = gate_up && nei1 == 2 && ctx->mtp_routed_stats_active && ggml_vk_gate_up_proof() &&
+            (src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS);
     const uint32_t nbi1 = (uint32_t)(ids->nb[1] / sizeof(int));
 
     const uint64_t ne20 = dst->ne[0];
@@ -8606,7 +8640,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1 * (ctx->expert_overlap.projection == dst ? 2 : 1));
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv,
+                (nei1 + compact_requested) * (ctx->expert_overlap.projection == dst ? 2 : 1));
     }
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, gate_up ? gate_up : cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
@@ -8746,14 +8781,15 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                     timing.pool, 2 * sample + 1);
         }
     };
-    const auto prove_pairs = [&](const uint32_t * masks, bool pair_dispatch) {
-        if (!time_gate_up || !(masks[0] || masks[1])) {
-            return;
+    const auto match_pairs = [&](const uint32_t * masks, bool pair_dispatch, uint32_t (&partners)[2], uint32_t & matched0) {
+        if ((!time_gate_up && !count_proof && !(gate_up && pair_dispatch && precomputed)) || !(masks[0] || masks[1])) {
+            return false;
         }
         auto & group = timing.totals[timing_group];
-        ++group.phases;
+        group.phases += time_gate_up;
+        ctx->mtp_gate_up_proof_phases += count_proof;
         if (!timing.lookup || (ids != timing.lookup && ids->view_src != timing.lookup && ids->src[0] != timing.lookup)) {
-            return;
+            return false;
         }
         uint32_t matches = 0;
         for (unsigned first = 0; first < 10; ++first) {
@@ -8768,7 +8804,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             for (unsigned earlier = 0; earlier < first; ++earlier) {
                 if ((masks[0] & (1u << earlier)) && timing.slots[earlier] == slot) {
                     if (timing.experts[earlier] != timing.experts[first]) {
-                        return;
+                        return false;
                     }
                     duplicate = true;
                     break;
@@ -8780,16 +8816,29 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             for (unsigned second = 0; second < 10; ++second) {
                 if ((masks[1] & (1u << second)) && timing.slots[10 + second] == slot) {
                     if (timing.experts[10 + second] != timing.experts[first]) {
-                        return;
+                        return false;
                     }
+                    const auto word = first / 8;
+                    const auto shift = 4 * (first % 8);
+                    partners[word] = (partners[word] & ~(15u << shift)) | (second << shift);
+                    partners[1] |= 1u << (8 + second);
+                    matched0 |= 1u << first;
                     ++matches;
                     break;
                 }
             }
         }
-        ++group.proven;
-        group.matched += matches;
-        group.shared += pair_dispatch ? matches : 0;
+        if (time_gate_up) {
+            ++group.proven;
+            group.matched += matches;
+            group.shared += pair_dispatch ? matches : 0;
+        }
+        if (count_proof) {
+            ++ctx->mtp_gate_up_proof_covered;
+            ctx->mtp_gate_up_proof_matching += matches;
+            ctx->mtp_gate_up_proof_shared += pair_dispatch ? matches : 0;
+        }
+        return true;
     };
 
     const auto dispatch = [&](uint32_t expert_i1, uint32_t expert_mask, uint32_t positions) {
@@ -8820,38 +8869,64 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const auto dispatch_masks = [&](const uint32_t * masks) {
         const bool pair_dispatch = pair && masks[0] && masks[1];
-        prove_pairs(masks, pair_dispatch);
-        if (pair_dispatch) {
-            const uint32_t count = ggml_vk_expert_position_count(masks[0]) + ggml_vk_expert_position_count(masks[1]);
+        // The low 40 bits cover ten token-0 ranks. The next ten bits mark token-1 ranks to skip.
+        uint32_t partners[2] = { UINT32_MAX, 0xffu };
+        uint32_t matched0 = 0;
+        const bool proven = match_pairs(masks, pair_dispatch, partners, matched0);
+        const bool use_precomputed = gate_up && precomputed && proven;
+        const bool compact = pair_dispatch && compact_requested && use_precomputed;
+        const uint32_t matched1 = partners[1] >> 8;
+        if (compact && ctx->mtp_routed_stats_active) {
+            ++ctx->mtp_gate_up_compact_phases;
+        }
+        if (pair_dispatch && (!compact || matched0)) {
+            const uint32_t pair_mask0 = compact ? matched0 : masks[0];
+            const uint32_t pair_mask1 = compact ? 0 : masks[1];
+            const uint32_t count = ggml_vk_expert_position_count(pair_mask0) + ggml_vk_expert_position_count(pair_mask1);
             const vk_mat_vec_id_pair_push_constants pc = {
                 {
                     (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
                     stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
-                    0, (uint32_t)nei0, (uint32_t)ne11, 0, nbi1, masks[0]
+                    0, (uint32_t)nei0, (uint32_t)ne11, 0, nbi1, pair_mask0
                 },
-                masks[1], (uint32_t)src0->ne[2],
+                pair_mask1, (uint32_t)src0->ne[2],
             };
-            // The descriptor sets reserved for the single-token dispatches also cover this dispatch.
-            ggml_pipeline_request_descriptor_sets(ctx, pair, 0);
+            // The descriptor sets reserved above cover the pair and remaining singles.
+            auto & selected_pair = use_precomputed ? precomputed : pair;
+            ggml_pipeline_request_descriptor_sets(ctx, selected_pair, 0);
             const int timing_sample = begin_timing();
-            ggml_vk_dispatch_pipeline(ctx, subctx, pair, { d_X, d_Y, d_D, d_F0, d_F1, d_ids },
-                                      pc, { groups_x, count, groups_z });
+            if (use_precomputed) {
+                const vk_mat_vec_id_pair_precomputed_push_constants params = { pc, { partners[0], partners[1] } };
+                ggml_vk_dispatch_pipeline(ctx, subctx, selected_pair, { d_X, d_Y, d_D, d_F0, d_F1, d_ids },
+                                          params, { groups_x, count, groups_z });
+            } else {
+                ggml_vk_dispatch_pipeline(ctx, subctx, selected_pair, { d_X, d_Y, d_D, d_F0, d_F1, d_ids },
+                                          pc, { groups_x, count, groups_z });
+            }
             end_timing(timing_sample);
             if (gate_up) {
                 if (ctx->mtp_routed_stats_active) {
                     ++ctx->mtp_gate_up_dispatches;
                     ++ctx->mtp_gate_up_pair_dispatches;
-                    ctx->mtp_gate_up_pair_slots += count;
+                    ctx->mtp_gate_up_pair_slots += compact ? 2 * count : count;
+                    ctx->mtp_gate_up_pair_workgroups_y += count;
+                    ctx->mtp_gate_up_pair_precomputed += use_precomputed;
+                    ctx->mtp_gate_up_compact_dispatches += compact;
                 }
             } else {
                 ++ctx->expert_pair_dispatches;
             }
-            return;
+            if (!compact) {
+                return;
+            }
         }
         for (uint32_t token = 0; token < nei1; ++token) {
-            const uint32_t count = ggml_vk_expert_position_count(masks[token]);
+            const uint32_t paired = token == 0 ? matched0 : matched1;
+            const uint32_t remaining = compact ? masks[token] & ~paired : masks[token];
+            const uint32_t count = ggml_vk_expert_position_count(remaining);
             if (count) {
-                dispatch(token, masks[token], count);
+                dispatch(token, remaining, count);
+                ctx->mtp_gate_up_compact_singles += compact && matched0 && ctx->mtp_routed_stats_active;
             }
         }
     };
@@ -8881,13 +8956,15 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         dispatch_masks(cold_masks);
         overlap.projection = nullptr;
         ++overlap.split_projections;
-    } else if (pair || time_gate_up) {
+    } else if (pair || time_gate_up || count_proof) {
         const uint32_t full = UINT32_MAX >> (32 - nei0);
         const uint32_t masks[2] = { full, full };
         if (pair) {
             dispatch_masks(masks);
         } else {
-            prove_pairs(masks, false);
+            uint32_t partners[2] = { UINT32_MAX, 0xffu };
+            uint32_t matched0 = 0;
+            match_pairs(masks, false, partners, matched0);
             for (uint32_t token = 0; token < nei1; ++token) {
                 dispatch(token, 0, (uint32_t)nei0);
             }
@@ -14579,10 +14656,18 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (ctx->mtp_routed_stats_seen) {
         GGML_LOG_INFO("mtp gate-up Vulkan: device=%s dispatches=%" PRIu64 " ordinary=%" PRIu64
                 " full_hot=%" PRIu64 " iq2_s=%" PRIu64 " iq3_xxs=%" PRIu64 " iq4_xs=%" PRIu64
-                " pair_dispatches=%" PRIu64 " pair_slots=%" PRIu64 "\n",
+                " pair_dispatches=%" PRIu64 " pair_slots=%" PRIu64 " precomputed_dispatches=%" PRIu64 "\n",
                 ctx->name.c_str(), ctx->mtp_gate_up_dispatches, ctx->mtp_gate_up_ordinary, ctx->mtp_gate_up_full_hot,
                 ctx->mtp_gate_up_quant[GGML_TYPE_IQ2_S], ctx->mtp_gate_up_quant[GGML_TYPE_IQ3_XXS], ctx->mtp_gate_up_quant[GGML_TYPE_IQ4_XS],
-                ctx->mtp_gate_up_pair_dispatches, ctx->mtp_gate_up_pair_slots);
+                ctx->mtp_gate_up_pair_dispatches, ctx->mtp_gate_up_pair_slots, ctx->mtp_gate_up_pair_precomputed);
+        if (ggml_vk_gate_up_proof()) {
+            GGML_LOG_INFO("mtp gate-up compact: pair_groups_y=%" PRIu64 " compact_phases=%" PRIu64
+                    " compact_dispatches=%" PRIu64 " compact_singles=%" PRIu64
+                    " phases=%" PRIu64 " proven=%" PRIu64 " matched=%" PRIu64 " shared=%" PRIu64 "\n",
+                    ctx->mtp_gate_up_pair_workgroups_y, ctx->mtp_gate_up_compact_phases, ctx->mtp_gate_up_compact_dispatches,
+                    ctx->mtp_gate_up_compact_singles, ctx->mtp_gate_up_proof_phases, ctx->mtp_gate_up_proof_covered,
+                    ctx->mtp_gate_up_proof_matching, ctx->mtp_gate_up_proof_shared);
+        }
         GGML_LOG_INFO("mtp routed Vulkan: device=%s add_dispatches=%" PRIu64 " multi_add_dispatches=%" PRIu64
                 " reduce_dispatches=%" PRIu64 " weighted_dispatches=%" PRIu64
                 " other_fused_groups=%" PRIu64 " recorded_adds=%" PRIu64 " aggregates=%" PRIu64
@@ -18901,7 +18986,7 @@ static void ggml_backend_vk_set_gate_up_diagnostic_ids(ggml_backend_t backend, c
                                                        const int32_t * ids, const int32_t * selected_slots) {
     auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
     auto & timing = ctx->gate_up_diagnostic;
-    if (!timing.pool) {
+    if (!timing.pool && !ggml_vk_gate_up_precompute() && !ggml_vk_gate_up_proof()) {
         return;
     }
     timing.lookup = lookup;

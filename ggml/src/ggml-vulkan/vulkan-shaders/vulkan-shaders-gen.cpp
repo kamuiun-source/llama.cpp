@@ -824,6 +824,10 @@ void process_shaders() {
                 string_to_spv(name + "_pair", shader, pair);
                 string_to_spv(name + "_pair_subgroup", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD", "1"}}));
                 string_to_spv(name + "_pair_subgroup_no_shmem", shader, merge_maps(pair, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+                const auto precomputed = merge_maps(pair, {{"MOE_GATE_UP_PRECOMPUTED", "1"}});
+                string_to_spv(name + "_pair_precomputed", shader, precomputed);
+                string_to_spv(name + "_pair_precomputed_subgroup", shader, merge_maps(precomputed, {{"USE_SUBGROUP_ADD", "1"}}));
+                string_to_spv(name + "_pair_precomputed_subgroup_no_shmem", shader, merge_maps(precomputed, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
             }
         }
         if (tname == "iq4_nl") {

@@ -35,6 +35,10 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID_PAIR
     uint expert_mask_1;
     uint n_experts;
+#ifdef MOE_GATE_UP_PRECOMPUTED
+    uint partners0;
+    uint partners1;
+#endif
 #endif
 #else
     uint base_work_group_y;
@@ -119,6 +123,7 @@ bool pair_active;
 uint pair_d_offset;
 uint pair_b_offset;
 
+#ifndef MOE_GATE_UP_PRECOMPUTED
 uint first_matching_rank(int expert, uint token, uint mask) {
     while (mask != 0) {
         const uint rank = uint(findLSB(mask));
@@ -129,6 +134,7 @@ uint first_matching_rank(int expert, uint token, uint mask) {
     }
     return p.nei0;
 }
+#endif
 
 bool get_pair_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     const uint count_0 = uint(bitCount(p.expert_mask));
@@ -152,6 +158,18 @@ bool get_pair_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     a_offset = expert_id * (p.batch_stride_a / QUANT_K);
     b_offset = token*p.batch_stride_b + (rank % p.ne11)*p.stride_b;
 
+#ifdef MOE_GATE_UP_PRECOMPUTED
+    if (token == 1) {
+        return (p.partners1 & (1u << (8 + rank))) == 0;
+    }
+    const uint partner_word = rank < 8 ? p.partners0 : p.partners1;
+    const uint other_rank = (partner_word >> (4 * (rank & 7))) & 15u;
+    if (other_rank < p.nei0) {
+        pair_active = true;
+        pair_b_offset = p.batch_stride_b + (other_rank % p.ne11)*p.stride_b;
+        pair_d_offset = p.batch_stride_d + other_rank*p.stride_d;
+    }
+#else
     // Pair only the first active occurrence in each token.
     const uint earlier = mask & ((1u << rank) - 1u);
     if (first_matching_rank(expert, token, earlier) == p.nei0) {
@@ -166,6 +184,7 @@ bool get_pair_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
             pair_d_offset = p.batch_stride_d + other_rank*p.stride_d;
         }
     }
+#endif
     return true;
 }
 
