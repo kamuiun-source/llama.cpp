@@ -10,6 +10,8 @@
 struct llama_model_loader;
 
 struct llama_expert_placement {
+    enum class hip_overlap_mode { off, serial, async };
+
     struct weight {
         int layer;
         uint16_t shard;
@@ -33,6 +35,7 @@ struct llama_expert_placement {
     const ggml_backend_dev_t target;
     const int32_t max_ubatch;
     const int32_t n_slots;
+    const hip_overlap_mode hip_overlap;
     const bool overlap;
     const bool dynamic_resident;
     const int32_t prefill_tokens;

@@ -556,6 +556,7 @@ struct llama_moe_cache::impl {
     size_t profile_upload_steps = 0;
     size_t profile_upload_bytes = 0;
     ggml_backend_buffer_ptr packed_staging;
+    ggml_backend_ptr hip_upload_backend;
     std::vector<moe_cache_lru::fill> fills; // packed fills use logical scratch indices
     std::vector<moe_cache_lru::fill> cpu;
 
@@ -799,7 +800,9 @@ struct llama_moe_cache::impl {
                 packed_staging.reset(alloc_host_upload_buffer(placement->target, staging_bytes));
             }
             const char * hip_pinned = std::getenv("LLAMA_EXPERT_HIP_PINNED_UPLOAD");
-            const bool hip_upload_requested = std::strcmp(target_name, "ROCm") == 0 && hip_pinned && std::strcmp(hip_pinned, "1") == 0;
+            const bool hip_overlap = placement->hip_overlap != llama_expert_placement::hip_overlap_mode::off;
+            const bool hip_upload_requested = hip_overlap ||
+                    (std::strcmp(target_name, "ROCm") == 0 && hip_pinned && std::strcmp(hip_pinned, "1") == 0);
             if (hip_upload_requested) {
                 const auto buft = ggml_backend_dev_host_buffer_type(placement->target);
                 ggml_backend_buffer_ptr buffer(buft ? ggml_backend_buft_alloc_buffer(buft, staging_bytes) : nullptr);
@@ -808,6 +811,8 @@ struct llama_moe_cache::impl {
                     packed_staging = std::move(buffer);
                     LLAMA_LOG_INFO("packed expert HIP pinned upload: %zu bytes of staging on %s\n",
                             ggml_backend_buffer_get_size(packed_staging.get()), ggml_backend_dev_name(placement->target));
+                } else if (hip_overlap) {
+                    throw std::runtime_error("HIP expert overlap requires pinned host staging");
                 } else {
                     LLAMA_LOG_WARN("packed expert HIP pinned upload unavailable, using serial uploads\n");
                 }
@@ -816,9 +821,18 @@ struct llama_moe_cache::impl {
                 fills.reserve(placement->n_slots);
                 if (placement->overlap) {
                     packed_cold_scratch.reserve(placement->n_slots);
-                    const char * early_copy = std::getenv("LLAMA_EXPERT_OVERLAP_EARLY_COPY");
-                    packed_early_copy = !early_copy || std::strcmp(early_copy, "0") != 0;
-                    LLAMA_LOG_INFO("packed expert overlap: early cold uploads %s\n", packed_early_copy ? "enabled" : "disabled");
+                    if (hip_overlap) {
+                        hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
+                        if (!hip_upload_backend) {
+                            throw std::runtime_error("could not initialize the HIP expert upload backend");
+                        }
+                        LLAMA_LOG_INFO("packed expert HIP split: cold uploads %s\n",
+                                placement->hip_overlap == llama_expert_placement::hip_overlap_mode::async ? "overlapped" : "serialized");
+                    } else {
+                        const char * early_copy = std::getenv("LLAMA_EXPERT_OVERLAP_EARLY_COPY");
+                        packed_early_copy = !early_copy || std::strcmp(early_copy, "0") != 0;
+                        LLAMA_LOG_INFO("packed expert overlap: early cold uploads %s\n", packed_early_copy ? "enabled" : "disabled");
+                    }
                 }
                 LLAMA_LOG_INFO("packed expert %s upload: %zu bytes of native host staging on %s (%s)\n",
                         placement->overlap ? "overlap" : "batch", ggml_backend_buffer_get_size(packed_staging.get()),
@@ -1156,6 +1170,7 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         // The context synchronizes its backends before destroying the cache.
+        wait_hip_cold_upload();
         GGML_ASSERT(!pending_writeback);
         if (compact_upload_job) {
             prefill_destroy(compact_upload_job);
@@ -1834,7 +1849,18 @@ struct llama_moe_cache::impl {
         }
     }
 
-    size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold, bool * submitted = nullptr, size_t retry_bytes = 0) {
+    void wait_hip_cold_upload() {
+        if (hip_upload_backend && placement->hip_overlap == llama_expert_placement::hip_overlap_mode::async &&
+                pending_layer >= 0 && pending_upload_bytes != 0) {
+            const int64_t start = ggml_time_us();
+            ggml_backend_synchronize(hip_upload_backend.get());
+            packed_wait_us += ggml_time_us() - start;
+        }
+    }
+
+    size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
+                         bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false) {
+        GGML_ASSERT(!hip_async || (cold && !submitted));
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
         const auto & map = placement->maps[il];
         auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
@@ -1863,7 +1889,7 @@ struct llama_moe_cache::impl {
             }
             throw;
         }
-        if (!submitted || !*submitted) {
+        if (!hip_async && (!submitted || !*submitted)) {
             ggml_backend_synchronize(backend);
         }
         return bytes;
@@ -2091,7 +2117,9 @@ struct llama_moe_cache::impl {
         if (placement && placement->overlap && has_cpu) {
             // The resident split does not read the separate cold bank. The hot map readback waited for older users.
             GGML_ASSERT(pending_layer == il);
-            if (!fills.empty() && pending_upload_bytes == 0) {
+            if (hip_upload_backend) {
+                wait_hip_cold_upload();
+            } else if (!fills.empty() && pending_upload_bytes == 0) {
                 // A failed upload can leave the old cold slot only partly intact.
                 for (const auto & fill : fills) {
                     l.packed_scratch[fill.slot] = -1;
@@ -2224,6 +2252,7 @@ struct llama_moe_cache::impl {
             }
             if (placement->overlap) {
                 // An interrupted graph can leave an unconsumed plan.
+                wait_hip_cold_upload();
                 pending_layer = -1;
                 pending_upload_bytes = 0;
                 packed_cold_scratch = l.packed_scratch;
@@ -2422,6 +2451,18 @@ struct llama_moe_cache::impl {
                 pending_layer = il;
                 pending_permanent_hits = hits;
                 pending_scratch_hits = scratch_hits;
+                if (hip_upload_backend && !fills.empty()) {
+                    // Older cold readers have completed before this callback. Do not retain slots from an abandoned plan.
+                    for (const auto & fill : fills) {
+                        l.packed_scratch[fill.slot] = -1;
+                    }
+                    const int64_t upload_start = ggml_time_us();
+                    const bool async = placement->hip_overlap == llama_expert_placement::hip_overlap_mode::async;
+                    pending_upload_bytes = upload_packed(hip_upload_backend.get(), l, il, true, nullptr, 0, async);
+                    packed_wait_us += ggml_time_us() - upload_start;
+                    ++packed_wait_count;
+                    packed_early_upload_steps += async;
+                }
                 return true;
             }
             if (use_waves) {
