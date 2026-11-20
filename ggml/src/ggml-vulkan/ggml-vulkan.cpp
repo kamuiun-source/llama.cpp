@@ -16218,7 +16218,8 @@ static bool ggml_backend_vk_supports_graph_upload(ggml_backend_t backend, const 
     const auto * ctx = static_cast<const ggml_backend_vk_context *>(backend->context);
     const auto buft = &ctx->device->buffer_type;
     if (!ctx->device->support_async || ctx->device->serialize_submissions || ctx->device->async_use_transfer_queue ||
-            vk_perf_logger_enabled || !upload->staging || upload->staging->buft != buft) {
+            vk_perf_logger_enabled || !upload->staging || upload->staging->buft != buft ||
+            upload->single_submit_nodes > ctx->device->max_nodes_per_submit) {
         return false;
     }
     const auto & staging = static_cast<const ggml_backend_vk_buffer_context *>(upload->staging->context)->dev_buffer;
@@ -16228,7 +16229,7 @@ static bool ggml_backend_vk_supports_graph_upload(ggml_backend_t backend, const 
     }
     for (size_t i = 0; i < 3; ++i) {
         const auto * dst = upload->dst[i];
-        if (!dst && i == 2) {
+        if (!dst && i > 0 && (i == 2 || !upload->dst[2])) {
             break;
         }
         if (!dst || !dst->buffer || dst->buffer->buft != buft || dst->view_src || !dst->data || !ggml_is_contiguous(dst)) {
@@ -16307,7 +16308,8 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
 
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
-    const bool compact_experts = ggml_vk_compact_expert_graph(ctx, cgraph);
+    const bool single_submit = upload && upload->single_submit_nodes != 0;
+    const bool compact_experts = single_submit || ggml_vk_compact_expert_graph(ctx, cgraph);
 
     auto & overlap = ctx->expert_overlap;
     if (overlap.projection && std::find(cgraph->nodes, cgraph->nodes + cgraph->n_nodes, overlap.projection) ==
@@ -16385,7 +16387,7 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         }
     }
     // small graphs gain nothing from splitting, each submit costs CPU time
-    uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
+    uint64_t flops_per_submit = single_submit || ctx->last_total_flops < 1'000'000'000ULL ? 0 :
         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
 
     auto const submit_after = [&](int start, int end) {

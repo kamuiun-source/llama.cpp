@@ -168,7 +168,11 @@ struct llama_context {
     void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false);
+    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false,
+               llama_mtp_draft_row draft_row = llama_mtp_draft_row::normal);
+    const float * read_mtp_first_draft_row(int32_t index);
+    void discard_mtp_first_draft_row();
+    llama_mtp_draft_row_stats get_mtp_draft_row_stats() const { return mtp_draft_row_stats; }
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -506,6 +510,9 @@ private:
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
     bool mtp_device_pending         = false;
+    bool mtp_first_draft_ready       = false;
+    ggml_tensor * mtp_first_draft_row = nullptr;
+    llama_mtp_draft_row_stats mtp_draft_row_stats;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

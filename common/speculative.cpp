@@ -1574,6 +1574,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
     bool device_pending = false;
+    bool auto_draft_row_metrics = false;
+    bool auto_draft_row_lazy = false;
+    bool auto_device_pending = false;
+    bool auto_pending_host_valid = true;
+    size_t auto_pending_fallbacks = 0;
     bool device_pending_valid = false;
     size_t pending_copies = 0;
     size_t pending_h2d = 0;
@@ -1690,6 +1695,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
         const char * reuse = std::getenv("LLAMA_MTP_REUSE_DRAFT_ANCHOR");
         reuse_draft_anchor = single_candidate && reuse && std::strcmp(reuse, "1") == 0;
+        const char * mode = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        const char * lazy = std::getenv("LLAMA_MTP_AUTO_LAZY_DRAFT_ROW");
+        auto_draft_row_metrics = mode && std::strcmp(mode, "auto") == 0 && n_seq == 1 && n_mtp_layers == 1 &&
+                n_max == 2 && dev_rows && llama_n_ubatch(ctx_dft) == 1 && llama_supports_mtp_verify_three(ctx_tgt) &&
+                llama_get_model(ctx_tgt) != llama_get_model(ctx_dft) &&
+                is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
+        auto_draft_row_lazy = auto_draft_row_metrics && lazy && std::strcmp(lazy, "1") == 0;
+        const char * pending = std::getenv("LLAMA_MTP_AUTO_DEVICE_PENDING");
+        if (auto_draft_row_metrics && pending && std::strcmp(pending, "1") == 0) {
+            auto_device_pending = llama_enable_mtp_device_pending(ctx_dft);
+            if (!auto_device_pending) {
+                SPC_WRN("%s", "Auto MTP device pending unavailable; using host pending rows\n");
+            }
+        }
         if (single_candidate && !reuse_draft_anchor) {
             device_pending = llama_enable_mtp_device_pending(ctx_dft);
             if (device_pending) {
@@ -1704,6 +1723,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (auto_draft_row_metrics) {
+            const auto stats = llama_get_mtp_draft_row_stats(params.ctx_dft);
+            SPC_INF("MTP auto first draft row: enabled=%d candidates=%" PRIu64 " d2h=%" PRIu64
+                    " eager=%" PRIu64 " lazy=%" PRIu64 " skipped=%" PRIu64 " fallback=%" PRIu64 "\n",
+                    auto_draft_row_lazy, stats.candidates, stats.eager_d2h + stats.lazy_d2h,
+                    stats.eager_d2h, stats.lazy_d2h, stats.skipped, stats.fallback);
+        }
+        if (auto_draft_row_metrics) {
+            SPC_INF("MTP auto target pending: enabled=%d d2d=%zu d2h=%zu h2d=%zu fallbacks=%zu draft_host_rows=%zu\n",
+                    auto_device_pending, pending_copies, pending_d2h, pending_h2d, auto_pending_fallbacks, draft_host_rows);
+        }
         if (reuse_draft_anchor) {
             SPC_INF("MTP draft anchor: reused=%zu\n", n_reused_anchors);
         }
@@ -1730,6 +1760,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool ensure_pending_device_row() {
         if (!device_pending_valid) {
+            if (auto_device_pending) {
+                if (!auto_pending_host_valid) {
+                    return false;
+                }
+                // A restored host row must not race a previous CUDA copy into the reserved row.
+                llama_synchronize(params.ctx_tgt);
+            }
             device_pending_valid = llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt, 1, pending_h[0].data());
             pending_h2d += device_pending_valid;
         }
@@ -1743,6 +1780,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         ++pending_copies;
         device_pending_valid = true;
         return true;
+    }
+
+    bool save_auto_pending_row(int32_t row) {
+        device_pending_valid = false;
+        auto_pending_host_valid = false;
+        if (save_pending_device_row(row)) {
+            return true;
+        }
+        ++auto_pending_fallbacks;
+        auto_pending_host_valid = llama_get_embeddings_nextn_rows(params.ctx_tgt, row, 1, pending_h[0].data());
+        pending_d2h += auto_pending_host_valid;
+        return auto_pending_host_valid;
     }
 
     bool keep_mtp_anchor(llama_seq_id seq_id, llama_pos pos, llama_token token) override {
@@ -1851,7 +1900,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0 && !reuse_anchor) {
-                        if (device_pending) {
+                        if (device_pending || auto_device_pending) {
                             if (!ensure_pending_device_row()) {
                                 return false;
                             }
@@ -1940,7 +1989,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dev_rows) {
                 verify_row0[seq_id] = h_offset;
-                if (device_pending) {
+                if (auto_device_pending) {
+                    if (!save_auto_pending_row(h_offset + h_rows - 1)) {
+                        return false;
+                    }
+                } else if (device_pending) {
                     if (!save_pending_device_row(h_offset + h_rows - 1)) {
                         return false;
                     }
@@ -1993,6 +2046,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (llama_mtp_vocab_subset_enabled(params.ctx_dft) && (dp.temp != 0.0f || dp.result_q)) {
                 throw std::runtime_error("MTP draft vocabulary requires target temperature=0 and sample-and-match verification");
             }
+            const bool auto_pending_row = auto_device_pending && ensure_pending_device_row();
+            if (auto_device_pending && !auto_pending_row && !auto_pending_host_valid) {
+                continue;
+            }
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
@@ -2011,7 +2068,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            if (device_pending && ensure_pending_device_row()) {
+            if (auto_pending_row || (device_pending && ensure_pending_device_row())) {
                 batch.set_embd_state_row(idx, n_batch_tgt);
             } else {
                 batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
@@ -2044,7 +2101,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            const bool track_first_row = auto_draft_row_metrics && i == 0 && batch.size() == 1 && dparams[0].chain_mtp;
+            int ret = track_first_row ? llama_process_mtp_first_draft(ctx_dft, batch.get(), auto_draft_row_lazy) :
+                    llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2115,7 +2174,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 GGML_ASSERT(!device_pending);
                 if (defer_hidden_row) {
-                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                    h_row = track_first_row ? llama_read_mtp_first_draft_row(ctx_dft, i_last[seq_id]) :
+                            llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                    if (!h_row) {
+                        SPC_ERR("%s", "MTP first draft row is unavailable; ending the draft chain\n");
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
                 }
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
@@ -2141,6 +2207,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            if (track_first_row) {
+                llama_discard_mtp_first_draft_row(ctx_dft);
+            }
             if (batch.size() == 0) {
                 break;
             }
@@ -2178,7 +2247,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (dev_rows) {
             // process() already saved the last row.
             if (i_h != n_rows - 1) {
-                if (device_pending) {
+                if (auto_device_pending) {
+                    if (!save_auto_pending_row(verify_row0[seq_id] + i_h)) {
+                        SPC_ERR("%s", "Could not save the accepted Auto MTP target row\n");
+                    }
+                } else if (device_pending) {
                     GGML_ASSERT(save_pending_device_row(verify_row0[seq_id] + i_h));
                 } else {
                     pending_d2h += llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
@@ -2196,7 +2269,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        if (device_pending && device_pending_valid) {
+        if ((device_pending || auto_device_pending) && device_pending_valid) {
             std::vector<float> row(n_embd);
             if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt, 1, row.data())) {
                 return false;
@@ -2205,6 +2278,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             data.resize(row_bytes);
             std::memcpy(data.data(), row.data(), row_bytes);
             return true;
+        }
+        if (auto_device_pending && !auto_pending_host_valid) {
+            return false;
         }
         data.resize(row_bytes);
         std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
@@ -2222,6 +2298,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
         device_pending_valid = false;
+        auto_pending_host_valid = true;
         anchor = {};
     }
 };

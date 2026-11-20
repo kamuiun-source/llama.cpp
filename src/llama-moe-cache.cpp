@@ -2243,6 +2243,9 @@ struct llama_moe_cache::impl {
                         overlap_three_fit = overlap_three && cold_count <= placement->n_slots;
                         mtp_overlap_fit_layers += overlap_three_fit;
                         mtp_verify_max_cold = std::max(mtp_verify_max_cold, cold_count);
+                        if (sched && cold_count <= placement->n_slots) {
+                            ggml_backend_sched_mark_mtp_three_empty_wave(sched, graph);
+                        }
                     } else {
                         ++prefill_layer_batches;
                         prefill_max_tokens = std::max(prefill_max_tokens, ids.size() / n_used);

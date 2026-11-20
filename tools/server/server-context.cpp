@@ -724,6 +724,7 @@ struct server_mtp_depth {
     double draft_us[2] = {};
     double cycle_us[2] = {};
     int choice = -1;
+    int trace_choice = -1;
     int band = 0;
     int64_t started_us = 0;
     int64_t drafted_us = 0;
@@ -731,7 +732,9 @@ struct server_mtp_depth {
     bool chain(float confidence_first) {
         band = confidence_first < 0.90f ? 0 : confidence_first < 0.97f ? 1 : 2;
         ++decisions;
-        if (decisions <= 8) {
+        if (trace_choice >= 0) {
+            choice = trace_choice;
+        } else if (decisions <= 8) {
             choice = (decisions - 1) % 2;
             ++explored;
         } else if (decisions - last[0] >= 32 || decisions - last[1] >= 32) {
@@ -1716,6 +1719,7 @@ private:
     bool mtp_logit_trace = false;
     bool mtp_logit_match_drafts = false;
     llama_tokens mtp_logit_reference;
+    std::vector<int> mtp_logit_auto_chain;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
@@ -2166,16 +2170,17 @@ private:
         const char * logit_trace = std::getenv("LLAMA_MTP_LOGIT_TRACE");
         mtp_logit_trace = logit_trace && std::strcmp(logit_trace, "1") == 0;
         mtp_logit_reference.clear();
+        mtp_logit_auto_chain.clear();
         mtp_logit_match_drafts = false;
         if (mtp_logit_trace) {
             const bool mtp_only = spec_mtp && std::all_of(params_base.speculative.types.begin(),
                     params_base.speculative.types.end(), [](common_speculative_type type) {
                         return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
                     });
-            if (!spec || !mtp_only || mtp_adaptive || slots.size() != 1 || params_base.speculative.has_synth() ||
+            if (!spec || !mtp_only || slots.size() != 1 || params_base.speculative.has_synth() ||
                     params_base.speculative.draft.probabilistic || params_base.n_predict <= 0 ||
                     ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-                SRV_ERR("%s", "MTP logit trace requires fixed-depth greedy MTP, one slot, bounded generation and target/draft rollback\n");
+                SRV_ERR("%s", "MTP logit trace requires greedy MTP, one slot, bounded generation and target/draft rollback\n");
                 return false;
             }
             if (const char * reference = std::getenv("LLAMA_MTP_LOGIT_REFERENCE"); reference && *reference) {
@@ -2199,6 +2204,27 @@ private:
                     return false;
                 }
                 mtp_logit_match_drafts = true;
+            }
+            if (mtp_adaptive) {
+                const char * schedule = std::getenv("LLAMA_MTP_LOGIT_AUTO_CHAIN");
+                if (!schedule || !*schedule || mtp_logit_reference.empty() || mtp_logit_match_drafts ||
+                        params_base.speculative.draft.n_max != 2 || params_base.speculative.draft.p_min != 0.0f ||
+                        llama_mtp_vocab_subset_enabled(ctx_dft)) {
+                    SRV_ERR("%s", "Auto MTP logit trace requires a chain schedule, forced IDs, full draft vocabulary and two greedy candidates with p-min 0\n");
+                    return false;
+                }
+                std::ifstream input{std::filesystem::u8path(schedule)};
+                for (std::string choice; input >> choice; ) {
+                    if ((choice != "0" && choice != "1") || mtp_logit_auto_chain.size() >= mtp_logit_reference.size()) {
+                        SRV_ERR("%s", "invalid MTP logit auto chain schedule\n");
+                        return false;
+                    }
+                    mtp_logit_auto_chain.push_back(choice == "1");
+                }
+                if (!input.eof() || mtp_logit_auto_chain.size() != mtp_logit_reference.size()) {
+                    SRV_ERR("%s", "MTP logit auto chain schedule must have one choice per committed token index\n");
+                    return false;
+                }
             }
             llama_set_mtp_logit_trace(ctx_tgt, true);
         }
@@ -4647,6 +4673,10 @@ private:
                                 return static_cast<server_mtp_depth *>(data)->chain(confidence_first);
                             };
                             dp.chain_mtp_data = &slot.mtp_depth;
+                            if (!mtp_logit_auto_chain.empty()) {
+                                const size_t index = slot.stats.n_gen;
+                                slot.mtp_depth.trace_choice = index < mtp_logit_auto_chain.size() ? mtp_logit_auto_chain[index] : 0;
+                            }
                         }
                         drafting.push_back(&slot);
                     }
@@ -4664,6 +4694,14 @@ private:
                     depth->started_us = ggml_time_us();
                 }
                 common_speculative_draft(spec.get());
+                if (!mtp_logit_auto_chain.empty()) {
+                    GGML_ASSERT(depth);
+                    const auto & slot = *drafting.front();
+                    const auto & draft = slot.spec_draft;
+                    SLT_INF(slot, "mtp logits auto decision: index=%zu choice=%d proposed=%zu draft0=%d draft1=%d\n",
+                            size_t(slot.stats.n_gen), depth->choice, draft.size(),
+                            draft.empty() ? LLAMA_TOKEN_NULL : draft[0], draft.size() < 2 ? LLAMA_TOKEN_NULL : draft[1]);
+                }
                 if (depth && depth->choice >= 0) {
                     depth->drafted_us = ggml_time_us();
                 }
@@ -5884,6 +5922,13 @@ private:
                 if (mtp_logit_trace) {
                     if (use_rejection || (trace_replay && slot.use_spec_rejection())) {
                         throw std::runtime_error("MTP logit trace requires sample-and-match verification");
+                    }
+                    if (!mtp_logit_auto_chain.empty()) {
+                        common_sampler_ptr natural_sampler(common_sampler_clone(slot.smpl.get()));
+                        const auto natural = common_sampler_sample_and_accept_n(natural_sampler.get(), slot.ctx_tgt,
+                                spec_i_batch, slot.spec_draft);
+                        SLT_INF(slot, "mtp logits natural verify: round=%zu accepted=%zu next=%d replay=%d\n",
+                                trace_round, natural.size() - 1, natural.back(), trace_replay);
                     }
                     accepted = common_sampler_sample_and_accept_n_with(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
                             [&](int32_t row, size_t index) {

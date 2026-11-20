@@ -16,6 +16,20 @@
 LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API int32_t llama_process_mtp_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API bool llama_mtp_vocab_subset_enabled(const struct llama_context * ctx);
+enum class llama_mtp_draft_row { normal, eager, lazy };
+
+struct llama_mtp_draft_row_stats {
+    uint64_t candidates = 0;
+    uint64_t eager_d2h   = 0;
+    uint64_t lazy_d2h    = 0;
+    uint64_t skipped     = 0;
+    uint64_t fallback    = 0;
+};
+
+LLAMA_API int32_t llama_process_mtp_first_draft(struct llama_context * ctx, struct llama_batch_ext * batch, bool lazy);
+LLAMA_API const float * llama_read_mtp_first_draft_row(struct llama_context * ctx, int32_t index);
+LLAMA_API void llama_discard_mtp_first_draft_row(struct llama_context * ctx);
+LLAMA_API llama_mtp_draft_row_stats llama_get_mtp_draft_row_stats(const struct llama_context * ctx);
 LLAMA_API bool llama_supports_mtp_verify_three(const struct llama_context * ctx);
 LLAMA_API void llama_set_mtp_logit_trace(struct llama_context * ctx, bool enabled);
 

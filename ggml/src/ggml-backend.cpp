@@ -1374,6 +1374,21 @@ struct ggml_backend_sched {
     bool target_mtp_verify;
     bool target_mtp_verify_three;
     bool mtp_three_shared_input;
+    bool mtp_three_router_upload;
+    bool mtp_three_merge_empty_wave;
+    bool mtp_auto_reset_shared_plan;
+    size_t mtp_auto_stale_shared_prefixes;
+    bool mtp_three_empty_next;
+    size_t mtp_three_empty_merges;
+    size_t mtp_three_empty_candidates;
+    size_t mtp_three_empty_bad_split;
+    size_t mtp_three_empty_bad_inputs;
+    size_t mtp_three_empty_unpinned;
+    size_t mtp_three_empty_bad_carry;
+    size_t mtp_three_empty_bad_upload;
+    size_t mtp_three_empty_alias;
+    size_t mtp_three_router_upload_batches;
+    size_t mtp_three_router_upload_bytes;
     bool mtp_three_shared_overlap;
     size_t mtp_three_shared_input_batches;
     size_t mtp_three_shared_input_bytes;
@@ -2069,6 +2084,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        if (sched->mtp_auto_reset_shared_plan && sched->target_mtp_verify_three) {
+            sched->mtp_auto_stale_shared_prefixes += split->shared_prefix.n_nodes != 0;
+            split->shared_plan_uid = 0;
+            split->shared_prefix = {};
+            split->after_shared = {};
+        }
         split->carry_plan_uid = 0;
         split->carry_plan_node = nullptr;
         split->carry_plan_end = 0;
@@ -2127,6 +2148,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             struct ggml_tensor * input = split->inputs[j];
             const size_t input_id = hash_id(input);
             struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
+
+            // The merged graph can upload this small copy before wave zero uses its work buffers.
+            if (sched->mtp_three_merge_empty_wave && sched->target_mtp_verify_three &&
+                    input->type == GGML_TYPE_F32 && input->ne[0] == 1 && input->ne[1] == 10 &&
+                    input->ne[2] == 3 && input->ne[3] == 1 && strncmp(input->name, "ffn_moe_weights_", 16) == 0) {
+                ggml_set_input(input_cpy);
+                ggml_set_output(input_cpy);
+            }
 
             // add a dependency to the input source so that it is not freed before the copy is done
             struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
@@ -2538,7 +2567,33 @@ struct ggml_backend_sched_upload {
     ggml_backend_graph_upload regions{};
     ggml_backend_vk_graph_upload_t compute = nullptr;
     size_t bytes = 0;
+    bool mtp_three_router = false;
 };
+
+static bool ggml_backend_sched_is_mtp_three_router_input(ggml_backend_sched_t sched, const ggml_backend_sched_split * split,
+        const ggml_tensor * src, const ggml_tensor * dst) {
+    if (!sched->mtp_three_router_upload || !sched->target_mtp_verify_three || !sched->callback_copy ||
+            src->type != GGML_TYPE_F32 || src->ne[0] != 1 || src->ne[1] != 10 || src->ne[2] != 3 || src->ne[3] != 1 ||
+            strncmp(src->name, "ffn_moe_weights_", 16) != 0) {
+        return false;
+    }
+    for (int i = 0; i < split->n_inputs; ++i) {
+        auto * input = split->inputs[i];
+        if (input != src && sched->hv_tensor_requires_copy[hash_id(input)] && !ggml_backend_sched_is_host_weight(input)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const auto * node = split->graph.nodes[i];
+        if (node->op == GGML_OP_MUL && (node->flags & GGML_TENSOR_FLAG_COMPUTE) && node->src[1] == dst &&
+                strncmp(node->name, "ffn_moe_weighted_mtp_three-", sizeof("ffn_moe_weighted_mtp_three-") - 1) == 0 &&
+                node->src[0]->op == GGML_OP_ADD &&
+                strcmp(node->src[0]->name, "ffn_moe_prefill_accumulator") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, const ggml_backend_sched_split * split,
         const ggml_tensor * const * srcs, ggml_tensor * const * dsts, int count) {
@@ -2597,6 +2652,161 @@ static bool ggml_backend_sched_is_packed_moe_input(ggml_backend_sched_t sched, c
         }
     }
     return false;
+}
+
+// Only merge adjacent waves for the same layer and only after the cache proves wave one empty.
+static bool ggml_backend_sched_merge_empty_wave(ggml_backend_sched_t sched, ggml_backend_sched_split * first,
+        ggml_backend_sched_upload & upload, std::vector<ggml_tensor *> & nodes, ggml_cgraph & merged) {
+    if (!sched->mtp_three_empty_next) {
+        return false;
+    }
+    ++sched->mtp_three_empty_candidates;
+    if (first == &sched->splits[sched->n_splits - 1] || first->has_custom ||
+            !upload.compute || !upload.regions.dst[1] || upload.regions.dst[2]) {
+        ++sched->mtp_three_empty_bad_split;
+        return false;
+    }
+    auto * next = first + 1;
+    if (first->backend_id != next->backend_id || next->has_custom) {
+        ++sched->mtp_three_empty_bad_split;
+        return false;
+    }
+    const ggml_tensor * first_map = nullptr;
+    for (int i = 0; i < first->n_inputs; ++i) {
+        const auto * input = first->inputs[i];
+        if (ggml_backend_sched_is_host_weight(input)) {
+            if (first_map) {
+                ++sched->mtp_three_empty_bad_inputs;
+                return false;
+            }
+            first_map = input;
+        }
+    }
+    const char * suffix = first_map ? strstr(first_map->name, "-mtp3-0") : nullptr;
+    if (!suffix || strcmp(suffix, "-mtp3-0") != 0) {
+        ++sched->mtp_three_empty_bad_inputs;
+        return false;
+    }
+    ggml_tensor * router = nullptr;
+    ggml_tensor * second_map = nullptr;
+    for (int i = 0; i < next->n_inputs; ++i) {
+        auto * input = next->inputs[i];
+        if (!sched->hv_tensor_requires_copy[hash_id(input)]) {
+            continue;
+        }
+        if (ggml_backend_sched_is_host_weight(input)) {
+            if (second_map) {
+                ++sched->mtp_three_empty_bad_inputs;
+                return false;
+            }
+            second_map = input;
+        } else {
+            if (router) {
+                ++sched->mtp_three_empty_bad_inputs;
+                return false;
+            }
+            router = input;
+        }
+    }
+    const size_t prefix = suffix - first_map->name;
+    if (!second_map || strncmp(second_map->name, first_map->name, prefix) != 0 ||
+            strcmp(second_map->name + prefix, "-mtp3-1") != 0 || !router ||
+            (router->flags & GGML_TENSOR_FLAG_INPUT)) {
+        ++sched->mtp_three_empty_bad_inputs;
+        return false;
+    }
+    auto * dst = tensor_copy(router, next->backend_id, sched->cur_copy);
+    if (!dst || !(dst->flags & GGML_TENSOR_FLAG_INPUT) || !(dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        ++sched->mtp_three_empty_unpinned;
+        return false;
+    }
+    if (!ggml_backend_sched_is_mtp_three_router_input(sched, next, router, dst)) {
+        ++sched->mtp_three_empty_bad_inputs;
+        return false;
+    }
+    ggml_tensor * accumulator = nullptr;
+    for (int i = 0; i < next->graph.n_nodes; ++i) {
+        auto * node = next->graph.nodes[i];
+        if (node->op == GGML_OP_ADD && strcmp(node->name, "ffn_moe_prefill_accumulator") == 0) {
+            accumulator = node;
+            break;
+        }
+    }
+    if (!accumulator || !accumulator->src[0] || accumulator->buffer != accumulator->src[0]->buffer ||
+            accumulator->data != accumulator->src[0]->data ||
+            std::find(first->graph.nodes, first->graph.nodes + first->graph.n_nodes, accumulator->src[0]) ==
+                    first->graph.nodes + first->graph.n_nodes) {
+        ++sched->mtp_three_empty_bad_carry;
+        return false;
+    }
+    sched->active_copy_split = next;
+    const bool carry = ggml_backend_sched_carry_accumulator(sched, &next->graph, accumulator);
+    const int begin = sched->carry_prefix_end;
+    sched->active_copy_split = nullptr;
+    sched->carry_accumulator = nullptr;
+    sched->carry_prefix_end = 0;
+    if (!carry || begin >= next->graph.n_nodes || next->graph.nodes[begin]->op != GGML_OP_MUL ||
+            next->graph.nodes[begin]->src[0] != accumulator || next->graph.nodes[begin]->src[1] != dst) {
+        ++sched->mtp_three_empty_bad_carry;
+        return false;
+    }
+    auto * backend = sched->backends[first->backend_id];
+    auto * source = ggml_backend_sched_get_tensor_backend(sched, router);
+    const size_t bytes = ggml_nbytes(router);
+    if (source != sched->shared_input.cuda || !ggml_are_same_layout(router, dst) ||
+            !ggml_backend_sched_device_input_buffer(source, router, bytes) ||
+            bytes > shared_host_capacity - upload.bytes) {
+        ++sched->mtp_three_empty_bad_upload;
+        return false;
+    }
+    const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    using supports_upload_t = bool (*)(ggml_backend_t, const ggml_backend_graph_upload *);
+    const auto supports = reinterpret_cast<supports_upload_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_supports_graph_upload"));
+    auto regions = upload.regions;
+    regions.dst[2] = dst;
+    regions.offsets[2] = upload.bytes;
+    regions.single_submit_nodes = first->graph.n_nodes + next->graph.n_nodes - begin;
+    if (!supports || !supports(backend, &regions)) {
+        ++sched->mtp_three_empty_bad_upload;
+        return false;
+    }
+    // Check the allocated ranges too, in case the allocator reused a previous graph layout.
+    const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst->data);
+    const auto aliases_router = [&](const ggml_tensor * tensor) {
+        if (!tensor || tensor == dst || tensor->buffer != dst->buffer || !tensor->data) {
+            return false;
+        }
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(tensor->data);
+        return addr < dst_addr ? dst_addr - addr < ggml_nbytes(tensor) : addr - dst_addr < bytes;
+    };
+    const auto aliases_graph = [&](const ggml_cgraph & graph, int start) {
+        for (int i = start; i < graph.n_nodes; ++i) {
+            if (aliases_router(graph.nodes[i])) {
+                return true;
+            }
+            for (const auto * src : graph.nodes[i]->src) {
+                if (aliases_router(src)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (aliases_graph(first->graph, 0) || aliases_graph(next->graph, begin)) {
+        ++sched->mtp_three_empty_alias;
+        return false;
+    }
+    // Wave zero has already synchronized CUDA and joined prior readers of this staging buffer.
+    ggml_backend_tensor_get(router, static_cast<uint8_t *>(sched->shared_input.host) + upload.bytes, 0, bytes);
+    upload.regions = regions;
+    nodes.assign(first->graph.nodes, first->graph.nodes + first->graph.n_nodes);
+    nodes.insert(nodes.end(), next->graph.nodes + begin, next->graph.nodes + next->graph.n_nodes);
+    merged = first->graph;
+    merged.nodes = nodes.data();
+    merged.n_nodes = nodes.size();
+    merged.size = merged.n_nodes;
+    return true;
 }
 
 static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int first,
@@ -2665,12 +2875,14 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         last = i;
         ++count;
     }
-    if (count < 2) {
+    const bool router_upload = count == 1 && ggml_backend_sched_is_mtp_three_router_input(sched, split, srcs[0], dsts[0]);
+    if (count < 2 && !router_upload) {
         return 0;
     }
 
     if (sched->shared_host_input && host_copies && !sched->profile.enabled && !sched->callback_eval &&
-            bytes <= shared_host_capacity && ggml_backend_sched_is_packed_moe_input(sched, split, srcs, dsts, count)) {
+            bytes <= shared_host_capacity &&
+            (router_upload || ggml_backend_sched_is_packed_moe_input(sched, split, srcs, dsts, count))) {
         const auto src_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(src_backend));
         const auto dst_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(dst_backend));
         if (strcmp(ggml_backend_reg_name(src_reg), "CUDA") == 0 && strcmp(ggml_backend_reg_name(dst_reg), "Vulkan") == 0) {
@@ -2681,15 +2893,18 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
                     ggml_backend_reg_get_proc_address(dst_reg, "ggml_backend_vk_graph_upload"));
             if (supports && compute_upload && ggml_backend_sched_init_shared_host(sched->shared_input, dst_backend, src_backend)) {
                 const ggml_backend_graph_upload regions{sched->shared_input.vk_buffer,
-                    {dsts[0], dsts[1], count == 3 ? dsts[2] : nullptr},
-                    {data_offsets[0], data_offsets[1], count == 3 ? data_offsets[2] : 0}};
+                    {dsts[0], count >= 2 ? dsts[1] : nullptr, count == 3 ? dsts[2] : nullptr},
+                    {data_offsets[0], count >= 2 ? data_offsets[1] : 0, count == 3 ? data_offsets[2] : 0}, 0};
                 if (supports(dst_backend, &regions)) {
-                    upload = {regions, compute_upload, bytes};
+                    upload = {regions, compute_upload, bytes, router_upload};
                 }
             }
         }
     }
 
+    if (router_upload && !upload.compute) {
+        return 0;
+    }
     if (!upload.compute && sched->device_input_staging_size < bytes) {
         auto * staging = (uint8_t *) realloc(sched->device_input_staging, bytes);
         if (!staging) {
@@ -3078,6 +3293,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->n_prefetched = 0;
     }
 
+    std::vector<ggml_tensor *> merged_nodes;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -3089,6 +3305,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_cgraph * main_graph = &split->graph;
         sched->carry_prefix_end = 0;
         sched->carry_accumulator = nullptr;
+        sched->mtp_three_empty_next = false;
         ggml_backend_sched_upload upload;
 
         if (sched->overlap_shared && split_id > 0 && !profile.enabled && !sched->callback_eval) {
@@ -3218,11 +3435,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             backend_profile.splits++;
         }
 
+        ggml_cgraph merged_graph;
+        const bool merged_empty = ggml_backend_sched_merge_empty_wave(sched, split, upload, merged_nodes, merged_graph);
+        const int routed_split_id = split_id + merged_empty;
+        if (merged_empty) {
+            main_graph = &merged_graph;
+        }
+
         ggml_backend_vk_graph_readback_t graph_readback = nullptr;
         const ggml_tensor * return_tensor = nullptr;
-        if (sched->shared_host_return && !profile.enabled && !sched->callback_eval && split_id + 1 < sched->n_splits) {
-            auto & next = splits[split_id + 1];
-            if (ggml_backend_sched_plan_shared(sched, next, *split)) {
+        if (sched->shared_host_return && !profile.enabled && !sched->callback_eval && routed_split_id + 1 < sched->n_splits) {
+            auto & next = splits[routed_split_id + 1];
+            if (ggml_backend_sched_plan_shared(sched, next, splits[routed_split_id])) {
                 auto * input = next.inputs[0];
                 auto * dst = sched->backends[next.backend_id];
                 auto * copy = tensor_copy(input, next.backend_id, sched->cur_copy);
@@ -3264,7 +3488,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (upload.compute && status == GGML_STATUS_SUCCESS) {
                     ++sched->shared_input_batches;
                     sched->shared_input_bytes += upload.bytes;
-                    if (sched->target_mtp_verify_three) {
+                    if (merged_empty) {
+                        ++sched->mtp_three_router_upload_batches;
+                        sched->mtp_three_router_upload_bytes += ggml_nbytes(upload.regions.dst[2]);
+                    }
+                    if (upload.mtp_three_router) {
+                        ++sched->mtp_three_router_upload_batches;
+                        sched->mtp_three_router_upload_bytes += upload.bytes;
+                    } else if (sched->target_mtp_verify_three) {
                         ++sched->mtp_three_shared_input_batches;
                         sched->mtp_three_shared_input_bytes += upload.bytes;
                     }
@@ -3405,6 +3636,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (merged_empty) {
+            ++sched->mtp_three_empty_merges;
+            ++split_id;
+        }
         prev_backend_id = split_backend_id;
     }
 
@@ -3457,6 +3692,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     if (fast_three && strcmp(fast_three, "1") == 0) {
         const char * input = getenv("GGML_SCHED_MTP_THREE_SHARED_INPUT");
         const char * overlap = getenv("GGML_SCHED_MTP_THREE_SHARED_OVERLAP");
+        const char * router = getenv("GGML_SCHED_MTP_THREE_ROUTER_UPLOAD");
+        sched->mtp_three_router_upload = sched->shared_host_input && router && strcmp(router, "1") == 0;
+        const char * merge = getenv("GGML_SCHED_MTP_THREE_MERGE_EMPTY_WAVE");
+        sched->mtp_three_merge_empty_wave = sched->mtp_three_router_upload && merge && strcmp(merge, "1") == 0;
+        const char * mode = getenv("LLAMA_MTP_VERIFY_THREE");
+        const char * reset = getenv("GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN");
+        sched->mtp_auto_reset_shared_plan = sched->mtp_three_merge_empty_wave && mode && strcmp(mode, "auto") == 0 &&
+                reset && strcmp(reset, "1") == 0;
         sched->mtp_three_shared_input = sched->shared_host_input && input && strcmp(input, "1") == 0;
         sched->mtp_three_shared_overlap = sched->overlap_shared && overlap && strcmp(overlap, "1") == 0;
     }
@@ -3618,6 +3861,20 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->shared_input_verify_batches, sched->shared_input_other_batches,
                 sched->shared_input_verify_bytes, sched->shared_input_other_bytes,
                 sched->shared_input_optimized_verify, sched->shared_input_optimized_other);
+    }
+    if (sched->mtp_auto_reset_shared_plan) {
+        GGML_LOG_INFO("mtp auto shared plan reset: stale_prefixes=%zu\n", sched->mtp_auto_stale_shared_prefixes);
+    }
+    if (sched->mtp_three_merge_empty_wave) {
+        GGML_LOG_INFO("mtp fast-three merged empty waves: graphs=%zu candidates=%zu bad_split=%zu bad_inputs=%zu"
+                " unpinned=%zu bad_carry=%zu bad_upload=%zu alias=%zu\n",
+                sched->mtp_three_empty_merges, sched->mtp_three_empty_candidates, sched->mtp_three_empty_bad_split,
+                sched->mtp_three_empty_bad_inputs, sched->mtp_three_empty_unpinned, sched->mtp_three_empty_bad_carry,
+                sched->mtp_three_empty_bad_upload, sched->mtp_three_empty_alias);
+    }
+    if (sched->mtp_three_router_upload) {
+        GGML_LOG_INFO("mtp fast-three router upload: batches=%zu bytes=%zu\n",
+                sched->mtp_three_router_upload_batches, sched->mtp_three_router_upload_bytes);
     }
     if (sched->mtp_three_shared_input || sched->mtp_three_shared_overlap) {
         GGML_LOG_INFO("mtp fast-three shared handoff: input_enabled=%d input_batches=%zu input_bytes=%zu"
@@ -3811,6 +4068,13 @@ bool ggml_backend_sched_set_custom_op_backend(ggml_backend_sched_t sched, ggml_t
     sched->custom_backend = backend;
     ggml_backend_sched_set_tensor_backend(sched, op, backend);
     return true;
+}
+
+void ggml_backend_sched_mark_mtp_three_empty_wave(ggml_backend_sched_t sched, const ggml_cgraph * wave_zero) {
+    if (sched->mtp_three_merge_empty_wave && sched->target_mtp_verify_three && !sched->profile.enabled &&
+            !sched->callback_eval && sched->active_copy_split && wave_zero == &sched->active_copy_split->graph) {
+        sched->mtp_three_empty_next = true;
+    }
 }
 
 bool ggml_backend_sched_carry_accumulator(ggml_backend_sched_t sched, const ggml_cgraph * graph, ggml_tensor * accumulator) {

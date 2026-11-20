@@ -933,6 +933,7 @@ void llama_context::sched_reserve() {
         return;
     }
 
+    discard_mtp_first_draft_row();
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
@@ -1564,6 +1565,7 @@ void llama_context::set_embeddings(bool value) {
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
+    discard_mtp_first_draft_row();
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
@@ -1696,6 +1698,7 @@ void llama_context::layer_inp_dev_alloc() {
 }
 
 bool llama_context::h_nextn_dev_alloc() {
+    discard_mtp_first_draft_row();
     synchronize();
 
     auto reset = [&]() {
@@ -2026,6 +2029,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    struct scheduler_verify_three_scope {
+        ggml_backend_sched_t sched;
+        bool previous;
+        ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
+    } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
+            target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -2082,13 +2092,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    struct scheduler_verify_three_scope {
-        ggml_backend_sched_t sched;
-        bool previous;
-        ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
-    } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
-            target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
-
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2102,6 +2105,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    discard_mtp_first_draft_row();
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2349,7 +2353,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify) {
+int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify,
+                          llama_mtp_draft_row draft_row) {
+    discard_mtp_first_draft_row();
+    const bool tracked_draft = draft_row != llama_mtp_draft_row::normal;
+    mtp_draft_row_stats.candidates += tracked_draft;
+    ggml_tensor * deferred_draft_row = nullptr;
+    bool first_draft_ready = false;
     struct verify_scope {
         uint32_t & width;
         uint32_t previous;
@@ -2769,7 +2779,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                const auto dev = tracked_draft ? ggml_backend_get_device(backend_h) : nullptr;
+                const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                const bool cuda = reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+                const bool single_row = tracked_draft && n_tokens_all == 1 && n_rows == 1 && offset == 0;
+                // The graph output stays allocated until the next decode or graph reservation.
+                const bool defer = draft_row == llama_mtp_draft_row::lazy && single_row && cuda && masked &&
+                        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN4EXP &&
+                        cparams.n_seq_max == 1 && cparams.n_ubatch == 1 && dev == model.dev_output() &&
+                        t_h_nextn->buffer && ggml_backend_buffer_get_type(t_h_nextn->buffer) == ggml_backend_get_default_buffer_type(backend_h) &&
+                        t_h_nextn->type == GGML_TYPE_F32 && t_h_nextn->ne[0] == n_embd &&
+                        ggml_nrows(t_h_nextn) == 1 && ggml_is_contiguous(t_h_nextn) &&
+                        (t_h_nextn->flags & GGML_TENSOR_FLAG_OUTPUT);
+                if (defer) {
+                    deferred_draft_row = t_h_nextn;
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                    mtp_draft_row_stats.eager_d2h += single_row && cuda;
+                    mtp_draft_row_stats.fallback += single_row && draft_row == llama_mtp_draft_row::lazy;
+                }
+                first_draft_ready = single_row;
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
@@ -2869,10 +2898,40 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
         }
     }
 
+    mtp_first_draft_ready = first_draft_ready;
+    mtp_first_draft_row = deferred_draft_row;
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
     return 0;
+}
+
+void llama_context::discard_mtp_first_draft_row() {
+    mtp_draft_row_stats.skipped += mtp_first_draft_row != nullptr;
+    mtp_first_draft_row = nullptr;
+    mtp_first_draft_ready = false;
+}
+
+const float * llama_context::read_mtp_first_draft_row(int32_t index) {
+    if (!mtp_first_draft_ready || index != 0) {
+        return nullptr;
+    }
+    if (mtp_first_draft_row) {
+        const auto * res = get_gf_res_prev();
+        if (gf_res_prev_active != res || res->get_h_nextn() != mtp_first_draft_row || !embd_nextn.data || n_outputs != 1) {
+            discard_mtp_first_draft_row();
+            return nullptr;
+        }
+        auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), mtp_first_draft_row);
+        GGML_ASSERT(backend != nullptr);
+        const size_t bytes = ggml_nbytes(mtp_first_draft_row);
+        ggml_backend_tensor_get_async(backend, mtp_first_draft_row, embd_nextn.data, 0, bytes);
+        mtp_first_draft_row = nullptr;
+        ++mtp_draft_row_stats.lazy_d2h;
+    }
+    synchronize();
+    return get_embeddings_nextn_ith(index);
 }
 
 //
@@ -3283,6 +3342,7 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    discard_mtp_first_draft_row();
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
@@ -4371,6 +4431,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    discard_mtp_first_draft_row();
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4405,6 +4466,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    discard_mtp_first_draft_row();
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -5543,6 +5605,22 @@ bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
 
 int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, false, true, true);
+}
+
+int32_t llama_process_mtp_first_draft(llama_context * ctx, llama_batch_ext * batch, bool lazy) {
+    return ctx->decode(*batch, false, true, false, lazy ? llama_mtp_draft_row::lazy : llama_mtp_draft_row::eager);
+}
+
+const float * llama_read_mtp_first_draft_row(llama_context * ctx, int32_t index) {
+    return ctx->read_mtp_first_draft_row(index);
+}
+
+void llama_discard_mtp_first_draft_row(llama_context * ctx) {
+    ctx->discard_mtp_first_draft_row();
+}
+
+llama_mtp_draft_row_stats llama_get_mtp_draft_row_stats(const llama_context * ctx) {
+    return ctx->get_mtp_draft_row_stats();
 }
 
 bool llama_supports_mtp_verify_three(const llama_context * ctx) {
