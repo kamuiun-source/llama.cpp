@@ -16,6 +16,8 @@
 
 - Phase 1 は `codex/rocm-protected-slot-lru` で、昇格OFFと保護300・仮置き20のLRUを同じビルドで比較。生成は27.03 / 27.20 t/s、要求ミス率は12.30% / 10.23%。4回すべて書き戻しゼロ、生成ID・MTP採用数は一致。[実装と計測結果](../rocm/07-protected-slot-lru.md)
 - Phase 1を `257a0fee9` に保存し、同じブランチで Phase 2 のリクエスト間交換を実装。2回目の生成は Phase 1 が29.23 t/s、Phase 2 が29.01 t/s、全体の要求ミス率は10.11% / 9.96%。Phase 2 の生成中書き戻しはゼロ。H2D・D2Hの中断時に原本と所有表を照合し、どちらも次の応答と交換が正常だった。[Phase 2の記録](../rocm/07-protected-slot-lru.md)
+- Phase 2を `7ecd7f5c8` に保存。Phase 3 の利用統計とPhase 2の固定選定を、同じプロンプト2回の両順比較で計測した。固定 / 利用統計で生成29.50 / 29.31 t/s、要求ミス率9.96% / 9.89%、退避後の再アップロード23 / 0件（両方48組交換）。[Phase 3の記録](../rocm/07-protected-slot-lru.md)
+- 入力を除いた追加計測では、固定 / 利用統計の生成中ヒット率は交換前が両方89.70%、交換後が90.01% / 90.13%。両順で同じ件数を再現した。[投稿と生成区間の比較](../research/reference-decode-comparison-20261119.md)
 
 ### Windows Vulkan の検証記録
 

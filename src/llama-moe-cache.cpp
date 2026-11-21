@@ -389,6 +389,12 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> prefill_ids;
         std::vector<int32_t> packed_scratch_slots; // physical slots when the permanent map can change
         std::vector<uint64_t> packed_last_used;
+        std::vector<uint64_t> hip_request_uses;
+        struct {
+            int32_t expert = -1;
+            int32_t host_slot = -1;
+            size_t bytes = 0;
+        } hip_exchange_reload;
         std::vector<int32_t> packed_ram_slots; // pinned tuple index per logical host slot, -1 for normal RAM
         uint64_t packed_lookups = 0;
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
@@ -568,6 +574,11 @@ struct llama_moe_cache::impl {
         size_t h2d_bytes = 0;
         size_t d2h_bytes = 0;
     } hip_exchange_totals;
+    struct hip_exchange_reloads {
+        size_t exchanges = 0;
+        size_t reuploads = 0;
+        size_t bytes = 0;
+    } hip_exchange_request_reloads, hip_exchange_total_reloads;
     size_t hip_exchange_boundaries = 0;
     int64_t hip_exchange_us = 0;
     std::vector<moe_cache_lru::fill> fills; // packed fills use logical scratch indices
@@ -725,6 +736,9 @@ struct llama_moe_cache::impl {
                 if (placement->dynamic_resident || placement->hip_overlap_promotion || placement->hip_protected_slots) {
                     l.packed_last_used.assign(llama_expert_profile::n_experts, 0);
                 }
+                if (placement->hip_slot_exchange_usage) {
+                    l.hip_request_uses.assign(llama_expert_profile::n_experts, 0);
+                }
             }
             if (placement->hip_protected_slots) {
                 LLAMA_LOG_INFO("packed expert HIP scratch policy: protected LRU\n");
@@ -738,7 +752,8 @@ struct llama_moe_cache::impl {
                 } else if (fault && *fault) {
                     throw std::runtime_error("HIP Expert exchange fault must be h2d or d2h");
                 }
-                LLAMA_LOG_INFO("packed expert HIP request exchange: enabled fault=%s\n", fault && *fault ? fault : "none");
+                LLAMA_LOG_INFO("packed expert HIP request exchange: enabled fault=%s selection=%s\n",
+                        fault && *fault ? fault : "none", placement->hip_slot_exchange_usage ? "usage" : "fixed");
             }
             std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
             for (const auto & w : placement->weights) {
@@ -2034,10 +2049,30 @@ struct llama_moe_cache::impl {
     void exchange_hip_pair(int32_t il, hip_exchange_stats & stats) {
         auto & l = layers[il];
         auto & map = placement->maps[il];
-        const auto scratch = std::find_if(l.packed_scratch.begin(), l.packed_scratch.end(), [](int32_t expert) { return expert >= 0; });
-        const auto victim = std::find_if(map.resident.begin(), map.resident.end(), [](int32_t slot) { return slot >= 0; });
+        auto scratch = std::find_if(l.packed_scratch.begin(), l.packed_scratch.end(), [](int32_t expert) { return expert >= 0; });
+        auto victim = std::find_if(map.resident.begin(), map.resident.end(), [](int32_t slot) { return slot >= 0; });
         if (scratch == l.packed_scratch.end() || victim == map.resident.end()) {
             return;
+        }
+        if (placement->hip_slot_exchange_usage) {
+            const auto rank = [&](int32_t expert) {
+                return std::make_pair(l.hip_request_uses[expert], l.packed_last_used[expert]);
+            };
+            for (auto candidate = scratch + 1; candidate != l.packed_scratch.end(); ++candidate) {
+                if (*candidate >= 0 && rank(*candidate) > rank(*scratch)) {
+                    scratch = candidate;
+                }
+            }
+            for (auto candidate = victim + 1; candidate != map.resident.end(); ++candidate) {
+                if (*candidate >= 0 && rank(candidate - map.resident.begin()) < rank(victim - map.resident.begin())) {
+                    victim = candidate;
+                }
+            }
+            const uint64_t hot_uses = l.hip_request_uses[*scratch];
+            const uint64_t cold_uses = l.hip_request_uses[victim - map.resident.begin()];
+            if (hot_uses <= cold_uses || hot_uses - cold_uses < 2) {
+                return;
+            }
         }
         const int32_t promote = *scratch;
         GGML_ASSERT(promote < llama_expert_profile::n_experts);
@@ -2164,6 +2199,7 @@ struct llama_moe_cache::impl {
         map.host[evict] = host_slot;
         map.host[promote] = -1;
         *scratch = -1;
+        l.hip_exchange_reload = {evict, host_slot, tuple_size};
         ++stats.committed;
         LLAMA_LOG_DEBUG("packed expert HIP exchange committed: layer=%d promoted=%d evicted=%d hot_slot=%d host_slot=%d tuple_bytes=%zu\n",
                 il, promote, evict, hot_slot, host_slot, tuple_size);
@@ -2174,6 +2210,14 @@ struct llama_moe_cache::impl {
         wait_hip_cold_upload();
         pending_layer = -1;
         const int64_t start = ggml_time_us();
+        const auto previous = hip_exchange_request_reloads;
+        hip_exchange_request_reloads = {};
+        hip_exchange_total_reloads.exchanges += previous.exchanges;
+        hip_exchange_total_reloads.reuploads += previous.reuploads;
+        hip_exchange_total_reloads.bytes += previous.bytes;
+        for (auto & l : layers) {
+            l.hip_exchange_reload = {};
+        }
         hip_exchange_stats stats;
         for (int32_t il = 0; il < llama_expert_profile::n_layers; ++il) {
             exchange_hip_pair(il, stats);
@@ -2181,14 +2225,22 @@ struct llama_moe_cache::impl {
                 break;
             }
         }
+        if (placement->hip_slot_exchange_usage) {
+            for (auto & l : layers) {
+                std::fill(l.hip_request_uses.begin(), l.hip_request_uses.end(), 0);
+            }
+        }
+        hip_exchange_request_reloads.exchanges = stats.committed;
         const int64_t elapsed = ggml_time_us() - start;
         hip_exchange_totals.committed += stats.committed;
         hip_exchange_totals.interrupted += stats.interrupted;
         hip_exchange_totals.h2d_bytes += stats.h2d_bytes;
         hip_exchange_totals.d2h_bytes += stats.d2h_bytes;
         hip_exchange_us += elapsed;
-        LLAMA_LOG_INFO("packed expert HIP request exchange: boundary=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64 "\n",
-                ++hip_exchange_boundaries, stats.committed, stats.interrupted, stats.h2d_bytes, stats.d2h_bytes, elapsed);
+        LLAMA_LOG_INFO("packed expert HIP request exchange: boundary=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64
+                " previous_exchanges=%zu previous_reuploads=%zu previous_reupload_bytes=%zu\n",
+                ++hip_exchange_boundaries, stats.committed, stats.interrupted, stats.h2d_bytes, stats.d2h_bytes, elapsed,
+                previous.exchanges, previous.reuploads, previous.bytes);
     }
 
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
@@ -2486,6 +2538,20 @@ struct llama_moe_cache::impl {
                 for (const int32_t expert : ids) {
                     l.packed_last_used[expert] = ++l.packed_lookups;
                 }
+            }
+            if (placement->hip_slot_exchange_usage) {
+                for (const int32_t expert : ids) {
+                    ++l.hip_request_uses[expert];
+                }
+            }
+            auto & reload = l.hip_exchange_reload;
+            if (reload.expert >= 0 && placement->maps[il].host[reload.expert] == reload.host_slot &&
+                    std::any_of(fills.begin(), fills.end(), [&](const auto & fill) { return fill.expert == reload.expert; })) {
+                ++hip_exchange_request_reloads.reuploads;
+                hip_exchange_request_reloads.bytes += reload.bytes;
+                LLAMA_LOG_DEBUG("packed expert HIP exchange reupload: layer=%d expert=%d host_slot=%d bytes=%zu\n",
+                        il, reload.expert, reload.host_slot, reload.bytes);
+                reload = {};
             }
             stats_small.hits += pending_permanent_hits + pending_scratch_hits;
             packed_scratch_hits += pending_scratch_hits;
@@ -3128,9 +3194,11 @@ struct llama_moe_cache::impl {
                         packed_promotions, packed_promotions, packed_writeback_bytes);
             }
             if (placement->hip_slot_exchange) {
-                LLAMA_LOG_INFO("packed expert HIP request exchanges: boundaries=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64 " generation_writeback_bytes=%zu\n",
+                LLAMA_LOG_INFO("packed expert HIP request exchanges: boundaries=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64
+                        " generation_writeback_bytes=%zu observed_exchanges=%zu reuploads=%zu reupload_bytes=%zu\n",
                         hip_exchange_boundaries, hip_exchange_totals.committed, hip_exchange_totals.interrupted,
-                        hip_exchange_totals.h2d_bytes, hip_exchange_totals.d2h_bytes, hip_exchange_us, packed_writeback_bytes);
+                        hip_exchange_totals.h2d_bytes, hip_exchange_totals.d2h_bytes, hip_exchange_us, packed_writeback_bytes,
+                        hip_exchange_total_reloads.exchanges, hip_exchange_total_reloads.reuploads, hip_exchange_total_reloads.bytes);
             }
         }
         auto log = [](const char * name, const stats & st) {

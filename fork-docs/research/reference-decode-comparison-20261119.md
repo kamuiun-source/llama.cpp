@@ -7,6 +7,14 @@
 - [配置図](https://pbs.twimg.com/media/HUHRpLUakAAVwsB?format=webp&name=4096x4096) は256K設定での配置容量を示す。104.4 GiB中、RTXの重み4.9 GiB、MI50のExpert 29.2 GiB、RAMのExpert 21.4 GiB、SSDのPLE 48.3 GiB。
 - [スロット図](https://pbs.twimg.com/media/HUHRzvvakAA7wUm?format=webp&name=4096x4096) は全48層で14,400スロット、保護スロットの古いExpertを裏で書き戻し、各層8個の仮置きスロットをコピーなしで再利用・破棄する構造を示す。RAMとGPUの並びをそろえ、ミス時は2.08 MiBを1 DMAで転送。要求ヒット率97%。層間の動的な枠の貸し借りは図から確定できない。
 
+### 投稿本文に記載された構成と報告値
+
+RTX 3060（12 GB）、Radeon Instinct MI50（32 GB）、システムRAM 32 GBの1台で、CUDAとROCmを併用した独自システムを動かしたという報告。重みごとに量子化率を変え、RTXに毎トークン使う密なレイヤーとMTP、MI50に各層512個中300個のホットExpert、RAMに残りのExpert約21.4 GiB、NVMeにPLEテーブル約48 GiBを配置した。RAM上のExpertは `mlock` で固定し、PLEはトークンあたり16行を読むと説明している。
+
+各層ではRTXのAttentionとルーターから、ページ固定RAMを介してMI50のExpertへ渡し、結果をRAM経由でRTXに戻す。投稿では生成中のExpert要求は97%がMI50にヒットし、ミスは2.08 MiBを約0.17 msで1回転送し、常駐Expertの演算と重ねる。検証1層は約0.87 msと報告している。
+
+報告値は生成平均約70 tok/s・ピーク106 tok/s、プレフィル約460 tok/s。コンテキスト256KとVisionに対応し、QSAの工夫で長い文脈における生成速度低下を抑えたと説明している。本文からは速度測定時の実際の文脈長、画像入力の有無、MTPの幅と採用率を確定できない。
+
 ## 優先して切り分ける差
 
 | 対象 | 検証版の実装・観測 | 次に見る値 |
@@ -20,3 +28,14 @@
 実装箇所は `src/llama-expert-placement.cpp`、`src/llama-moe-cache.cpp` の `overlap_packed_upload` とpromotion処理、`ggml/src/ggml-vulkan/ggml-vulkan.cpp`、`src/models/qwen4exp.cpp`、`ggml/src/ggml-cuda/lightning-indexer.cu`、`ggml/src/ggml-cuda/fattn.cu`。集計元はGit外の `shared-input-producer-telemetry-20261119-171624-c12788d4/on/metrics.json` と同じディレクトリの `llama.log`。
 
 1層0.87 msが全48層の検証パス平均だと仮定すると41.76 ms/パス。こちらの実効約1.66トークン/パスでは、追加費用を除いても約40 tok/sになる。投稿本文の「検証1層」の範囲は未確認で、この換算から投稿のMTP幅や性能上限は決められない。
+
+## Linux ROCm版の生成中Expertヒット率（2026-11-21）
+
+Flash Next UD-IQ3_XXSとQ8_0のMTPドラフト、固定プロンプト1、MTP 2位置で、Phase 2の固定選定とPhase 3の利用統計を両順で比較した。各サーバーにキャッシュを無効にして同じ入力63トークンを2回送り、各128トークンを生成した。1回目と2回目の間に各層で1組ずつ交換した。
+
+| 選定 | 1回目の生成中（交換前） | 2回目の生成中（交換後） |
+| --- | ---: | ---: |
+| Phase 2 固定 | 62,863 / 70,080（89.70%） | 62,213 / 69,120（90.01%） |
+| Phase 3 利用統計 | 62,863 / 70,080（89.70%） | 62,295 / 69,120（90.13%） |
+
+各条件の2試行で件数は再現した。常駐枠と仮置き枠の両方をヒットとし、本体が生成中に検証した候補も分母に含めた。入力処理はログの `prefill` 区分で除外した。入力と生成を合算すると各試行の終了時カウンタと一致し、出力トークン列とMTP採用数は通常試行と一致した。交換後の差は82ヒット、約0.12ポイント。投稿の97%と比べる場合は、プロンプト、履歴長、量子化と候補数の差が残る。生ログは Git 外の `/tmp/llama-rocm-phase-3-decode-hits/`。

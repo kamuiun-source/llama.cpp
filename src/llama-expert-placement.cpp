@@ -89,6 +89,15 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()), hip_slot_exchange([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_SLOT_EXCHANGE");
         return value && std::strcmp(value, "1") == 0;
+    }()), hip_slot_exchange_usage([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_SLOT_EXCHANGE_SELECTION");
+        if (!value || std::strcmp(value, "fixed") == 0) {
+            return false;
+        }
+        if (std::strcmp(value, "usage") == 0) {
+            return true;
+        }
+        throw std::runtime_error("HIP Expert exchange selection must be fixed or usage");
     }()), overlap([&] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return hip_overlap != hip_overlap_mode::off || (value && std::strcmp(value, "1") == 0);
@@ -130,6 +139,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }
     if (hip_slot_exchange && !hip_protected_slots) {
         throw std::runtime_error("HIP Expert exchange requires the protected slot policy");
+    }
+    if (hip_slot_exchange_usage && !hip_slot_exchange) {
+        throw std::runtime_error("HIP Expert usage selection requires request exchange");
     }
     if (hip_overlap != hip_overlap_mode::off && hip_dynamic && std::strcmp(hip_dynamic, "1") == 0) {
         throw std::runtime_error("HIP expert overlap is incompatible with same-bank dynamic residency");
