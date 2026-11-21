@@ -5662,6 +5662,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+#ifdef GGML_USE_HIP
+                const bool mtp_gate_up_merge = node->op == GGML_OP_ADD &&
+                        std::strcmp(node->name, "ffn_moe_mtp_gate_up_merge") == 0;
+                const auto * projection = mtp_gate_up_merge ? node->src[1] : node;
+                if (projection->op == GGML_OP_MUL_MAT_ID) {
+                    const auto * lookup = projection->src[2]->view_src;
+                    if (ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[1] == 2 && lookup->op_params[0] == 0) {
+                        GGML_ASSERT(!mtp_gate_up_merge || node->data == node->src[0]->data);
+                        continue;
+                    }
+                }
+#endif
                 const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -5920,12 +5932,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    bool dynamic_moe_routes = false;
+#ifdef GGML_USE_HIP
+    for (int i = 0; i < cgraph->n_nodes && !dynamic_moe_routes; ++i) {
+        dynamic_moe_routes = ggml_cuda_is_compact_moe_lookup(cgraph->nodes[i]);
+    }
+#endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (!dynamic_moe_routes && graph->is_enabled()) {
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
