@@ -2654,8 +2654,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 up_exps->ne[1] != 640 || gate_exps->ne[1] != 640 || selected_experts->ne[0] != 10 || n_tokens != 3)) {
             throw std::runtime_error("HIP MTP3 shared gate/up output requires the Flash-Next quantized gate/up shape");
         }
+        ggml_tensor * shared_q8 = nullptr;
+        if (auto * count = moe_cache->get_hip_mtp_q8_1_count()) {
+            shared_q8 = ggml_cast(ctx0, cur, GGML_TYPE_Q8_1);
+            ggml_set_name(shared_q8, "ffn_moe_mtp_shared_q8_1");
+            std::memcpy(shared_q8->op_params + 4, &count, sizeof(count));
+            auto * backend = moe_cache->backend(il);
+            if (!ggml_backend_supports_op(backend, shared_q8)) {
+                throw std::runtime_error("HIP MTP3 shared gate/up Q8_1 requires gfx906 and a 2560x1x3 F32 activation");
+            }
+            ggml_backend_sched_set_tensor_backend(sched, shared_q8, backend);
+        }
         auto project = [&](ggml_tensor * weight, ggml_tensor * slots, const char * name, ggml_tensor * output = nullptr) {
             auto * projection = build_lora_mm_id(weight, cur, selected_experts, nullptr, slots, true);
+            if (shared_q8) {
+                GGML_ASSERT(projection->src[1] == shared_q8->src[0]);
+                projection->src[4] = shared_q8;
+            }
             if (output) {
                 GGML_ASSERT(ggml_are_same_shape(projection, output) && ggml_are_same_stride(projection, output));
                 projection->view_src = output;
@@ -2683,6 +2698,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         auto * act = ggml_swiglu_split(ctx0, gate, up);
         cb(act, "ffn_moe_swiglu", il);
+        const auto type = up_hot->src[0]->type;
+        auto * fused_hit_count = moe_cache->get_hip_mtp_fused_hit_count();
+        if (fused_hit_count && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS) &&
+                type == gate_hot->src[0]->type && ggml_are_same_shape(up_hot->src[0], gate_hot->src[0]) &&
+                ggml_are_same_stride(up_hot->src[0], gate_hot->src[0]) &&
+                up_hot->src[1] == gate_hot->src[1] && up_hot->src[1]->ne[1] == 1 &&
+                up_hot->src[0]->ne[0] == 2560 && up_hot->ne[0] == 640 && up_hot->ne[1] == 10 && up_hot->ne[2] == 3) {
+            auto * lookup = cache.slots->view_src;
+            GGML_ASSERT(lookup && lookup->op == GGML_OP_GET_ROWS);
+            lookup->op_params[1] = 3;
+            // Keep the fused inputs live past the hot split.
+            act->src[2] = up_hot->src[1];
+            act->src[3] = cache.slots;
+            act->src[4] = up_hot->src[0];
+            act->src[5] = gate_hot->src[0];
+            std::memcpy(act->op_params + 4, &fused_hit_count, sizeof(fused_hit_count));
+            ggml_set_name(act, "ffn_moe_mtp_gate_up_fuse_hits");
+        }
         ggml_build_forward_expand(gf, act);
         const auto full = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps,
                 false, il, false, -1, nullptr, false, gate_up_full_map);

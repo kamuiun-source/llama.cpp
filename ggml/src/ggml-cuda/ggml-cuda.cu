@@ -2330,6 +2330,34 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+#ifdef GGML_USE_HIP
+static bool ggml_cuda_mtp_fused_hit_node(const ggml_tensor * node) {
+    return node->op == GGML_OP_GLU && std::strcmp(node->name, "ffn_moe_mtp_gate_up_fuse_hits") == 0;
+}
+
+static bool ggml_cuda_mtp_shared_q8_1_node(const ggml_tensor * node) {
+    return node->op == GGML_OP_CPY && std::strcmp(node->name, "ffn_moe_mtp_shared_q8_1") == 0;
+}
+
+static bool ggml_cuda_mtp_shared_q8_1_supported(const ggml_tensor * node, int cc) {
+    const auto * src = node->src[0];
+    return cc == GGML_CUDA_CC_VEGA20 && src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) &&
+           src->ne[0] == 2560 && src->ne[0] % MATRIX_ROW_PADDING == 0 && src->ne[1] == 1 &&
+           src->ne[2] == 3 && src->ne[3] == 1 && node->type == GGML_TYPE_Q8_1 &&
+           ggml_are_same_shape(src, node) && ggml_is_contiguous(node);
+}
+
+static bool ggml_cuda_mtp_fuse_hits(const ggml_tensor * ids, int cc) {
+    const auto * lookup = ids->view_src;
+    if (cc != GGML_CUDA_CC_VEGA20 || !ggml_cuda_is_compact_moe_lookup(lookup) ||
+            lookup->op_params[1] != 3 || lookup->op_params[0] != ((1 << 30) - 1)) {
+        return false;
+    }
+    static const bool disabled = ggml_cuda_env_flag("GGML_HIP_GFX906_DISABLE_ROUTED_SWIGLU_FUSION");
+    return !disabled && !ggml_cuda_fusion_disabled();
+}
+#endif
+
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -5663,13 +5691,43 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
 #ifdef GGML_USE_HIP
+                const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+                if (ggml_cuda_mtp_shared_q8_1_node(node)) {
+                    GGML_ASSERT(ggml_cuda_mtp_shared_q8_1_supported(node, cc));
+                    const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
+                    const auto * src = node->src[0];
+                    quantize_row_q8_1_cuda(static_cast<const float *>(src->data), node->data, src->ne[0],
+                            src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+                            node->ne[0], node->ne[1], node->ne[2], node->ne[3], cuda_ctx->stream());
+                    uint64_t * counter;
+                    std::memcpy(&counter, node->op_params + 4, sizeof(counter));
+                    ++*counter;
+                    if (profile_enabled) {
+                        profile_dispatch(i, 1, dispatch_start_us);
+                    }
+                    continue;
+                }
+                if (ggml_cuda_mtp_fused_hit_node(node) && ggml_cuda_mtp_fuse_hits(node->src[3], cc)) {
+                    const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
+                    ggml_cuda_mm_fusion_args_host fusion{};
+                    fusion.gate = node->src[5];
+                    fusion.glu_op = GGML_GLU_OP_SWIGLU;
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[4], node->src[2], node->src[3], node, &fusion);
+                    uint64_t * counter;
+                    std::memcpy(&counter, node->op_params + 4, sizeof(counter));
+                    ++*counter;
+                    if (profile_enabled) {
+                        profile_dispatch(i, 1, dispatch_start_us);
+                    }
+                    continue;
+                }
                 const bool mtp_gate_up_merge = node->op == GGML_OP_ADD &&
                         std::strcmp(node->name, "ffn_moe_mtp_gate_up_merge") == 0;
                 const auto * projection = mtp_gate_up_merge ? node->src[1] : node;
                 if (projection->op == GGML_OP_MUL_MAT_ID) {
                     const auto * lookup = projection->src[2]->view_src;
                     if (!mtp_gate_up_merge && ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[2]) {
-                        GGML_ASSERT(ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20 && ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
+                        GGML_ASSERT(cc == GGML_CUDA_CC_VEGA20 && ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
                                 "shared MTP3 gate/up output requires gfx906 MMVQ");
                         if (lookup->op_params[1] == 2) {
                             GGML_ASSERT(node->view_src == node->src[3] && node->data == node->src[3]->data);
@@ -5677,7 +5735,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         GGML_ASSERT(lookup->op_params[0] >= 0);
                         if (lookup->op_params[0] != 0) {
                             const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
-                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node);
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node,
+                                    nullptr, node->src[4]);
                             uint64_t * counter;
                             std::memcpy(&counter, lookup->op_params + 4, sizeof(counter));
                             ++*counter;
@@ -5685,6 +5744,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 profile_dispatch(i, 1, dispatch_start_us);
                             }
                         }
+                        continue;
+                    }
+                    if (!mtp_gate_up_merge && ggml_cuda_mtp_fuse_hits(projection->src[2], cc)) {
                         continue;
                     }
                     if (ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[1] == 2 && lookup->op_params[0] == 0) {
@@ -5954,7 +6016,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool dynamic_moe_routes = false;
 #ifdef GGML_USE_HIP
     for (int i = 0; i < cgraph->n_nodes && !dynamic_moe_routes; ++i) {
-        dynamic_moe_routes = ggml_cuda_is_compact_moe_lookup(cgraph->nodes[i]);
+        dynamic_moe_routes = ggml_cuda_is_compact_moe_lookup(cgraph->nodes[i]) ||
+                ggml_cuda_mtp_fused_hit_node(cgraph->nodes[i]) || ggml_cuda_mtp_shared_q8_1_node(cgraph->nodes[i]);
     }
 #endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -6951,6 +7014,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_CPY:
             {
+#ifdef GGML_USE_HIP
+                if (ggml_cuda_mtp_shared_q8_1_node(op)) {
+                    return ggml_cuda_mtp_shared_q8_1_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
+                }
+#endif
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
                 if (src0_type == GGML_TYPE_F8_E4M3 && src1_type == GGML_TYPE_F8_E4M3) {

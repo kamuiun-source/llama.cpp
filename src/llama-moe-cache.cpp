@@ -538,7 +538,9 @@ struct llama_moe_cache::impl {
     size_t packed_mtp_gate_up_all_hit = 0;
     size_t packed_mtp_gate_up_all_miss = 0;
     size_t packed_mtp_gate_up_mixed = 0;
+    uint64_t packed_mtp_gate_up_fused_hits = 0;
     uint64_t packed_mtp_gate_up_shared_dispatches = 0;
+    uint64_t packed_mtp_gate_up_q8_1_dispatches = 0;
     bool defer_upload_requested = false;
     size_t packed_deferred_uploads = 0;
     size_t packed_synchronous_uploads = 0;
@@ -596,6 +598,13 @@ struct llama_moe_cache::impl {
     uint64_t prompt_trace_rows = 0;
     int64_t prompt_trace_request_id = -1;
     std::vector<llama_pos> prompt_trace_positions;
+    std::unique_ptr<FILE, decltype(&fclose)> generation_trace{nullptr, fclose};
+    std::vector<llama_pos> generation_trace_positions;
+    uint64_t generation_trace_step = 0;
+    uint64_t generation_trace_memcpy_us = 0;
+    uint64_t generation_trace_upload_wait_us = 0;
+    int64_t generation_trace_request = -1;
+    uint32_t generation_trace_verify_width = 0;
     bool prompt_active = false;
     bool prompt_stats = false;
     uint64_t prompt_ubatches = 0;
@@ -638,10 +647,14 @@ struct llama_moe_cache::impl {
     uint64_t prefill_overlap_pending_windows = 0;
     uint64_t prefill_overlap_fallback_layers = 0;
 
-    void write_prompt_trace(const std::string & row) {
-        if (fwrite(row.data(), 1, row.size(), prompt_trace) != row.size() || fflush(prompt_trace) != 0) {
-            throw std::runtime_error("could not write packed prompt trace");
+    static void write_expert_trace(FILE * file, const std::string & row) {
+        if (fwrite(row.data(), 1, row.size(), file) != row.size() || fflush(file) != 0) {
+            throw std::runtime_error("could not write packed expert trace");
         }
+    }
+
+    void write_prompt_trace(const std::string & row) {
+        write_expert_trace(prompt_trace, row);
     }
 
     // slot maps in host memory
@@ -928,6 +941,21 @@ struct llama_moe_cache::impl {
                     rtx_expert = std::make_unique<llama_rtx_expert>(cuda->backend, static_cast<int32_t>(slots));
                     LLAMA_LOG_INFO("packed expert RTX offload: max_slots=%zu threshold=2\n", rtx_max_slots);
                 }
+            }
+            if (const char * path = std::getenv("LLAMA_EXPERT_GENERATION_TRACE"); path && *path) {
+                if (std::strcmp(target_name, "ROCm") != 0 || !placement->dynamic_resident ||
+                        placement->overlap || placement->hip_mtp_overlap || rtx_expert) {
+                    throw std::runtime_error("generation trace requires ROCm single-bank dynamic Expert placement with upload overlap and RTX assist off");
+                }
+                generation_trace.reset(fopen(path, "wb"));
+                if (!generation_trace) {
+                    throw std::runtime_error("could not open packed expert generation trace");
+                }
+                std::ostringstream header;
+                header << "{\"type\":\"header\",\"version\":1,\"experts\":" << llama_expert_profile::n_experts
+                       << ",\"resident_count\":" << llama_expert_profile::n_resident
+                       << ",\"scratch_capacity\":" << placement->n_slots << "}\n";
+                write_expert_trace(generation_trace.get(), header.str());
             }
             if (const char * path = std::getenv("LLAMA_EXPERT_PREFILL_TRACE"); path && *path) {
                 if (placement->max_ubatch != 2 || placement->prefill_tokens || placement->overlap || rtx_expert) {
@@ -1920,13 +1948,20 @@ struct llama_moe_cache::impl {
     }
 
     void copy_upload_staging(void * dst, const void * src, size_t size, size_t & retry_bytes) {
-        if (!profile_packed_ram_copy) {
+        const bool trace_generation = !generation_trace_positions.empty();
+        if (!profile_packed_ram_copy && !trace_generation) {
             std::memcpy(dst, src, size);
             return;
         }
         const int64_t start = ggml_time_us();
         std::memcpy(dst, src, size);
         const uint64_t us = ggml_time_us() - start;
+        if (trace_generation) {
+            generation_trace_memcpy_us += us;
+        }
+        if (!profile_packed_ram_copy) {
+            return;
+        }
         auto & total = packed_staging_totals;
         ++total.calls;
         total.bytes += size;
@@ -2096,7 +2131,8 @@ struct llama_moe_cache::impl {
             throw;
         }
         if (!hip_async && (!submitted || !*submitted)) {
-            const bool measure_wait = hip_direct || profile_packed_ram_copy;
+            const bool trace_wait = !generation_trace_positions.empty();
+            const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy;
             const int64_t start = measure_wait ? ggml_time_us() : 0;
             ggml_backend_synchronize(backend);
             if (measure_wait) {
@@ -2104,6 +2140,9 @@ struct llama_moe_cache::impl {
                 if (profile_packed_ram_copy) {
                     packed_staging_totals.upload_wait_us += us;
                     packed_staging_totals.direct_bytes += hip_direct ? bytes : 0;
+                }
+                if (trace_wait) {
+                    generation_trace_upload_wait_us += us;
                 }
                 if (hip_direct) {
                     ++hip_direct_upload_steps;
@@ -2478,19 +2517,31 @@ struct llama_moe_cache::impl {
 
         if (placement) {
             const auto & map = placement->maps[il];
-            std::unique_ptr<std::ostringstream> prompt_row;
-            size_t prompt_trace_uploads = 0;
-            if (prompt_trace && !prompt_trace_positions.empty()) {
-                if (ids.size() != prompt_trace_positions.size() * n_used) {
-                    throw std::runtime_error("prompt trace Router ID shape mismatch");
+            const bool trace_generation = !generation_trace_positions.empty();
+            const auto & trace_positions = trace_generation ? generation_trace_positions : prompt_trace_positions;
+            std::unique_ptr<std::ostringstream> trace_row;
+            size_t trace_uploads = 0;
+            size_t trace_tuple_bytes = 0;
+            if (!trace_positions.empty()) {
+                if (ids.size() != trace_positions.size() * n_used) {
+                    throw std::runtime_error("packed expert trace Router ID shape mismatch");
                 }
-                prompt_row = std::make_unique<std::ostringstream>();
-                auto & row = *prompt_row;
-                row << "{\"type\":\"layer\",\"request\":" << prompt_trace_request_id
-                    << ",\"segment\":" << prompt_trace_segment << ",\"layer\":" << il << ",\"positions\":";
-                prompt_trace_array(row, prompt_trace_positions);
+                trace_row = std::make_unique<std::ostringstream>();
+                auto & row = *trace_row;
+                row << "{\"type\":\"layer\",\"request\":" << (trace_generation ? generation_trace_request : prompt_trace_request_id);
+                if (trace_generation) {
+                    generation_trace_memcpy_us = 0;
+                    generation_trace_upload_wait_us = 0;
+                    row << ",\"step\":" << generation_trace_step
+                        << ",\"phase\":\"" << (generation_trace_verify_width ? "verify" : "decode") << "\""
+                        << ",\"verify_width\":" << generation_trace_verify_width;
+                } else {
+                    row << ",\"segment\":" << prompt_trace_segment;
+                }
+                row << ",\"layer\":" << il << ",\"positions\":";
+                prompt_trace_array(row, trace_positions);
                 row << ",\"selected\":[";
-                for (size_t token = 0; token < prompt_trace_positions.size(); ++token) {
+                for (size_t token = 0; token < trace_positions.size(); ++token) {
                     row << (token ? ",[" : "[");
                     for (int rank = 0; rank < n_used; ++rank) {
                         row << (rank ? "," : "") << ids[token * n_used + rank];
@@ -2518,6 +2569,7 @@ struct llama_moe_cache::impl {
                 row << ",\"strides\":[";
                 for (size_t plane = 0; plane < l.experts.size(); ++plane) {
                     row << (plane ? "," : "") << l.experts[plane]->nb[2];
+                    trace_tuple_bytes += l.experts[plane]->nb[2];
                 }
                 row << "],\"uploads\":[";
             }
@@ -2701,8 +2753,13 @@ struct llama_moe_cache::impl {
                     upload_start_us = ggml_time_us();
                 }
                 const int32_t slot = packed_slot(l, scratch_index);
-                if (prompt_row) {
-                    *prompt_row << (prompt_trace_uploads++ ? "," : "") << "{\"expert\":" << expert << ",\"slot\":" << slot << '}';
+                if (trace_row) {
+                    auto & row = *trace_row;
+                    row << (trace_uploads++ ? "," : "") << "{\"expert\":" << expert << ",\"slot\":" << slot;
+                    if (trace_generation) {
+                        row << ",\"bytes\":" << trace_tuple_bytes;
+                    }
+                    row << '}';
                 }
                 if (batch) {
                     fills.push_back({expert, scratch_index});
@@ -2919,10 +2976,20 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_DEBUG("packed experts: layer %d: %zu permanent hits, %zu scratch hits, %d RAM uploads, %zu bytes\n",
                     il, hits, scratch_hits, n_uploads, bytes);
-            if (prompt_row) {
-                *prompt_row << "],\"bytes\":" << bytes << "}\n";
-                write_prompt_trace(prompt_row->str());
-                ++prompt_trace_rows;
+            if (trace_row) {
+                *trace_row << "],\"bytes\":" << bytes;
+                if (trace_generation) {
+                    *trace_row << ",\"staging_memcpy_us\":" << generation_trace_memcpy_us
+                               << ",\"upload_wait_us\":" << generation_trace_upload_wait_us
+                               << ",\"direct_bytes\":" << (hip_direct ? bytes : 0);
+                }
+                *trace_row << "}\n";
+                if (trace_generation) {
+                    write_expert_trace(generation_trace.get(), trace_row->str());
+                } else {
+                    write_prompt_trace(trace_row->str());
+                    ++prompt_trace_rows;
+                }
             }
             return true;
         }
@@ -3082,16 +3149,21 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP MTP3 gate/up overlap: all_hit_layers=%zu all_miss_layers=%zu mixed_layers=%zu"
                         " swiglu_per_layer=1 down_per_layer=1\n",
                         packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed);
+                if (placement->hip_mtp_gate_up_fuse_hits) {
+                    LLAMA_LOG_INFO("packed expert HIP MTP3 gate/up overlap: fused_hit_dispatches=%" PRIu64 "\n",
+                            packed_mtp_gate_up_fused_hits);
+                }
                 if (placement->hip_mtp_gate_up_shared_output) {
                     LLAMA_LOG_INFO("packed expert HIP MTP3 shared gate/up output: all_hit_layers=%zu"
                             " all_miss_layers=%zu mixed_layers=%zu projection_dispatches=%" PRIu64 "\n",
                             packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed,
                             packed_mtp_gate_up_shared_dispatches);
                 }
-            }
-            if (overlap_upload_requested) {
-                LLAMA_LOG_INFO("packed expert Vulkan promotion overlap: committed=%zu writeback_bytes=%zu\n",
-                        packed_overlap_promotions, packed_overlap_writeback_bytes);
+                if (placement->hip_mtp_gate_up_reuse_q8_1) {
+                    LLAMA_LOG_INFO("packed expert HIP MTP3 shared gate/up Q8_1: quantize_dispatches=%" PRIu64
+                            " projection_consumers=%" PRIu64 "\n",
+                            packed_mtp_gate_up_q8_1_dispatches, packed_mtp_gate_up_shared_dispatches);
+                }
             }
             if (overlap_upload_requested) {
                 LLAMA_LOG_INFO("packed expert Vulkan promotion overlap: committed=%zu writeback_bytes=%zu\n",
@@ -3230,6 +3302,33 @@ void llama_moe_cache::end_prompt_trace(bool success) {
     self.write_prompt_trace(row.str());
 }
 
+void llama_moe_cache::begin_generation_trace(const llama_ubatch & ubatch, uint32_t verify_width) {
+    auto & self = *pimpl;
+    if (!self.generation_trace) {
+        return;
+    }
+    if (!ubatch.token || !ubatch.n_pos || ubatch.n_seqs_unq != 1 ||
+            ubatch.n_tokens > 3 || !self.generation_trace_positions.empty()) {
+        throw std::runtime_error("packed expert generation trace requires one text sequence and up to three tokens");
+    }
+    ++self.generation_trace_step;
+    self.generation_trace_request = prompt_trace_request;
+    self.generation_trace_verify_width = verify_width;
+    self.generation_trace_positions.assign(ubatch.pos, ubatch.pos + ubatch.n_tokens);
+}
+
+void llama_moe_cache::end_generation_trace(bool success) {
+    auto & self = *pimpl;
+    if (self.generation_trace_positions.empty()) {
+        return;
+    }
+    self.generation_trace_positions.clear();
+    std::ostringstream row;
+    row << "{\"type\":\"end\",\"request\":" << self.generation_trace_request << ",\"step\":" << self.generation_trace_step
+        << ",\"success\":" << (success ? "true" : "false") << "}\n";
+    self.write_expert_trace(self.generation_trace.get(), row.str());
+}
+
 void llama_moe_cache::record_decode_width(uint32_t tokens) {
     if (pimpl->prompt_stats) {
         pimpl->decode_max_tokens = std::max<uint64_t>(pimpl->decode_max_tokens, tokens);
@@ -3328,13 +3427,18 @@ ggml_tensor * llama_moe_cache::get_hip_mtp_gate_up_full_map(int32_t il) const {
     return requires_slots(il) ? pimpl->layers[il].hip_mtp_full_map : nullptr;
 }
 
-ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
-    return pimpl->get_cpu_map(il, n_tokens);
+uint64_t * llama_moe_cache::get_hip_mtp_fused_hit_count() const {
+    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_fuse_hits ? &pimpl->packed_mtp_gate_up_fused_hits : nullptr;
 }
 
 uint64_t * llama_moe_cache::get_hip_mtp_shared_output_count() const {
     return pimpl->placement && pimpl->placement->hip_mtp_gate_up_shared_output ?
             &pimpl->packed_mtp_gate_up_shared_dispatches : nullptr;
+}
+
+uint64_t * llama_moe_cache::get_hip_mtp_q8_1_count() const {
+    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_reuse_q8_1 ?
+            &pimpl->packed_mtp_gate_up_q8_1_dispatches : nullptr;
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {

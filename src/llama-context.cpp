@@ -2642,25 +2642,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
         struct prompt_trace_scope {
             llama_moe_cache * cache;
+            bool prefill;
             bool success = false;
             ~prompt_trace_scope() {
                 if (cache) {
                     try {
-                        cache->end_prompt_trace(success);
+                        if (prefill) {
+                            cache->end_prompt_trace(success);
+                        } else {
+                            cache->end_generation_trace(success);
+                        }
                     } catch (const std::exception & err) {
-                        LLAMA_LOG_ERROR("prompt trace: %s\n", err.what());
+                        LLAMA_LOG_ERROR("packed expert trace: %s\n", err.what());
                     }
                 }
             }
-        } prompt_trace{prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? moe_cache.get() : nullptr};
-        if (prompt_trace.cache) {
-            prompt_trace.cache->begin_prompt_trace(ubatch, n_tokens_all, n_tokens_prev);
-        } else if (moe_cache && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
-            moe_cache->record_decode_width(ubatch.n_tokens);
+        } expert_trace{cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? moe_cache.get() : nullptr, prefill};
+        if (expert_trace.cache) {
+            if (prefill) {
+                expert_trace.cache->begin_prompt_trace(ubatch, n_tokens_all, n_tokens_prev);
+            } else {
+                expert_trace.cache->record_decode_width(ubatch.n_tokens);
+                if (!cparams.warmup) {
+                    expert_trace.cache->begin_generation_trace(ubatch, target_mtp_verify_width);
+                }
+            }
         }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
                 decode_profile && n_tokens_all == 1);
-        prompt_trace.success = res != nullptr;
+        expert_trace.success = res != nullptr;
 
         if (!res) {
             if (mtp_device_pending && state_backend) {

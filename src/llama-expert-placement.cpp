@@ -98,8 +98,14 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()), hip_mtp_gate_up_overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
+    }()), hip_mtp_gate_up_fuse_hits([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_FUSE_HITS");
+        return value && std::strcmp(value, "1") == 0;
     }()), hip_mtp_gate_up_shared_output([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_SHARED_OUTPUT");
+        return value && std::strcmp(value, "1") == 0;
+    }()), hip_mtp_gate_up_reuse_q8_1([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_REUSE_Q8_1");
         return value && std::strcmp(value, "1") == 0;
     }()), hip_mtp_compact(hip_mtp_gate_up_overlap || [&] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_COMPACT");
@@ -134,8 +140,14 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     if (hip_mtp_gate_up_overlap && (!hip_mtp_verify_three || !dynamic_resident || overlap)) {
         throw std::runtime_error("HIP gate/up overlap requires single-bank dynamic residency and fixed three-position MTP");
     }
-    if (hip_mtp_gate_up_shared_output && !hip_mtp_gate_up_overlap) {
-        throw std::runtime_error("HIP MTP3 shared gate/up output requires gate/up overlap");
+    if (hip_mtp_gate_up_fuse_hits && !hip_mtp_gate_up_overlap) {
+        throw std::runtime_error("HIP MTP3 fused hits require HIP MTP3 gate/up overlap");
+    }
+    if (hip_mtp_gate_up_shared_output && (!hip_mtp_gate_up_overlap || hip_mtp_gate_up_fuse_hits)) {
+        throw std::runtime_error("HIP MTP3 shared gate/up output requires gate/up overlap with fused hits off");
+    }
+    if (hip_mtp_gate_up_reuse_q8_1 && !hip_mtp_gate_up_shared_output) {
+        throw std::runtime_error("HIP MTP3 Q8_1 reuse requires shared gate/up output");
     }
     if (hip_mtp_direct_ram && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap)) {
         throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP with upload overlap off");

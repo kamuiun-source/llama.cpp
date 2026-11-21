@@ -29,6 +29,8 @@ public:
             ggml_tensor * up_scale, ggml_tensor * gate_scale, ggml_tensor * down_scale) const;
     void begin_prompt_trace(const llama_ubatch & ubatch, uint32_t batch_tokens, uint32_t batch_offset);
     void end_prompt_trace(bool success);
+    void begin_generation_trace(const llama_ubatch & ubatch, uint32_t verify_width);
+    void end_generation_trace(bool success);
     void record_decode_width(uint32_t tokens);
     llama_expert_round_stats round_stats() const;
 
@@ -44,7 +46,9 @@ public:
     ggml_tensor * get_cold_slot_map(int32_t il, bool mtp_three = false) const;
     bool uses_hip_mtp_compact() const;
     ggml_tensor * get_hip_mtp_gate_up_full_map(int32_t il) const;
+    uint64_t * get_hip_mtp_fused_hit_count() const;
     uint64_t * get_hip_mtp_shared_output_count() const;
+    uint64_t * get_hip_mtp_q8_1_count() const;
     llama_rtx_expert * get_rtx_expert() const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others

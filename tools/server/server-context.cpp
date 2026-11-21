@@ -163,6 +163,10 @@ struct server_decode_telemetry {
         const char * path = std::getenv("LLAMA_EXPERT_PREFILL_TRACE");
         return path && *path;
     }();
+    const bool expert_generation_trace = [] {
+        const char * path = std::getenv("LLAMA_EXPERT_GENERATION_TRACE");
+        return path && *path;
+    }();
     const bool expert_decode_trace = server_expert_decode_trace_enabled();
     bool initialized = false;
     const bool per_response = [] {
@@ -5578,12 +5582,13 @@ private:
                 }
             }
             int64_t trace_request = -1;
-            if (decode_telemetry.expert_prompt_trace && prompt_only) {
+            const bool trace_experts = prompt_only ? decode_telemetry.expert_prompt_trace : decode_telemetry.expert_generation_trace;
+            if (trace_experts) {
                 trace_request = slots[batch.tokens[off].id_slot].task->id;
                 for (int i = off; i < off + batch.view.size(); ++i) {
                     if (slots[batch.tokens[i].id_slot].task->id != trace_request) {
                         trace_request = -1;
-                        SRV_WRN("%s", "packed prompt trace: omitted a batch containing multiple requests\n");
+                        SRV_WRN("%s", "packed expert trace: omitted a batch containing multiple requests\n");
                         break;
                     }
                 }
@@ -5596,8 +5601,7 @@ private:
                         llama_set_expert_prompt_trace_request(previous);
                     }
                 }
-            } prompt_trace_request{decode_telemetry.expert_prompt_trace,
-                    decode_telemetry.expert_prompt_trace ? llama_set_expert_prompt_trace_request(trace_request) : -1};
+            } prompt_trace_request{trace_experts, trace_experts ? llama_set_expert_prompt_trace_request(trace_request) : -1};
             if (mtp_verify && phase == server_decode_telemetry::verify) {
                 ret = llama_process_mtp_verify(ctx_tgt, batch.view.get());
             } else {
