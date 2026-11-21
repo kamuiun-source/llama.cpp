@@ -5668,6 +5668,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 const auto * projection = mtp_gate_up_merge ? node->src[1] : node;
                 if (projection->op == GGML_OP_MUL_MAT_ID) {
                     const auto * lookup = projection->src[2]->view_src;
+                    if (!mtp_gate_up_merge && ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[2]) {
+                        GGML_ASSERT(ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20 && ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
+                                "shared MTP3 gate/up output requires gfx906 MMVQ");
+                        if (lookup->op_params[1] == 2) {
+                            GGML_ASSERT(node->view_src == node->src[3] && node->data == node->src[3]->data);
+                        }
+                        GGML_ASSERT(lookup->op_params[0] >= 0);
+                        if (lookup->op_params[0] != 0) {
+                            const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node);
+                            uint64_t * counter;
+                            std::memcpy(&counter, lookup->op_params + 4, sizeof(counter));
+                            ++*counter;
+                            if (profile_enabled) {
+                                profile_dispatch(i, 1, dispatch_start_us);
+                            }
+                        }
+                        continue;
+                    }
                     if (ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[1] == 2 && lookup->op_params[0] == 0) {
                         GGML_ASSERT(!mtp_gate_up_merge || node->data == node->src[0]->data);
                         continue;

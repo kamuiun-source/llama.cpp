@@ -42,6 +42,7 @@ struct llama_expert_placement {
     const bool dynamic_resident;
     const bool hip_mtp_verify_three;
     const bool hip_mtp_gate_up_overlap;
+    const bool hip_mtp_gate_up_shared_output;
     const bool hip_mtp_compact;
     const bool hip_mtp_overlap;
     const bool hip_mtp_direct_ram;

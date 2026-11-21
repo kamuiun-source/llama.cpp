@@ -538,6 +538,7 @@ struct llama_moe_cache::impl {
     size_t packed_mtp_gate_up_all_hit = 0;
     size_t packed_mtp_gate_up_all_miss = 0;
     size_t packed_mtp_gate_up_mixed = 0;
+    uint64_t packed_mtp_gate_up_shared_dispatches = 0;
     bool defer_upload_requested = false;
     size_t packed_deferred_uploads = 0;
     size_t packed_synchronous_uploads = 0;
@@ -3081,6 +3082,16 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP MTP3 gate/up overlap: all_hit_layers=%zu all_miss_layers=%zu mixed_layers=%zu"
                         " swiglu_per_layer=1 down_per_layer=1\n",
                         packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed);
+                if (placement->hip_mtp_gate_up_shared_output) {
+                    LLAMA_LOG_INFO("packed expert HIP MTP3 shared gate/up output: all_hit_layers=%zu"
+                            " all_miss_layers=%zu mixed_layers=%zu projection_dispatches=%" PRIu64 "\n",
+                            packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed,
+                            packed_mtp_gate_up_shared_dispatches);
+                }
+            }
+            if (overlap_upload_requested) {
+                LLAMA_LOG_INFO("packed expert Vulkan promotion overlap: committed=%zu writeback_bytes=%zu\n",
+                        packed_overlap_promotions, packed_overlap_writeback_bytes);
             }
             if (overlap_upload_requested) {
                 LLAMA_LOG_INFO("packed expert Vulkan promotion overlap: committed=%zu writeback_bytes=%zu\n",
@@ -3315,6 +3326,15 @@ bool llama_moe_cache::uses_hip_mtp_compact() const {
 
 ggml_tensor * llama_moe_cache::get_hip_mtp_gate_up_full_map(int32_t il) const {
     return requires_slots(il) ? pimpl->layers[il].hip_mtp_full_map : nullptr;
+}
+
+ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
+    return pimpl->get_cpu_map(il, n_tokens);
+}
+
+uint64_t * llama_moe_cache::get_hip_mtp_shared_output_count() const {
+    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_shared_output ?
+            &pimpl->packed_mtp_gate_up_shared_dispatches : nullptr;
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {

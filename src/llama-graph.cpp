@@ -2645,21 +2645,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 up_exps_b || gate_exps_b || type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f) {
             throw std::runtime_error("HIP MTP3 gate/up overlap requires separate plain gate/up projections and unclamped SwiGLU");
         }
-        auto project = [&](ggml_tensor * weight, ggml_tensor * slots, const char * name) {
+        const bool shared_output = moe_cache->get_hip_mtp_shared_output_count() != nullptr;
+        const auto shared_projection_type = [](ggml_type type) {
+            return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS;
+        };
+        if (shared_output && (!shared_projection_type(up_exps->type) || !shared_projection_type(gate_exps->type) ||
+                up_exps->ne[0] != 2560 || gate_exps->ne[0] != 2560 ||
+                up_exps->ne[1] != 640 || gate_exps->ne[1] != 640 || selected_experts->ne[0] != 10 || n_tokens != 3)) {
+            throw std::runtime_error("HIP MTP3 shared gate/up output requires the Flash-Next quantized gate/up shape");
+        }
+        auto project = [&](ggml_tensor * weight, ggml_tensor * slots, const char * name, ggml_tensor * output = nullptr) {
             auto * projection = build_lora_mm_id(weight, cur, selected_experts, nullptr, slots, true);
+            if (output) {
+                GGML_ASSERT(ggml_are_same_shape(projection, output) && ggml_are_same_stride(projection, output));
+                projection->view_src = output;
+                projection->src[3] = output;
+            }
             cb(projection, name, il);
+            if (shared_output) {
+                ggml_backend_sched_set_tensor_backend(sched, projection, moe_cache->backend(il));
+            }
             ggml_build_forward_expand(gf, projection);
             return projection;
         };
         auto * gate_hot = project(gate_exps, cache.slots, "ffn_moe_gate_hot");
         auto * up_hot = project(up_exps, cache.slots, "ffn_moe_up_hot");
         const auto cold = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, true);
-        auto * gate_miss = project(gate_exps, cold.slots, "ffn_moe_gate_miss");
-        auto * up_miss = project(up_exps, cold.slots, "ffn_moe_up_miss");
-        auto * gate = ggml_add_inplace(ctx0, gate_hot, gate_miss);
-        auto * up = ggml_add_inplace(ctx0, up_hot, up_miss);
-        ggml_set_name(gate, "ffn_moe_mtp_gate_up_merge");
-        ggml_set_name(up, "ffn_moe_mtp_gate_up_merge");
+        auto * gate_miss = project(gate_exps, cold.slots, "ffn_moe_gate_miss", shared_output ? gate_hot : nullptr);
+        auto * up_miss = project(up_exps, cold.slots, "ffn_moe_up_miss", shared_output ? up_hot : nullptr);
+        auto * gate = gate_miss;
+        auto * up = up_miss;
+        if (!shared_output) {
+            gate = ggml_add_inplace(ctx0, gate_hot, gate_miss);
+            up = ggml_add_inplace(ctx0, up_hot, up_miss);
+            ggml_set_name(gate, "ffn_moe_mtp_gate_up_merge");
+            ggml_set_name(up, "ffn_moe_mtp_gate_up_merge");
+        }
         auto * act = ggml_swiglu_split(ctx0, gate, up);
         cb(act, "ffn_moe_swiglu", il);
         ggml_build_forward_expand(gf, act);
@@ -2864,6 +2885,10 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         slots->op_params[0] = -1;
         if (moe_cache->get_hip_mtp_gate_up_full_map(il)) {
             slots->op_params[1] = cold ? 2 : 1;
+            if (auto * count = moe_cache->get_hip_mtp_shared_output_count()) {
+                slots->op_params[2] = 1;
+                std::memcpy(slots->op_params + 4, &count, sizeof(count));
+            }
         }
     }
 

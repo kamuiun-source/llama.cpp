@@ -1597,6 +1597,8 @@ void ggml_cuda_mul_mat_vec_q(
                                 !fusion->x_scale && !fusion->gate_scale));
         if (ids->view_src->op_params[1] && compact_mask == (1 << 30) - 1) {
             compact_mask = -1;
+        } else if (ids->view_src->op_params[2]) {
+            GGML_ASSERT(compact_mask != 0);
         } else {
             CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
             if (compact_mask == 0) {

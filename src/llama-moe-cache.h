@@ -44,6 +44,7 @@ public:
     ggml_tensor * get_cold_slot_map(int32_t il, bool mtp_three = false) const;
     bool uses_hip_mtp_compact() const;
     ggml_tensor * get_hip_mtp_gate_up_full_map(int32_t il) const;
+    uint64_t * get_hip_mtp_shared_output_count() const;
     llama_rtx_expert * get_rtx_expert() const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
