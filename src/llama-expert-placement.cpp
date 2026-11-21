@@ -75,8 +75,11 @@ static llama_expert_placement::hip_overlap_mode packed_hip_mode(ggml_backend_dev
 }
 
 llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used)
-    : target(target), max_ubatch(packed_max_ubatch()), n_slots(packed_scratch_capacity(n_expert_used, max_ubatch)),
-        hip_overlap(packed_hip_mode(target, "LLAMA_EXPERT_HIP_OVERLAP")),
+    : target(target), max_ubatch(packed_max_ubatch()), hip_overlap(packed_hip_mode(target, "LLAMA_EXPERT_HIP_OVERLAP")),
+        hip_mtp_verify_three([&] {
+        const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        return hip_overlap != hip_overlap_mode::off && value && std::strcmp(value, "1") == 0;
+    }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_three ? 3 : max_ubatch)),
         hip_prefill(packed_hip_mode(target, "LLAMA_EXPERT_HIP_PREFILL")), hip_overlap_promotion([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_OVERLAP_PROMOTION");
         return value && std::strcmp(value, "1") == 0;
@@ -109,14 +112,17 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()) {
     const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
+    if (hip_mtp_verify_three && (max_ubatch != 2 || n_expert_used != 10)) {
+        throw std::runtime_error("HIP 3-position MTP requires two-token microbatches and top-10 routing");
+    }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
     }
-    if (hip_overlap != hip_overlap_mode::off && (max_ubatch != 1 || (hip_dynamic && std::strcmp(hip_dynamic, "1") == 0))) {
-        throw std::runtime_error("HIP expert overlap requires one position and dynamic residency off");
+    if (hip_overlap != hip_overlap_mode::off && hip_dynamic && std::strcmp(hip_dynamic, "1") == 0) {
+        throw std::runtime_error("HIP expert overlap is incompatible with same-bank dynamic residency");
     }
-    if (max_ubatch > 1 && !dynamic_resident) {
-        throw std::runtime_error("packed expert batching requires dynamic residency");
+    if (max_ubatch > 1 && !dynamic_resident && hip_overlap == hip_overlap_mode::off) {
+        throw std::runtime_error("packed expert batching requires dynamic residency or HIP split placement");
     }
     if (dynamic_resident) {
         if (n_slots <= 0 || n_slots > n_experts - n_resident) {

@@ -2158,7 +2158,7 @@ private:
                     (mtp_adaptive && params_base.speculative.draft.n_min > 1) ||
                     !llama_supports_mtp_verify_three(ctx_tgt) || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                     ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-                SRV_ERR("%s", "three-position MTP requires two draft tokens, real acceptance, one slot, and target and draft rollback on packed Qwen4Exp Prefill512\n");
+                SRV_ERR("%s", "three-position MTP requires supported packed Qwen4Exp placement, two draft tokens, real acceptance, one slot, and target and draft rollback\n");
                 return false;
             }
         }

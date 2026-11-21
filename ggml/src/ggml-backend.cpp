@@ -1361,6 +1361,8 @@ struct ggml_backend_sched {
     size_t host_input_batches;
     size_t batched_host_inputs;
     bool batch_device_inputs;
+    bool batch_hip_device_inputs;
+    bool skip_hip_device_dst_wait;
     bool trace_handoff;
     bool overlap_shared;
     bool shared_host_return;
@@ -2332,8 +2334,7 @@ static ggml_backend_buffer_t ggml_backend_sched_device_input_buffer(
     return buffer;
 }
 
-// The CUDA and Vulkan copy hooks decline the other backend's standard device buffer without submitting work.
-static bool ggml_backend_sched_is_cuda_vulkan_pair(ggml_backend_t src, ggml_backend_t dst) {
+static bool ggml_backend_sched_is_cuda_pair(ggml_backend_t src, ggml_backend_t dst, const char * peer) {
     if (src == dst) {
         return false;
     }
@@ -2346,8 +2347,13 @@ static bool ggml_backend_sched_is_cuda_vulkan_pair(ggml_backend_t src, ggml_back
     }
     const char * src_name = ggml_backend_reg_name(src_reg);
     const char * dst_name = ggml_backend_reg_name(dst_reg);
-    return (strcmp(src_name, "CUDA") == 0 && strcmp(dst_name, "Vulkan") == 0) ||
-            (strcmp(src_name, "Vulkan") == 0 && strcmp(dst_name, "CUDA") == 0);
+    return (strcmp(src_name, "CUDA") == 0 && strcmp(dst_name, peer) == 0) ||
+            (strcmp(src_name, peer) == 0 && strcmp(dst_name, "CUDA") == 0);
+}
+
+// The CUDA and Vulkan copy hooks decline the other backend's standard device buffer without submitting work.
+static bool ggml_backend_sched_is_cuda_vulkan_pair(ggml_backend_t src, ggml_backend_t dst) {
+    return ggml_backend_sched_is_cuda_pair(src, dst, "Vulkan");
 }
 
 static ggml_backend_sched_host_copies::entry * ggml_backend_sched_host_copy_entry(
@@ -2365,8 +2371,15 @@ static ggml_backend_sched_host_copies::entry * ggml_backend_sched_host_copy_entr
     const auto dst_dev = ggml_backend_get_device(dst);
     const auto src_reg = src_dev ? ggml_backend_dev_backend_reg(src_dev) : nullptr;
     const auto dst_reg = dst_dev ? ggml_backend_dev_backend_reg(dst_dev) : nullptr;
-    if (!src_reg || !dst_reg || strcmp(ggml_backend_reg_name(src_reg), "CUDA") != 0 ||
-            strcmp(ggml_backend_reg_name(dst_reg), "Vulkan") != 0) {
+    if (!src_reg || !dst_reg || strcmp(ggml_backend_reg_name(src_reg), "CUDA") != 0) {
+        return nullptr;
+    }
+    static const bool hip_host_router_ids = [] {
+        const char * value = getenv("GGML_SCHED_HIP_HOST_ROUTER_IDS");
+        return value && strcmp(value, "1") == 0;
+    }();
+    const char * dst_name = ggml_backend_reg_name(dst_reg);
+    if (strcmp(dst_name, "Vulkan") != 0 && !(hip_host_router_ids && strcmp(dst_name, "ROCm") == 0)) {
         return nullptr;
     }
     entry.payload = entry.data;
@@ -2423,9 +2436,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    const bool cuda_hip_pair = input_backend && (sched->skip_hip_device_dst_wait || sched->trace_handoff_graph) &&
+            ggml_backend_sched_is_cuda_pair(input_backend, split_backend, "ROCm");
     ggml_backend_handoff_times handoff;
     handoff.enabled = sched->trace_handoff_graph && input_backend &&
-            ggml_backend_sched_is_cuda_vulkan_pair(input_backend, split_backend) && !ggml_backend_sched_is_host_weight(input);
+            (cuda_hip_pair || ggml_backend_sched_is_cuda_vulkan_pair(input_backend, split_backend)) &&
+            !ggml_backend_sched_is_host_weight(input);
     const ggml_tensor * trace_input = input;
 
     // read before the previous split, wait for the copy only
@@ -2497,15 +2513,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         handoff.measure(handoff.source_wait_us, [&] { ggml_backend_synchronize(input_backend); });
+        const bool skip_hip_wait = sched->skip_hip_device_dst_wait && cuda_hip_pair && ggml_are_same_layout(input, input_cpy);
+        const char * host_path = "host";
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             handoff.measure(handoff.destination_wait_us, [&] { ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]); });
-        } else if (sched->batch_device_inputs && sched->n_copies == 1 &&
-                ggml_backend_sched_is_cuda_vulkan_pair(input_backend, split_backend) &&
+        } else if (sched->n_copies == 1 &&
+                (skip_hip_wait || (sched->batch_device_inputs && ggml_backend_sched_is_cuda_vulkan_pair(input_backend, split_backend))) &&
                 ggml_backend_sched_device_input_buffer(input_backend, input, ggml_nbytes(input)) &&
                 ggml_backend_sched_device_input_buffer(split_backend, input_cpy, ggml_nbytes(input)) &&
                 !ggml_backend_sched_is_host_weight(input)) {
             // The first destination wait already completed; the declined copy did not queue anything.
             ++sched->skipped_device_dst_waits;
+            if (skip_hip_wait) {
+                host_path = "host_skip_dst_wait";
+            }
         } else {
             handoff.measure(handoff.destination_wait_us, [&] { ggml_backend_synchronize(split_backend); });
         }
@@ -2516,7 +2537,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ++host_copies->count;
         }
         ggml_backend_sched_log_handoff(sched, split, input_backend, split_backend, &trace_input, 1,
-                ggml_nbytes(input), handoff, handoff.read_end_us ? "host" : "buffer");
+                ggml_nbytes(input), handoff, handoff.read_end_us ? host_path : "buffer");
     } else {
         ggml_backend_sched_log_handoff(sched, split, input_backend, split_backend, &trace_input, 1, ggml_nbytes(input), handoff, "async");
         if (sched->profile.enabled) {
@@ -2839,7 +2860,11 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
             break;
         }
         ggml_backend_t src = ggml_backend_sched_get_tensor_backend(sched, input);
-        if (!src || (count ? src != src_backend : !ggml_backend_sched_is_cuda_vulkan_pair(src, dst_backend))) {
+        if (!src || (count && src != src_backend)) {
+            break;
+        }
+        if (!count && !(sched->batch_device_inputs && ggml_backend_sched_is_cuda_vulkan_pair(src, dst_backend)) &&
+                !(sched->batch_hip_device_inputs && ggml_backend_sched_is_cuda_pair(src, dst_backend, "ROCm"))) {
             break;
         }
         ggml_tensor * copy = tensor_copy(input, backend_id, sched->cur_copy);
@@ -2875,12 +2900,14 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         last = i;
         ++count;
     }
-    const bool router_upload = count == 1 && ggml_backend_sched_is_mtp_three_router_input(sched, split, srcs[0], dsts[0]);
+    const bool vulkan_pair = count > 0 && ggml_backend_sched_is_cuda_vulkan_pair(src_backend, dst_backend);
+    const bool router_upload = count == 1 && vulkan_pair &&
+            ggml_backend_sched_is_mtp_three_router_input(sched, split, srcs[0], dsts[0]);
     if (count < 2 && !router_upload) {
         return 0;
     }
 
-    if (sched->shared_host_input && host_copies && !sched->profile.enabled && !sched->callback_eval &&
+    if (vulkan_pair && sched->shared_host_input && host_copies && !sched->profile.enabled && !sched->callback_eval &&
             bytes <= shared_host_capacity &&
             (router_upload || ggml_backend_sched_is_packed_moe_input(sched, split, srcs, dsts, count))) {
         const auto src_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(src_backend));
@@ -3375,7 +3402,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         continue;
                     }
                 }
-                if (sched->batch_device_inputs && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                if ((sched->batch_device_inputs || sched->batch_hip_device_inputs) && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
                     const int count = ggml_backend_sched_batch_device_inputs(sched, split, input_id, host_copies, upload);
                     if (count > 0) {
                         input_id += count - 1;
@@ -3671,14 +3698,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    const char * placement = getenv("LLAMA_EXPERT_PLACEMENT");
+    const char * batch_hip = getenv("GGML_SCHED_HIP_BATCH_DEVICE_INPUTS");
+    const char * skip_hip_wait = getenv("GGML_SCHED_HIP_SKIP_DUP_DST_WAIT");
+    const bool allow_hip_handoff = placement && *placement && sched->n_copies == 1;
+    const bool allow_hip_batch = allow_hip_handoff && batch_hip && strcmp(batch_hip, "1") == 0;
+    const bool allow_hip_wait_skip = allow_hip_handoff && skip_hip_wait && strcmp(skip_hip_wait, "1") == 0;
     bool cuda_vulkan = false;
+    bool cuda_hip = false;
     for (int src = 0; src < n_backends; ++src) {
         for (int dst = src + 1; dst < n_backends; ++dst) {
             cuda_vulkan |= ggml_backend_sched_is_cuda_vulkan_pair(backends[src], backends[dst]);
+            if (allow_hip_batch || allow_hip_wait_skip) {
+                cuda_hip |= ggml_backend_sched_is_cuda_pair(backends[src], backends[dst], "ROCm");
+            }
         }
     }
-    const char * placement = getenv("LLAMA_EXPERT_PLACEMENT");
     cuda_vulkan = cuda_vulkan && placement && *placement;
+    sched->batch_hip_device_inputs = allow_hip_batch && cuda_hip;
+    sched->skip_hip_device_dst_wait = allow_hip_wait_skip && cuda_hip;
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
     const char * rtx_slots = getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
     sched->overlap_shared = sched->n_copies == 1 && cuda_vulkan &&
@@ -3729,6 +3767,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->batch_device_inputs = cuda_vulkan;
     if (sched->batch_device_inputs) {
         GGML_LOG_INFO("sched_batch_device_inputs: enabled\n");
+    }
+    if (sched->batch_hip_device_inputs) {
+        GGML_LOG_INFO("sched_batch_device_inputs: enabled for CUDA and ROCm\n");
     }
 
     // initialize hash table
@@ -3811,7 +3852,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched->overlap_shared) {
         GGML_LOG_INFO("shared expert overlap: prefix_submits=%zu tokens=%zu\n", sched->shared_overlap_submits, sched->shared_overlap_tokens);
     }
-    if (sched->batch_device_inputs) {
+    if (sched->batch_device_inputs || sched->batch_hip_device_inputs || sched->skip_hip_device_dst_wait) {
         GGML_LOG_INFO("sched_batch_device_inputs: device_input_batches=%zu batched_device_inputs=%zu bytes=%zu skipped_dst_waits=%zu\n",
                 sched->device_input_batches, sched->batched_device_inputs, sched->batched_device_input_bytes, sched->skipped_device_dst_waits);
     }

@@ -435,6 +435,7 @@ struct llama_moe_cache::impl {
     int32_t pending_layer = -1;
     size_t pending_permanent_hits = 0;
     size_t pending_scratch_hits = 0;
+    size_t pending_request_misses = 0;
     size_t pending_upload_bytes = 0;
     size_t packed_scratch_hits = 0;
     size_t packed_request_misses = 0;
@@ -669,7 +670,7 @@ struct llama_moe_cache::impl {
             if (!mtp_verify_three_enabled && n_expert_used == mtp_pair_experts && pair_overlap && std::strcmp(pair_overlap, "1") == 0) {
                 mtp_pair_histograms.resize(layers.size());
             }
-            LLAMA_LOG_INFO("packed expert router: reuse host IDs from CUDA to Vulkan copies\n");
+            LLAMA_LOG_INFO("packed expert router: reuse host IDs when captured by the scheduler\n");
             groups.emplace_back().id = static_cast<int32_t>(device - devices.begin());
             const int32_t n_prefill_waves = placement->prefill_waves(placement->prefill_tokens, n_expert_used);
             if (mtp_verify_three_enabled && (placement->overlap || placement->n_slots != 20 ||
@@ -1218,7 +1219,8 @@ struct llama_moe_cache::impl {
         }
         const layer & l = layers[il];
         if (placement) {
-            return n_tokens > 0 && n_tokens <= placement->max_ubatch && n_expert_used > 0 &&
+            const int32_t max_tokens = placement->hip_mtp_verify_three ? 3 : placement->max_ubatch;
+            return n_tokens > 0 && n_tokens <= max_tokens && n_expert_used > 0 &&
                     n_expert_used <= placement->n_slots / n_tokens ? l.slot_map : nullptr;
         }
 
@@ -2298,6 +2300,7 @@ struct llama_moe_cache::impl {
             }
             stats_small.hits += pending_permanent_hits + pending_scratch_hits;
             packed_scratch_hits += pending_scratch_hits;
+            packed_request_misses += pending_request_misses;
             stats_small.misses += fills.size();
             stats_small.bytes += pending_upload_bytes;
             LLAMA_LOG_DEBUG("packed experts: layer %d: %zu permanent hits, %zu scratch hits, %zu RAM uploads, %zu bytes\n",
@@ -2336,7 +2339,7 @@ struct llama_moe_cache::impl {
             GGML_ASSERT(l.prefill_ids.size() == ids.size());
             ids = l.prefill_ids;
         } else if (placement && sched && ggml_backend_sched_get_host_copy(sched, sel, ids.data(), ids_bytes)) {
-            // The weight callback starts after the scheduler has finished older Vulkan work.
+            // The scheduler waits for older work on this backend before exposing a host copy.
             ++router_host_hits;
             router_readback_elided_bytes += ids_bytes;
         } else {
@@ -2608,6 +2611,7 @@ struct llama_moe_cache::impl {
                 pending_layer = il;
                 pending_permanent_hits = hits;
                 pending_scratch_hits = scratch_hits;
+                pending_request_misses = request_misses;
                 const int32_t hip_evict = placement->hip_overlap_promotion && promote_index >= 0 ?
                         packed_promotion_victim(l, map) : -1;
                 if (hip_upload_backend && (!fills.empty() || hip_evict >= 0)) {

@@ -364,12 +364,19 @@ llama_context::llama_context(
             throw std::runtime_error("packed expert placement requires a nonzero microbatch");
         }
         const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        const bool vulkan_waves = placement->n_slots == 20 && !placement->overlap && placement->prefill_tokens == 512 &&
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(placement->target)), "Vulkan") == 0;
+        const bool hip_three = placement->hip_mtp_verify_three &&
+                (params.n_outputs_max == 0 || params.n_outputs_max >= 3) &&
+                (params.n_outputs_max_per_seq == 0 || params.n_outputs_max_per_seq >= 3);
         mtp_verify_three_enabled = mtp_three && (strcmp(mtp_three, "1") == 0 || strcmp(mtp_three, "auto") == 0) &&
                 model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
                 cparams.n_seq_max == 1 && cparams.n_batch >= 3 && cparams.n_ubatch == 2 &&
-                placement->n_slots == 20 && !placement->overlap && placement->prefill_tokens == 512 &&
-                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(placement->target)), "Vulkan") == 0 &&
-                cparams.n_rs_seq == 2;
+                (vulkan_waves || hip_three) && cparams.n_rs_seq == 2;
+        mtp_verify_three_vulkan_waves = mtp_verify_three_enabled && vulkan_waves;
+        if (placement->hip_mtp_verify_three && !mtp_verify_three_enabled) {
+            throw std::runtime_error("HIP 3-position MTP requires a single target sequence, two recurrent snapshots and room for three tokens and outputs");
+        }
         if (cparams.n_rs_seq >= cparams.n_ubatch && !mtp_verify_three_enabled) {
             LLAMA_LOG_INFO("%s: packed expert microbatch cannot hold the requested recurrent snapshots, using checkpoint rollback\n",
                     __func__);
@@ -582,7 +589,7 @@ llama_context::llama_context(
         };
 
         auto cparams_mem = cparams;
-        cparams_mem.n_ubatch = n_ubatch_prefill();
+        cparams_mem.n_ubatch = n_ubatch_reserve();
         memory.reset(model.create_memory(params_mem, cparams_mem));
     }
 
@@ -651,7 +658,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0 || model.expert_placement) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, mtp_verify_three_enabled);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, mtp_verify_three_vulkan_waves);
         }
 
         init_mtp_vocab_subset();
@@ -944,7 +951,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_prefill());
+    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_reserve());
 
     const size_t max_nodes = this->graph_max_nodes();
 
@@ -1165,6 +1172,11 @@ uint32_t llama_context::n_ubatch_prefill() const {
     return std::max(cparams.n_ubatch, std::min(cparams.n_batch, n_prefill));
 }
 
+uint32_t llama_context::n_ubatch_reserve() const {
+    const uint32_t n_verify = mtp_verify_three_enabled ? 3 : 0;
+    return std::max(n_ubatch_prefill(), n_verify);
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -1226,7 +1238,7 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_prefill());
+        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_reserve());
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -2035,7 +2047,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         bool previous;
         ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
     } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
-            target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
+            mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -3426,7 +3438,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.target_mtp_verify_three =*/ target_mtp_verify_width == 3,
+        /*.target_mtp_verify_three =*/ mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3,
     };
 }
 

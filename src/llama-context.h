@@ -284,6 +284,7 @@ private:
 public:
     uint32_t graph_max_nodes() const;
     uint32_t n_ubatch_prefill() const;
+    uint32_t n_ubatch_reserve() const;
     bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -424,6 +425,7 @@ private:
 
     ggml_backend_sched_ptr sched;
     bool mtp_verify_three_enabled = false;
+    bool mtp_verify_three_vulkan_waves = false;
     bool mtp_logit_trace_enabled = false;
     uint32_t target_mtp_verify_width = 0;
 

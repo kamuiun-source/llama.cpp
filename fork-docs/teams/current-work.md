@@ -1,10 +1,17 @@
 # 親エージェントの再開メモ
 
-更新 2026-11-20
+更新 2026-11-21
 
 開始・再開・コンテキスト圧縮後に読む。作業中の判断が変わったら該当箇所を更新する。詳細な作業履歴は [coordinator-memory.md](coordinator-memory.md)、技術調査と検証待ちは [research-notes.md](research-notes.md)、再現用の設定は [runtime-flags.md](runtime-flags.md) に残す。
 
 ## 現在の状態
+
+### Linux ROCm の転送改善
+
+- `codex/rocm-integrated-test` の `a17eb0c08` から派生した作業ブランチは `codex/rocm-decode-transfers`。RTXをCUDA、MI50をROCm 7.2.1で使用する。ビルド先は `build-cuda-hip`、モデルは Flash Next UD-IQ3_XXS、ドラフトは Q8_0。
+- 実装と採用判断は [RTX・MI50 の受け渡しと複数位置の転送](../rocm/06-decode-transfers.md) に記録する。GPU間の受け渡しとHIP分割バンクの並行転送は、明示指定で有効にする。2・3位置はどちらも直列と並行で生成トークン列が一致。改善幅は同じ分割グラフで測定した。
+
+### Windows Vulkan の検証記録
 
 - 当面の通常運用は高速固定3幅、全語彙、`p-min=0`。MTP改善はユーザー判断で休止。固定2幅と自動幅は比較用に保持。
 - 日本語・コードは同じ推論経路と初期配置を使う比較用の入力。下記の初期配置改善は、普段の日本語・コード入力のExpert利用頻度から両方に使う配置表を1つ作る未着手の候補。
