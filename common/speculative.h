@@ -79,6 +79,9 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    bool (*chain_mtp)(void *, float) = nullptr;
+    void * chain_mtp_data = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -91,6 +94,14 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+int64_t common_speculative_mtp_draft_us(const common_speculative * spec);
+
+common_speculative_type common_speculative_last_draft_type(const common_speculative * spec, llama_seq_id seq_id);
+
+// A retained draft anchor must be consumed by process or discarded before releasing the slot.
+bool common_speculative_keep_mtp_anchor(common_speculative * spec, llama_seq_id seq_id, llama_pos pos, llama_token token);
+void common_speculative_discard_mtp_anchor(common_speculative * spec, llama_seq_id seq_id);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

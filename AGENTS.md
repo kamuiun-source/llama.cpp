@@ -1,3 +1,7 @@
+# Fork-specific working agreement
+
+For this fork, read [fork-docs/agent.md](fork-docs/agent.md) before starting work. It records the user-approved workflow and current decisions. Explicit user instructions take precedence. The upstream instructions below remain intact.
+
 # Instructions for llama.cpp
 
 > [!IMPORTANT]

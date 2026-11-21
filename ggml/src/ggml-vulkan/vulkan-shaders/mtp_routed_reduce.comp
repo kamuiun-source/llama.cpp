@@ -1,0 +1,33 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256) in;
+layout(binding = 0, std430) buffer Experts { float values[]; } experts;
+layout(binding = 1, std430) buffer Output { float values[]; } output_data;
+#if ROUTER_WEIGHTS
+layout(binding = 2, std430) buffer Weights { float values[]; } weights;
+#endif
+layout(push_constant) uniform Parameters { uint width; } p;
+
+float expert_value(uint x, uint index) {
+    precise float value = experts.values[index * p.width + x];
+#if ROUTER_WEIGHTS
+    value = value * weights.values[index];
+#endif
+    return value;
+}
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint token = gl_GlobalInvocationID.y;
+    if (x >= p.width) {
+        return;
+    }
+    const uint base = token * 10;
+    // Match the f32 ADD chain, including its first operand and rounding order.
+    precise float sum = expert_value(x, base) + expert_value(x, base + 1);
+    [[unroll]] for (uint expert = 2; expert < 10; ++expert) {
+        sum = sum + expert_value(x, base + expert);
+    }
+    output_data.values[token * p.width + x] = sum;
+}

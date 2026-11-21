@@ -16,9 +16,9 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
 
     uint ibi = a_offset + first_row * num_blocks_per_row + i;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const float d = float(data_a[ibi].d);
-        const uint sl = (data_a[ibi].scales_l[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
-        const uint sh = (data_a[ibi].scales_h >> (2 * ib32)) & 3;
+        const float d = float(MOE_WEIGHT(data_a, ibi, d));
+        const uint sl = (MOE_WEIGHT(data_a, ibi, scales_l[ib32/2]) >> (4 * (ib32 & 1))) & 0xF;
+        const uint sh = (MOE_WEIGHT(data_a, ibi, scales_h) >> (2 * ib32)) & 3;
         const float dscale = d * float(int(sl | (sh << 4)) - 32);
 
         FLOAT_TYPE sum[NUM_COLS];
@@ -27,7 +27,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
         }
 
         [[unroll]] for (uint l = 0; l < 4; ++l) {
-            const uint w = data_a_packed32[ibi].qs[4 * ib32 + l];
+            const uint w = MOE_WEIGHT(data_a_packed32, ibi, qs[4 * ib32 + l]);
             const u8vec4 q0 = unpack8(w & 0x0F0F0F0F);
             const u8vec4 q1 = unpack8((w >> 4) & 0x0F0F0F0F);
 
@@ -59,6 +59,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
 
     get_offsets(a_offset, b_offset, d_offset);
+#ifdef MUL_MAT_ID
+    if (zero_skipped_expert(d_offset, first_row, num_rows)) {
+        return;
+    }
+#endif
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
@@ -68,6 +73,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint itid = tid % 8;  // 0...7
     const uint ix = tid / 8;
 
+#ifdef MOE_GATE_UP
+    [[unroll]] for (uint projection = 0; projection < 2; ++projection) {
+        gate_up_second = projection != 0;
+#endif
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
             temp[j][i] = FLOAT_TYPE(0);
@@ -78,6 +87,15 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
+#ifdef MOE_GATE_UP
+#ifndef USE_SUBGROUP_ADD_NO_SHMEM
+        // Finish reading the gate reduction before reusing the shared sums.
+        if (!gate_up_second) {
+            barrier();
+        }
+#endif
+    }
+#endif
 }
 
 void main() {

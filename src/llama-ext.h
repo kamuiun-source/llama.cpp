@@ -12,6 +12,27 @@
 #include <string>
 #include <vector>
 
+// Keep prompt accounting while using the normal decode microbatch capacity.
+LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
+LLAMA_API int32_t llama_process_mtp_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
+LLAMA_API bool llama_mtp_vocab_subset_enabled(const struct llama_context * ctx);
+enum class llama_mtp_draft_row { normal, eager, lazy };
+
+struct llama_mtp_draft_row_stats {
+    uint64_t candidates = 0;
+    uint64_t eager_d2h   = 0;
+    uint64_t lazy_d2h    = 0;
+    uint64_t skipped     = 0;
+    uint64_t fallback    = 0;
+};
+
+LLAMA_API int32_t llama_process_mtp_first_draft(struct llama_context * ctx, struct llama_batch_ext * batch, bool lazy);
+LLAMA_API const float * llama_read_mtp_first_draft_row(struct llama_context * ctx, int32_t index);
+LLAMA_API void llama_discard_mtp_first_draft_row(struct llama_context * ctx);
+LLAMA_API llama_mtp_draft_row_stats llama_get_mtp_draft_row_stats(const struct llama_context * ctx);
+LLAMA_API bool llama_supports_mtp_verify_three(const struct llama_context * ctx);
+LLAMA_API void llama_set_mtp_logit_trace(struct llama_context * ctx, bool enabled);
+
 //
 // llama architecture queries
 //
@@ -179,6 +200,43 @@ LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, l
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+LLAMA_API void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uint64_t & splits);
+
+// Cumulative packed Expert upload counts and H2D bytes on the calling thread.
+LLAMA_API void llama_get_expert_miss_telemetry(uint64_t * bins, size_t n_bins, uint64_t & bytes, uint64_t & bytes_3plus);
+struct llama_expert_transfer_telemetry {
+    uint64_t requests = 0;
+    uint64_t misses = 0;
+    uint64_t promotions = 0;
+    uint64_t writeback_bytes = 0;
+};
+LLAMA_API llama_expert_transfer_telemetry llama_get_expert_transfer_telemetry();
+
+struct llama_expert_staging_telemetry {
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+    uint64_t us = 0;
+    uint64_t fill_ge2_bytes = 0;
+    uint64_t fill_ge2_us = 0;
+    uint64_t retry_bytes = 0;
+    uint64_t retry_us = 0;
+};
+LLAMA_API llama_expert_staging_telemetry llama_get_expert_staging_telemetry();
+LLAMA_API int64_t llama_set_expert_prompt_trace_request(int64_t request);
+
+struct llama_expert_round_stats {
+    uint64_t requests = 0;
+    uint64_t misses = 0;
+    uint64_t uploads = 0;
+    uint64_t bytes = 0;
+    uint64_t permanent_hits = 0;
+    uint64_t scratch_hits = 0;
+    uint64_t promotions = 0;
+    uint64_t writeback_bytes = 0;
+    bool supported = false;
+};
+LLAMA_API llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx);
+
 // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
 // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
 // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).
@@ -192,6 +250,12 @@ LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64
 // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of src.
 // Returns whether decode accepts batches with state rows.
 LLAMA_API bool llama_set_embd_state_src(struct llama_context * ctx, struct llama_context * src);
+
+// Enable same-CUDA-device ordering for a draft context already attached to its target's state rows.
+LLAMA_API bool llama_enable_mtp_device_pending(struct llama_context * draft);
+
+// Queue a copy from a target's last decode to its reserved single-sequence row.
+LLAMA_API bool llama_copy_mtp_pending_row(struct llama_context * draft, int64_t row);
 
 // The state of entry idx is row `row` of the h_nextn device buffer of the context set with llama_set_embd_state_src().
 // All entries of a batch have a state row, or none.
