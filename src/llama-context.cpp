@@ -3529,6 +3529,13 @@ llama_expert_round_stats llama_context::get_expert_round_stats() const {
     return moe_cache ? moe_cache->round_stats() : llama_expert_round_stats{};
 }
 
+void llama_context::exchange_hip_expert_slots() {
+    if (moe_cache && model.expert_placement && model.expert_placement->hip_slot_exchange) {
+        synchronize();
+        moe_cache->exchange_hip_slots();
+    }
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
@@ -5658,4 +5665,8 @@ void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uin
 
 llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx) {
     return ctx->get_expert_round_stats();
+}
+
+void llama_exchange_hip_expert_slots(llama_context * ctx) {
+    ctx->exchange_hip_expert_slots();
 }

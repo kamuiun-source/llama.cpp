@@ -1764,8 +1764,10 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
     server_decode_telemetry decode_telemetry;
+    bool hip_expert_exchange_pending = false;
 
     void destroy() {
+        hip_expert_exchange_pending = false;
         if (decode_telemetry.enabled || decode_telemetry.expert_staging_copy) {
             decode_telemetry.log_and_reset();
         }
@@ -3205,6 +3207,10 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        if (slots.size() == 1 && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.stats.n_gen > 0 &&
+                !slot.rt && !slot.audio_stream && !slot.audio_wait) {
+            hip_expert_exchange_pending = true;
+        }
         queue_results.send(std::move(res));
     }
 
@@ -4309,6 +4315,17 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        if (hip_expert_exchange_pending && slots.size() == 1) {
+            const auto & slot = slots.front();
+            // A queued completion can already own the slot but has not started its prompt.
+            const bool before_prompt = slot.state == SLOT_STATE_STARTED && slot.task &&
+                    slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.rt && !slot.audio_stream && !slot.audio_wait;
+            if (slot.state == SLOT_STATE_IDLE || before_prompt) {
+                hip_expert_exchange_pending = false;
+                llama_exchange_hip_expert_slots(ctx_tgt);
+            }
+        }
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop

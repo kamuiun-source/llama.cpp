@@ -560,6 +560,16 @@ struct llama_moe_cache::impl {
     size_t profile_upload_bytes = 0;
     ggml_backend_buffer_ptr packed_staging;
     ggml_backend_ptr hip_upload_backend;
+    enum class hip_exchange_fault { none, h2d, d2h };
+    hip_exchange_fault hip_slot_exchange_fault = hip_exchange_fault::none;
+    struct hip_exchange_stats {
+        size_t committed = 0;
+        size_t interrupted = 0;
+        size_t h2d_bytes = 0;
+        size_t d2h_bytes = 0;
+    } hip_exchange_totals;
+    size_t hip_exchange_boundaries = 0;
+    int64_t hip_exchange_us = 0;
     std::vector<moe_cache_lru::fill> fills; // packed fills use logical scratch indices
     std::vector<moe_cache_lru::fill> cpu;
 
@@ -718,6 +728,17 @@ struct llama_moe_cache::impl {
             }
             if (placement->hip_protected_slots) {
                 LLAMA_LOG_INFO("packed expert HIP scratch policy: protected LRU\n");
+            }
+            if (placement->hip_slot_exchange) {
+                const char * fault = std::getenv("LLAMA_EXPERT_HIP_SLOT_EXCHANGE_FAULT");
+                if (fault && std::strcmp(fault, "h2d") == 0) {
+                    hip_slot_exchange_fault = hip_exchange_fault::h2d;
+                } else if (fault && std::strcmp(fault, "d2h") == 0) {
+                    hip_slot_exchange_fault = hip_exchange_fault::d2h;
+                } else if (fault && *fault) {
+                    throw std::runtime_error("HIP Expert exchange fault must be h2d or d2h");
+                }
+                LLAMA_LOG_INFO("packed expert HIP request exchange: enabled fault=%s\n", fault && *fault ? fault : "none");
             }
             std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
             for (const auto & w : placement->weights) {
@@ -2010,6 +2031,166 @@ struct llama_moe_cache::impl {
         }
     }
 
+    void exchange_hip_pair(int32_t il, hip_exchange_stats & stats) {
+        auto & l = layers[il];
+        auto & map = placement->maps[il];
+        const auto scratch = std::find_if(l.packed_scratch.begin(), l.packed_scratch.end(), [](int32_t expert) { return expert >= 0; });
+        const auto victim = std::find_if(map.resident.begin(), map.resident.end(), [](int32_t slot) { return slot >= 0; });
+        if (scratch == l.packed_scratch.end() || victim == map.resident.end()) {
+            return;
+        }
+        const int32_t promote = *scratch;
+        GGML_ASSERT(promote < llama_expert_profile::n_experts);
+        const int32_t evict = victim - map.resident.begin();
+        const int32_t hot_slot = *victim;
+        const int32_t cold_slot = scratch - l.packed_scratch.begin();
+        const int32_t host_slot = map.host[promote];
+        GGML_ASSERT(host_slot >= 0 && map.resident[promote] == -1 && map.host[evict] == -1);
+
+        struct plane {
+            ggml_tensor * hot;
+            ggml_tensor * cold;
+            uint8_t * ram;
+            size_t stride;
+            size_t offset;
+        };
+        std::array<plane, 3> planes{};
+        const size_t plane_count = l.experts.size();
+        const size_t capacity = ggml_backend_buffer_get_size(packed_staging.get()) / 2;
+        size_t tuple_size = 0;
+        if (plane_count < 2 || plane_count > planes.size()) {
+            throw std::runtime_error("invalid HIP Expert exchange plane count");
+        }
+        for (size_t i = 0; i < plane_count; ++i) {
+            auto * host = l.experts[i];
+            const auto & b = bindings.at(host);
+            const size_t stride = host->nb[2];
+            if (!stride || stride > capacity - tuple_size || !host->data || !b.cached || !b.cached->data ||
+                    !b.cold || !b.cold->data || b.cached->nb[2] != stride || b.cold->nb[2] != stride ||
+                    host_slot >= host->ne[2] || hot_slot >= b.cached->ne[2] - 1 || cold_slot >= b.cold->ne[2] - 1) {
+                throw std::runtime_error("invalid HIP Expert exchange plane range");
+            }
+            planes[i] = {b.cached, b.cold, packed_host_data(l, host, host_slot, tuple_size), stride, tuple_size};
+            tuple_size += stride;
+        }
+
+        auto * staged = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        auto * shadow = staged + tuple_size;
+        auto * backend = hip_upload_backend.get();
+        const auto fault = hip_slot_exchange_fault;
+        std::vector<uint8_t> original, actual;
+        if (fault != hip_exchange_fault::none) {
+            original.resize(tuple_size);
+            actual.resize(tuple_size);
+        }
+        for (size_t i = 0; i < plane_count; ++i) {
+            const auto & p = planes[i];
+            std::memcpy(staged + p.offset, p.ram, p.stride);
+            if (!original.empty()) {
+                ggml_backend_tensor_get(p.hot, original.data() + p.offset, hot_slot * p.stride, p.stride);
+            }
+        }
+
+        bool interrupted = false;
+        try {
+            for (size_t i = 0; i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_set_async(backend, p.cold, staged + p.offset, cold_slot * p.stride, p.stride);
+                stats.h2d_bytes += p.stride;
+                if (fault == hip_exchange_fault::h2d) {
+                    interrupted = true;
+                    break;
+                }
+            }
+            for (size_t i = 0; !interrupted && i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_get_async(backend, p.hot, shadow + p.offset, hot_slot * p.stride, p.stride);
+                stats.d2h_bytes += p.stride;
+                interrupted = fault == hip_exchange_fault::d2h;
+            }
+        } catch (...) {
+            ggml_backend_synchronize(backend);
+            throw;
+        }
+        ggml_backend_synchronize(backend);
+        if (interrupted) {
+            hip_slot_exchange_fault = hip_exchange_fault::none;
+            for (size_t i = 0; i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_get(p.hot, actual.data() + p.offset, hot_slot * p.stride, p.stride);
+                if (std::memcmp(p.ram, staged + p.offset, p.stride) != 0) {
+                    throw std::runtime_error("interrupted HIP Expert exchange changed the RAM owner bytes");
+                }
+            }
+            if (actual != original || map.resident[evict] != hot_slot || map.host[evict] != -1 ||
+                    map.resident[promote] != -1 || map.host[promote] != host_slot || *scratch != promote) {
+                throw std::runtime_error("interrupted HIP Expert exchange changed GPU bytes or slot ownership");
+            }
+            for (size_t i = 0; i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_get(p.cold, actual.data() + p.offset, cold_slot * p.stride, p.stride);
+            }
+            if (std::memcmp(actual.data(), staged, tuple_size) != 0) {
+                throw std::runtime_error("interrupted HIP Expert exchange changed scratch bytes");
+            }
+            ++stats.interrupted;
+            LLAMA_LOG_INFO("packed expert HIP exchange recovered: stage=%s layer=%d promoted=%d evicted=%d RAM_bytes=equal GPU_bytes=equal scratch_bytes=equal owners=equal\n",
+                    fault == hip_exchange_fault::h2d ? "h2d" : "d2h", il, promote, evict);
+            return;
+        }
+
+        // At the request boundary there are no readers. Keep the shadow until the hot slot is complete.
+        try {
+            for (size_t i = 0; i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_set_async(backend, p.hot, staged + p.offset, hot_slot * p.stride, p.stride);
+                stats.h2d_bytes += p.stride;
+            }
+            ggml_backend_synchronize(backend);
+        } catch (...) {
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < plane_count; ++i) {
+                const auto & p = planes[i];
+                ggml_backend_tensor_set(p.hot, shadow + p.offset, hot_slot * p.stride, p.stride);
+            }
+            throw;
+        }
+        for (size_t i = 0; i < plane_count; ++i) {
+            const auto & p = planes[i];
+            std::memcpy(p.ram, shadow + p.offset, p.stride);
+        }
+        map.resident[promote] = hot_slot;
+        map.resident[evict] = -1;
+        map.host[evict] = host_slot;
+        map.host[promote] = -1;
+        *scratch = -1;
+        ++stats.committed;
+        LLAMA_LOG_DEBUG("packed expert HIP exchange committed: layer=%d promoted=%d evicted=%d hot_slot=%d host_slot=%d tuple_bytes=%zu\n",
+                il, promote, evict, hot_slot, host_slot, tuple_size);
+    }
+
+    void exchange_hip_slots() {
+        GGML_ASSERT(placement && placement->hip_slot_exchange && hip_upload_backend && packed_staging);
+        wait_hip_cold_upload();
+        pending_layer = -1;
+        const int64_t start = ggml_time_us();
+        hip_exchange_stats stats;
+        for (int32_t il = 0; il < llama_expert_profile::n_layers; ++il) {
+            exchange_hip_pair(il, stats);
+            if (stats.interrupted) {
+                break;
+            }
+        }
+        const int64_t elapsed = ggml_time_us() - start;
+        hip_exchange_totals.committed += stats.committed;
+        hip_exchange_totals.interrupted += stats.interrupted;
+        hip_exchange_totals.h2d_bytes += stats.h2d_bytes;
+        hip_exchange_totals.d2h_bytes += stats.d2h_bytes;
+        hip_exchange_us += elapsed;
+        LLAMA_LOG_INFO("packed expert HIP request exchange: boundary=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64 "\n",
+                ++hip_exchange_boundaries, stats.committed, stats.interrupted, stats.h2d_bytes, stats.d2h_bytes, elapsed);
+    }
+
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false) {
         GGML_ASSERT(!hip_async || (cold && !submitted));
@@ -2946,6 +3127,11 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP promotions: promotions=%zu evictions=%zu writeback_bytes=%zu\n",
                         packed_promotions, packed_promotions, packed_writeback_bytes);
             }
+            if (placement->hip_slot_exchange) {
+                LLAMA_LOG_INFO("packed expert HIP request exchanges: boundaries=%zu committed=%zu interrupted=%zu h2d_bytes=%zu d2h_bytes=%zu wall_us=%" PRId64 " generation_writeback_bytes=%zu\n",
+                        hip_exchange_boundaries, hip_exchange_totals.committed, hip_exchange_totals.interrupted,
+                        hip_exchange_totals.h2d_bytes, hip_exchange_totals.d2h_bytes, hip_exchange_us, packed_writeback_bytes);
+            }
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -3145,6 +3331,10 @@ bool llama_moe_cache::early_copy_enabled() const {
 
 bool llama_moe_cache::router_host_ids_enabled() const {
     return pimpl->placement != nullptr;
+}
+
+void llama_moe_cache::exchange_hip_slots() {
+    pimpl->exchange_hip_slots();
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,

@@ -31,6 +31,7 @@ public:
     void end_prompt_trace(bool success);
     void record_decode_width(uint32_t tokens);
     llama_expert_round_stats round_stats() const;
+    void exchange_hip_slots();
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)

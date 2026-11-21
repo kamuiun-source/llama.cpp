@@ -236,6 +236,8 @@ struct llama_expert_round_stats {
     bool supported = false;
 };
 LLAMA_API llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx);
+// Call on the inference thread between completed requests.
+LLAMA_API void llama_exchange_hip_expert_slots(llama_context * ctx);
 
 // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
 // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
