@@ -268,6 +268,8 @@ struct server_decode_telemetry {
                 total.fill_ge2_us += after.fill_ge2_us - staging_before->fill_ge2_us;
                 total.retry_bytes += after.retry_bytes - staging_before->retry_bytes;
                 total.retry_us += after.retry_us - staging_before->retry_us;
+                total.upload_wait_us += after.upload_wait_us - staging_before->upload_wait_us;
+                total.direct_bytes += after.direct_bytes - staging_before->direct_bytes;
             }
             if (!before) {
                 return;
@@ -370,10 +372,12 @@ struct server_decode_telemetry {
                 const auto & copy = item.staging;
                 SRV_INF("expert_staging_copy: phase=%s verify_calls=%" PRIu64 " phase_calls=%" PRIu64
                         " calls=%" PRIu64 " bytes=%" PRIu64 " cpu_ms=%.3f fill_ge2_bytes=%" PRIu64
-                        " fill_ge2_cpu_ms=%.3f retry_bytes=%" PRIu64 " retry_cpu_ms=%.3f phase_wall_ms=%.3f\n",
+                        " fill_ge2_cpu_ms=%.3f retry_bytes=%" PRIu64 " retry_cpu_ms=%.3f phase_wall_ms=%.3f"
+                        " upload_wait_ms=%.3f direct_bytes=%" PRIu64 "\n",
                         names[i], i == verify ? item.staging_calls : 0, item.staging_calls,
                         copy.calls, copy.bytes, copy.us / 1e3, copy.fill_ge2_bytes, copy.fill_ge2_us / 1e3,
-                        copy.retry_bytes, copy.retry_us / 1e3, item.staging_wall_us / 1e3);
+                        copy.retry_bytes, copy.retry_us / 1e3, item.staging_wall_us / 1e3,
+                        copy.upload_wait_us / 1e3, copy.direct_bytes);
             }
             if (item.calls == 0) {
                 continue;

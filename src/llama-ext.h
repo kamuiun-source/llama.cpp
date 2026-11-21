@@ -220,6 +220,8 @@ struct llama_expert_staging_telemetry {
     uint64_t fill_ge2_us = 0;
     uint64_t retry_bytes = 0;
     uint64_t retry_us = 0;
+    uint64_t upload_wait_us = 0;
+    uint64_t direct_bytes = 0;
 };
 LLAMA_API llama_expert_staging_telemetry llama_get_expert_staging_telemetry();
 LLAMA_API int64_t llama_set_expert_prompt_trace_request(int64_t request);

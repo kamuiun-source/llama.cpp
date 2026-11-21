@@ -95,6 +95,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         const bool hip_dynamic = dynamic_resident &&
                 std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "ROCm") == 0;
         return (hip_overlap != hip_overlap_mode::off || hip_dynamic) && value && std::strcmp(value, "1") == 0;
+    }()), hip_mtp_direct_ram([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM");
+        return value && std::strcmp(value, "1") == 0;
     }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
@@ -115,6 +118,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
     if (hip_mtp_verify_three && (max_ubatch != 2 || n_expert_used != 10)) {
         throw std::runtime_error("HIP 3-position MTP requires two-token microbatches and top-10 routing");
+    }
+    if (hip_mtp_direct_ram && (!hip_mtp_verify_three || !dynamic_resident || overlap)) {
+        throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP with upload overlap off");
     }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
@@ -194,6 +200,10 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     if (!cpu) {
         throw std::runtime_error("packed experts require a CPU backend");
     }
+    const bool lock_host = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    if (hip_mtp_direct_ram && lock_host) {
+        throw std::runtime_error("direct HIP Expert RAM uses native pinned buffers and requires an unlocked model load mode");
+    }
     using alloc_overlap_bank_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, ggml_context *);
     alloc_overlap_bank_t alloc_overlap_bank = nullptr;
     if (!overlap && dynamic_resident && max_ubatch == 2) {
@@ -205,7 +215,26 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
     }
     bank_buf.reset(alloc_overlap_bank ? alloc_overlap_bank(target, bank_ctx.get()) :
             ggml_backend_alloc_ctx_tensors_from_buft(bank_ctx.get(), ggml_backend_dev_buffer_type(target)));
-    host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), ggml_backend_dev_buffer_type(cpu)));
+    const auto host_buft = hip_mtp_direct_ram ? ggml_backend_dev_host_buffer_type(target) : ggml_backend_dev_buffer_type(cpu);
+    if (!host_buft) {
+        throw std::runtime_error("direct HIP Expert RAM requires a native pinned host buffer type");
+    }
+    host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(host_ctx.get(), host_buft));
+    if (hip_mtp_direct_ram) {
+        size_t pinned_bytes = 0;
+        size_t fallback_bytes = 0;
+        if (!host_buf) {
+            throw std::runtime_error("could not allocate direct HIP Expert RAM");
+        }
+        for (const auto & w : weights) {
+            auto & bytes = ggml_backend_buffer_get_type(w.host->buffer) == host_buft ? pinned_bytes : fallback_bytes;
+            bytes += ggml_nbytes(w.host);
+        }
+        LLAMA_LOG_INFO("expert placement HIP direct RAM: pinned_bytes=%zu fallback_bytes=%zu\n", pinned_bytes, fallback_bytes);
+        if (fallback_bytes != 0) {
+            throw std::runtime_error("direct HIP Expert RAM allocation fell back to pageable memory");
+        }
+    }
     if (!host_buf || !ggml_backend_buffer_is_host(host_buf.get()) || !bank_buf || ggml_backend_buffer_is_host(bank_buf.get())) {
         throw std::runtime_error("could not allocate packed expert buffers");
     }
@@ -218,7 +247,7 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
         }
         ggml_backend_buffer_set_usage(cold_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
-    if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+    if (lock_host) {
         host_lock.init(ggml_backend_buffer_get_base(host_buf.get()));
         host_lock.grow_to(ggml_backend_buffer_get_size(host_buf.get()));
     }

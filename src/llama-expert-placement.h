@@ -41,6 +41,7 @@ struct llama_expert_placement {
     const bool overlap;
     const bool dynamic_resident;
     const bool hip_mtp_verify_three;
+    const bool hip_mtp_direct_ram;
     const int32_t n_slots;
     const int32_t prefill_tokens;
     int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;

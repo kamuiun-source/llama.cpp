@@ -536,6 +536,10 @@ struct llama_moe_cache::impl {
     size_t router_readback_elided_bytes = 0;
     int64_t packed_wait_us = 0;
     size_t packed_wait_count = 0;
+    size_t hip_direct_upload_steps = 0;
+    size_t hip_direct_upload_planes = 0;
+    size_t hip_direct_upload_bytes = 0;
+    uint64_t hip_direct_upload_wait_us = 0;
     std::vector<uint8_t> packed_writeback;
     size_t packed_promotions = 0;
     size_t packed_writeback_bytes = 0;
@@ -829,8 +833,10 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_WARN("packed expert HIP pinned upload unavailable, using serial uploads\n");
                 }
             }
-            if (packed_staging) {
+            if (packed_staging || placement->hip_mtp_direct_ram) {
                 fills.reserve(placement->n_slots);
+            }
+            if (packed_staging) {
                 if (hip_overlap || hip_prefill) {
                     hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
                     if (!hip_upload_backend) {
@@ -870,6 +876,9 @@ struct llama_moe_cache::impl {
             }
             const char * rtx_slots_env = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
             if (rtx_slots_env && std::strcmp(rtx_slots_env, "0") != 0) {
+                if (placement->hip_mtp_direct_ram) {
+                    throw std::runtime_error("HIP MTP3 direct RAM requires RTX cold assist off");
+                }
                 char * end = nullptr;
                 const long slots = std::strtol(rtx_slots_env, &end, 10);
                 const auto cuda = std::find_if(devices.begin(), devices.end(), [](const auto & d) {
@@ -2008,12 +2017,13 @@ struct llama_moe_cache::impl {
     }
 
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
-                         bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false) {
+                         bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false) {
         GGML_ASSERT(!hip_async || (cold && !submitted));
+        GGML_ASSERT(!hip_direct || (!cold && !hip_async && !submitted && !retry_bytes));
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
         const auto & map = placement->maps[il];
-        auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
-        const size_t staging_bytes = hip_writeback_offset ? hip_writeback_offset :
+        auto * staging = hip_direct ? nullptr : static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        const size_t staging_bytes = hip_direct ? 0 : hip_writeback_offset ? hip_writeback_offset :
                 packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         size_t bytes = 0;
         try {
@@ -2023,9 +2033,12 @@ struct llama_moe_cache::impl {
                     const auto & binding = bindings.at(host);
                     const size_t stride = host->nb[2];
                     const auto * data = packed_host_data(l, host, map.host[fill.expert], binding.packed_offset);
-                    GGML_ASSERT(stride <= staging_bytes - bytes);
-                    copy_upload_staging(staging + bytes, data, stride, retry_bytes);
-                    ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, staging + bytes, slot * stride, stride);
+                    if (!hip_direct) {
+                        GGML_ASSERT(stride <= staging_bytes - bytes);
+                        copy_upload_staging(staging + bytes, data, stride, retry_bytes);
+                        data = staging + bytes;
+                    }
+                    ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, data, slot * stride, stride);
                     bytes += stride;
                 }
             }
@@ -2040,7 +2053,22 @@ struct llama_moe_cache::impl {
             throw;
         }
         if (!hip_async && (!submitted || !*submitted)) {
+            const bool measure_wait = hip_direct || profile_packed_ram_copy;
+            const int64_t start = measure_wait ? ggml_time_us() : 0;
             ggml_backend_synchronize(backend);
+            if (measure_wait) {
+                const uint64_t us = ggml_time_us() - start;
+                if (profile_packed_ram_copy) {
+                    packed_staging_totals.upload_wait_us += us;
+                    packed_staging_totals.direct_bytes += hip_direct ? bytes : 0;
+                }
+                if (hip_direct) {
+                    ++hip_direct_upload_steps;
+                    hip_direct_upload_planes += fills.size() * l.experts.size();
+                    hip_direct_upload_bytes += bytes;
+                    hip_direct_upload_wait_us += us;
+                }
+            }
         }
         return bytes;
     }
@@ -2405,7 +2433,9 @@ struct llama_moe_cache::impl {
             size_t scratch_hits = 0;
             const int64_t start = ggml_time_us();
             int64_t upload_start_us = 0;
-            const bool batch = packed_staging != nullptr;
+            // Non-verification microbatches have at most two positions. Wide prefill uses its own path.
+            const bool hip_direct = placement->hip_mtp_direct_ram && src == l.slot_map && ids.size() == 30;
+            const bool batch = packed_staging != nullptr || hip_direct;
             if (batch) {
                 fills.clear();
             }
@@ -2651,12 +2681,12 @@ struct llama_moe_cache::impl {
             const int32_t evict = placement->dynamic_resident && promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
             bool upload_submitted = false;
             bool overlap_submitted = false;
-            const bool can_overlap = (!use_waves || overlap_three_fit) && overlap_expert_upload &&
+            const bool can_overlap = !hip_direct && (!use_waves || overlap_three_fit) && overlap_expert_upload &&
                     !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
             if (batch && (!fills.empty() || can_overlap_promotion)) {
                 // A single-copy scheduler synchronizes the backend before each host-weight callback.
-                const bool can_defer = submit_expert_upload && !profile && sched &&
+                const bool can_defer = !hip_direct && submit_expert_upload && !profile && sched &&
                         ggml_backend_sched_get_n_copies(sched) == 1 && promote_index < 0;
                 try {
                     size_t overlap_copied_bytes = 0;
@@ -2666,7 +2696,8 @@ struct llama_moe_cache::impl {
                         mtp_overlap_submitted += overlap_three_fit && overlap_submitted;
                     }
                     if (!overlap_submitted && !fills.empty()) {
-                        bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr, overlap_copied_bytes);
+                        bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr,
+                                overlap_copied_bytes, false, hip_direct);
                     }
                 } catch (...) {
                     for (const auto & fill : fills) {
@@ -2873,6 +2904,10 @@ struct llama_moe_cache::impl {
         if (placement) {
             LLAMA_LOG_INFO("packed expert transfer phase (%s): %.3f ms across %zu layer steps\n",
                     placement->overlap ? "overlap" : "sync", packed_wait_us / 1000.0, packed_wait_count);
+            if (placement->hip_mtp_direct_ram) {
+                LLAMA_LOG_INFO("packed expert HIP MTP3 direct RAM: steps=%zu planes=%zu bytes=%zu staging_bytes=0 completion_wait_us=%" PRIu64 "\n",
+                        hip_direct_upload_steps, hip_direct_upload_planes, hip_direct_upload_bytes, hip_direct_upload_wait_us);
+            }
             if (placement->overlap) {
                 LLAMA_LOG_INFO("packed expert overlap uploads: early_steps=%zu waited_steps=%zu\n",
                         packed_early_upload_steps, packed_wait_count - packed_early_upload_steps);
