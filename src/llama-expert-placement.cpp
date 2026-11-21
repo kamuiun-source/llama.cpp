@@ -83,6 +83,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         hip_prefill(packed_hip_mode(target, "LLAMA_EXPERT_HIP_PREFILL")), hip_overlap_promotion([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_OVERLAP_PROMOTION");
         return value && std::strcmp(value, "1") == 0;
+    }()), hip_protected_slots([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_SLOT_POLICY");
+        return value && std::strcmp(value, "protected") == 0;
     }()), overlap([&] {
         const char * value = std::getenv("LLAMA_EXPERT_OVERLAP");
         return hip_overlap != hip_overlap_mode::off || (value && std::strcmp(value, "1") == 0);
@@ -117,6 +120,10 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
+    }
+    if (hip_protected_slots && (hip_overlap == hip_overlap_mode::off || max_ubatch != 2 || n_slots != 20 ||
+            n_expert_used != 10 || hip_overlap_promotion || prefill_tokens != 0)) {
+        throw std::runtime_error("protected HIP slots require two-position split placement without promotion or wide prefill");
     }
     if (hip_overlap != hip_overlap_mode::off && hip_dynamic && std::strcmp(hip_dynamic, "1") == 0) {
         throw std::runtime_error("HIP expert overlap is incompatible with same-bank dynamic residency");

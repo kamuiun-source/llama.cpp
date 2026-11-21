@@ -712,9 +712,12 @@ struct llama_moe_cache::impl {
                 if (placement->dynamic_resident) {
                     l.packed_scratch_slots = placement->maps[il].scratch_slots(placement->n_slots);
                 }
-                if (placement->dynamic_resident || placement->hip_overlap_promotion) {
+                if (placement->dynamic_resident || placement->hip_overlap_promotion || placement->hip_protected_slots) {
                     l.packed_last_used.assign(llama_expert_profile::n_experts, 0);
                 }
+            }
+            if (placement->hip_protected_slots) {
+                LLAMA_LOG_INFO("packed expert HIP scratch policy: protected LRU\n");
             }
             std::array<size_t, llama_expert_profile::n_layers> bytes_per_layer{};
             for (const auto & w : placement->weights) {
@@ -2298,6 +2301,11 @@ struct llama_moe_cache::impl {
                 }
                 commit_hip_promotion(l);
             }
+            if (placement->hip_protected_slots) {
+                for (const int32_t expert : ids) {
+                    l.packed_last_used[expert] = ++l.packed_lookups;
+                }
+            }
             stats_small.hits += pending_permanent_hits + pending_scratch_hits;
             packed_scratch_hits += pending_scratch_hits;
             packed_request_misses += pending_request_misses;
@@ -2558,9 +2566,18 @@ struct llama_moe_cache::impl {
                 }
                 auto victim = std::find(scratch.begin(), scratch.end(), -1);
                 if (victim == scratch.end()) {
-                    victim = std::find_if(scratch.begin(), scratch.end(), [&](int32_t resident) {
-                        return slots[resident] < 0;
-                    });
+                    if (placement->hip_protected_slots) {
+                        for (auto candidate = scratch.begin(); candidate != scratch.end(); ++candidate) {
+                            if (slots[*candidate] < 0 && (victim == scratch.end() ||
+                                    l.packed_last_used[*candidate] < l.packed_last_used[*victim])) {
+                                victim = candidate;
+                            }
+                        }
+                    } else {
+                        victim = std::find_if(scratch.begin(), scratch.end(), [&](int32_t resident) {
+                            return slots[resident] < 0;
+                        });
+                    }
                 }
                 if (victim == scratch.end()) {
                     GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
