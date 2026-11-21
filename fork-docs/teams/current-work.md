@@ -10,6 +10,8 @@
 
 - `codex/rocm-integrated-test` の `a17eb0c08` から派生した作業ブランチは `codex/rocm-decode-transfers`。RTXをCUDA、MI50をROCm 7.2.1で使用する。ビルド先は `build-cuda-hip`、モデルは Flash Next UD-IQ3_XXS、ドラフトは Q8_0。
 - 実装と採用判断は [RTX・MI50 の受け渡しと複数位置の転送](../rocm/06-decode-transfers.md) に記録する。GPU間の受け渡しとHIP分割バンクの並行転送は、明示指定で有効にする。2・3位置はどちらも直列と並行で生成トークン列が一致。改善幅は同じ分割グラフで測定した。
+- `cff3d167e` の追加比較では、Flash Next の固定プロンプト1、2位置・MTP下書き1候補、広幅prefill無効、各128生成トークンで、単一バンク → 並行分割バンク → 並行分割バンク → 単一バンクを実行した。生成は単一バンク29.86 / 27.71 t/s（合算28.75）、並行分割27.97 / 27.58 t/s（合算27.77）。全試行でトークン列、MTP提案73・採用54が一致。合算は初回トークン後の127トークン/試行で算出。生ログは Git 外の `/tmp/llama-rocm-06-single-vs-overlap/`。
+- 通常運用は従来の単一バンクを既定とする。2位置で比較した単一バンクの動的常駐は `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY=1` と `LLAMA_EXPERT_HIP_PINNED_UPLOAD=1`。並行転送・書き戻しは任意で、単一バンクの動的常駐を外して `LLAMA_EXPERT_HIP_OVERLAP=1` と `LLAMA_EXPERT_HIP_OVERLAP_PROMOTION=1` を指定する。
 
 ### Windows Vulkan の検証記録
 
