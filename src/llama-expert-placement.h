@@ -36,12 +36,12 @@ struct llama_expert_placement {
     const ggml_backend_dev_t target;
     const int32_t max_ubatch;
     const hip_overlap_mode hip_overlap;
-    const bool hip_mtp_verify_three;
-    const int32_t n_slots;
     const hip_overlap_mode hip_prefill;
     const bool hip_overlap_promotion;
     const bool overlap;
     const bool dynamic_resident;
+    const bool hip_mtp_verify_three;
+    const int32_t n_slots;
     const int32_t prefill_tokens;
     int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;
     mutable std::atomic<bool> context_in_use{false};

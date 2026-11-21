@@ -2842,10 +2842,10 @@ struct llama_moe_cache::impl {
                     prompt_ubatches, prompt_tokens, prompt_max_tokens, decode_max_tokens, prompt_layer_steps, prompt_uploads, prompt_upload_bytes,
                     compact_chunks, compact_workspace ? ggml_backend_buffer_get_size(compact_workspace.get()) : 0);
             if (placement->hip_prefill != llama_expert_placement::hip_overlap_mode::off) {
-                LLAMA_LOG_INFO("packed expert HIP prefill overlap10: mode=%s scratch_slots=20 bank_slots=10"
+                LLAMA_LOG_INFO("packed expert HIP prefill overlap10: mode=%s scratch_slots=%d bank_slots=10"
                         " transfer_submits=%" PRIu64 " transfer_bytes=%" PRIu64 " compute_windows=%" PRIu64 "\n",
                         placement->hip_prefill == llama_expert_placement::hip_overlap_mode::async ? "overlap" : "serial",
-                        prefill_overlap_submits, prefill_overlap_bytes, prefill_overlap_windows);
+                        placement->n_slots, prefill_overlap_submits, prefill_overlap_bytes, prefill_overlap_windows);
             } else if (prefill_overlap_ten) {
                 LLAMA_LOG_INFO("packed expert prefill overlap10: enabled=1 job=%d scratch_slots=20 bank_slots=10"
                         " transfer_submits=%" PRIu64 " transfer_bytes=%" PRIu64 " compute_windows=%" PRIu64

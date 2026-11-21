@@ -1046,6 +1046,18 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    if (mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves && !model.no_alloc()) {
+        struct restore_verify_width {
+            uint32_t & width;
+            uint32_t previous;
+            ~restore_verify_width() { width = previous; }
+        } restore{target_mtp_verify_width, target_mtp_verify_width};
+        target_mtp_verify_width = 3;
+        if (!graph_reserve(3, n_seqs, 3, mctx.get())) {
+            throw std::runtime_error("failed to allocate packed three-position MTP buffers");
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -3439,6 +3451,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.target_mtp_verify_three =*/ mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3,
+        /*.target_mtp_verify_three_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
+                target_mtp_verify_width == 3 && ubatch.n_tokens == 3,
     };
 }
 

@@ -1593,6 +1593,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     target_mtp_verify_three(params.target_mtp_verify_three),
+    target_mtp_verify_three_packed(params.target_mtp_verify_three_packed),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2446,7 +2447,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }();
     const bool fast_three = mtp_waves && mtp_three_fast;
     const int32_t prefill_waves = mtp_waves ? 2 : moe_cache ? moe_cache->get_prefill_waves(il, n_tokens, n_expert_used) : 0;
-    const bool compact_prefill = !mtp_waves && moe_cache && moe_cache->compact_prefill(n_tokens);
+    const bool compact_prefill = !mtp_waves && !target_mtp_verify_three_packed &&
+        moe_cache && moe_cache->compact_prefill(n_tokens);
     if (mtp_waves && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || down_exps_b || post_exp_norm ||
             type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f)) {
         throw std::runtime_error("3-position MTP requires unclamped SiLU Experts without bias, rotation, LoRA or post norm");
