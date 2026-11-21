@@ -13,6 +13,20 @@
 - `cff3d167e` の追加比較では、Flash Next の固定プロンプト1、2位置・MTP下書き1候補、広幅prefill無効、各128生成トークンで、単一バンク → 並行分割バンク → 並行分割バンク → 単一バンクを実行した。生成は単一バンク29.86 / 27.71 t/s（合算28.75）、並行分割27.97 / 27.58 t/s（合算27.77）。全試行でトークン列、MTP提案73・採用54が一致。合算は初回トークン後の127トークン/試行で算出。生ログは Git 外の `/tmp/llama-rocm-06-single-vs-overlap/`。
 - 通常運用は従来の単一バンクを既定とする。2位置で比較した単一バンクの動的常駐は `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY=1` と `LLAMA_EXPERT_HIP_PINNED_UPLOAD=1`。並行転送・書き戻しは任意で、単一バンクの動的常駐を外して `LLAMA_EXPERT_HIP_OVERLAP=1` と `LLAMA_EXPERT_HIP_OVERLAP_PROMOTION=1` を指定する。
 
+#### Expertスロット実験の引き継ぎ（2026-11-21）
+
+実験は統合ブランチの `d9287e566` から分けた `codex/rocm-protected-slot-lru` に保存した。Phase 3と計測メモを含む `9bbe9c12d` はGitHubへpush済み。Phase 3でいったん停止し、統合へのマージは保留。 [実験ブランチの設計と計測](https://github.com/kamuiun-source/llama.cpp/blob/9bbe9c12d0a698b3bab29b3bfee9c92d4c4758a5/fork-docs/rocm/07-protected-slot-lru.md)
+
+- Phase 0は、分割バンク2位置で生成中の昇格をOFFにすると書き戻しはゼロ、要求ミス率は7.09%から12.30%へ増加。Phase 1の保護300＋仮置き20のLRU（`257a0fee9`）で10.23%まで低下した。
+- Phase 2（`7ecd7f5c8`）はリクエスト間の対交換。H2DとD2Hの中断診断で原本と所有表を確認し、生成中の書き戻しはゼロだった。
+- Phase 3は直近のリクエストの利用統計で交換対象を選ぶ。同じFlash Next・プロンプト・MTP 2位置で、交換後の生成中ヒット率は固定90.01%、利用統計90.13%。退避後の再アップロードは23件から0件になったが、生成速度は29.50から29.31 t/sで改善を確認できなかった。投稿の平均約70 t/s・生成中ヒット率97%は参考値。 [投稿とLinuxの生成区間の比較](https://github.com/kamuiun-source/llama.cpp/blob/9bbe9c12d0a698b3bab29b3bfee9c92d4c4758a5/fork-docs/research/reference-decode-comparison-20261119.md)
+
+共有の `build-cuda-hip` には直近の実験バイナリが残っている。統合ブランチのコードで実行する際は、同じビルド先で増分ビルドする。
+
+#### gfx906のgate/up K分割の試作
+
+`codex/rocm-gfx906-split-k` でIQ3_XXS・2位置の融合gate/up＋SwiGLUを5＋5に分けた。既定版との出力差はNMSE `2.14e-14`。カーネル中央値は既定151.20 µs、試作166.32 µsだったため、既定版を採用する。[試作と計測結果](../rocm/08-gfx906-split-k.md)
+
 ### Windows Vulkan の検証記録
 
 - 当面の通常運用は高速固定3幅、全語彙、`p-min=0`。MTP改善はユーザー判断で休止。固定2幅と自動幅は比較用に保持。

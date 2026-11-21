@@ -915,10 +915,9 @@ static __global__ void mul_mat_vec_q(
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
-// Block: (warp_size, ncols_dst) - each warp handles one token independently.
-// No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+// Block: (warp_size, ncols_dst, split_k ? 2 : 1)
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool split_k = false>
+__launch_bounds__((split_k ? 4 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,
@@ -975,8 +974,10 @@ static __global__ void mul_mat_vec_q_moe(
 
     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
 
-    if (token_idx >= ncols_dst) {
-        return;
+    if constexpr (!split_k) {
+        if (token_idx >= ncols_dst) {
+            return;
+        }
     }
 
     ggml_cuda_pdl_sync();
@@ -990,7 +991,9 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kbx_begin = split_k ? int(threadIdx.z) * (blocks_per_row_x / 2) : 0;
+    const int kbx_end   = split_k ? kbx_begin + blocks_per_row_x / 2 : blocks_per_row_x;
+    for (int kbx = kbx_begin + threadIdx.x / (qi/vdr); kbx < kbx_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
@@ -1007,7 +1010,6 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_lc();
 
-    // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
@@ -1015,6 +1017,24 @@ static __global__ void mul_mat_vec_q_moe(
             if (use_gate) {
                 tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
             }
+        }
+    }
+
+    if constexpr (split_k) {
+        static_assert(type == GGML_TYPE_IQ3_XXS && c_rows_per_block == 2 && has_fusion);
+        // Publish the second half before the first half applies SwiGLU.
+        __shared__ float partial[2][c_rows_per_block][2];
+        if (threadIdx.z == 1 && threadIdx.x < c_rows_per_block) {
+            partial[token_idx][threadIdx.x][0] = tmp[threadIdx.x];
+            partial[token_idx][threadIdx.x][1] = tmp_gate[threadIdx.x];
+        }
+        __syncthreads();
+        if (threadIdx.z != 0) {
+            return;
+        }
+        if (threadIdx.x < c_rows_per_block) {
+            tmp[threadIdx.x]      += partial[token_idx][threadIdx.x][0];
+            tmp_gate[threadIdx.x] += partial[token_idx][threadIdx.x][1];
         }
     }
 
@@ -1133,26 +1153,34 @@ static void mul_mat_vec_q_moe_launch(
             }
             return value && std::strcmp(value, "4") == 0 ? 4 : 2;
         }();
-        if (swiglu_rows != 2 && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
+        static const bool swiglu_split_k = [] {
+            const char * value = std::getenv("GGML_HIP_GFX906_MOE_SWIGLU_SPLIT_K");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const bool split_k = swiglu_split_k && ncols_dst == 2;
+        if ((split_k || swiglu_rows != 2) && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
                 (ncols_dst == 2 || ncols_dst == 3) && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
                 !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
                 !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
-            const auto launch = [&](auto rows) {
+            const auto launch = [&](auto rows, auto split) {
                 constexpr int rows_per_block = decltype(rows)::value;
+                constexpr bool split_k_kernel = decltype(split)::value;
                 const dim3 block_nums(nrows_x / rows_per_block, nchannels_dst);
-                const dim3 block_dims(warp_size, ncols_dst);
+                const dim3 block_dims(warp_size, ncols_dst, split_k_kernel ? 2 : 1);
                 const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
-                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, split_k_kernel>, launch_params,
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                     stride_row_x, stride_col_y, stride_col_dst,
                     stride_channel_x, stride_channel_y, stride_channel_dst,
                     ncols_dst, ids_stride);
             };
-            if (swiglu_rows == 1) {
-                launch(std::integral_constant<int, 1>{});
+            if (split_k) {
+                launch(std::integral_constant<int, 2>{}, std::true_type{});
+            } else if (swiglu_rows == 1) {
+                launch(std::integral_constant<int, 1>{}, std::false_type{});
             } else {
-                launch(std::integral_constant<int, 4>{});
+                launch(std::integral_constant<int, 4>{}, std::false_type{});
             }
             return;
         }
