@@ -10,7 +10,7 @@
 
 単一バンクの `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY=1` 設定に、固定3幅では `LLAMA_MTP_VERIFY_THREE=1` と `--spec-draft-n-max 2` を加える。通常の `-ub 2` は維持する。仮置きは20枠から30枠へ広がり、広幅Prefillの転送に使うのは従来と同じ10枠ずつの2組。候補1個の固定2幅では `--spec-draft-n-max 1` を使う。
 
-固定3幅の通常起動では、入力H2D、戻りD2H、スロット表、昇格時の書き戻しを非同期化する。[Dockerの採用設定](10-decode-pipeline.md#単一バンク固定3幅の採用設定) を参照。
+固定3幅の通常起動では、入力H2D、戻りD2H、スロット表、昇格時の書き戻しを非同期化し、Expertの連続配置・直接DMAも有効にする。[Dockerの採用設定](10-decode-pipeline.md#単一バンク固定3幅の採用設定) を参照。
 
 固定3幅の検証グラフは、3トークンの通常Prefillとは区別して再利用する。HIP の生成検証では packed decode で Router ID とスロット表を処理する。初期試作では幅だけを判定したため生成検証が compact prefill に入り、その速度は採用比較から除いた。
 

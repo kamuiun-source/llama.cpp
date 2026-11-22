@@ -19,6 +19,14 @@ struct llama_expert_placement {
         ggml_tensor * host;
         ggml_tensor * bank;
         ggml_tensor * cold;
+        size_t payload_bytes;
+    };
+
+    struct tuple_bank {
+        ggml_tensor * host = nullptr;
+        ggml_tensor * device = nullptr;
+        size_t stride = 0;
+        size_t payload_bytes = 0;
     };
 
     struct layer_map {
@@ -48,17 +56,24 @@ struct llama_expert_placement {
     const bool hip_mtp_compact;
     const bool hip_mtp_overlap;
     const bool hip_mtp_direct_ram;
+    const bool hip_tuple_dma;
     const int32_t n_slots;
     const int32_t prefill_tokens;
     int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;
     mutable std::atomic<bool> context_in_use{false};
     std::array<layer_map, llama_expert_profile::n_layers> maps;
     std::vector<weight> weights;
+    std::array<tuple_bank, llama_expert_profile::n_layers> tuples;
     ggml_context_ptr host_ctx;
     ggml_context_ptr bank_ctx;
     ggml_context_ptr cold_ctx;
+    ggml_context_ptr tuple_host_ctx;
+    ggml_context_ptr tuple_bank_ctx;
     ggml_backend_buffer_ptr host_buf;
     ggml_backend_buffer_ptr bank_buf;
     ggml_backend_buffer_ptr cold_buf;
     llama_mlock host_lock;
+
+private:
+    bool load_tuples(llama_model_loader & loader, const llama_model_params & params);
 };

@@ -583,7 +583,15 @@ struct llama_moe_cache::impl {
     ggml_backend_ptr hip_upload_backend;
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
     ggml_backend_buffer_ptr hip_mtp_promotion_staging;
+    bool hip_mtp_promotion_async = false;
     packed_promotion hip_mtp_pending_move{};
+    size_t tuple_h2d_count = 0;
+    size_t tuple_h2d_payload_bytes = 0;
+    size_t tuple_h2d_bytes = 0;
+    size_t tuple_prefill_h2d_count = 0;
+    size_t tuple_d2h_count = 0;
+    size_t tuple_d2h_payload_bytes = 0;
+    size_t tuple_d2h_bytes = 0;
     size_t hip_mtp_async_maps = 0;
     size_t hip_mtp_async_map_bytes = 0;
     size_t hip_mtp_promotion_submits = 0;
@@ -773,10 +781,10 @@ struct llama_moe_cache::impl {
                 layers.at(w.layer).experts.push_back(w.host);
                 auto & bytes = bytes_per_layer.at(w.layer);
                 bindings.emplace(w.host, binding{w.layer, 0, w.bank, w.cold, bytes});
-                if (w.host->nb[2] > SIZE_MAX - bytes) {
+                if (w.payload_bytes > SIZE_MAX - bytes) {
                     throw std::runtime_error("packed expert tuple is too large");
                 }
-                bytes += w.host->nb[2];
+                bytes += w.payload_bytes;
             }
             const size_t tuple_bytes = *std::max_element(bytes_per_layer.begin(), bytes_per_layer.end());
             const char * ram_copy = std::getenv("LLAMA_EXPERT_PROFILE_RAM_COPY");
@@ -790,7 +798,9 @@ struct llama_moe_cache::impl {
                         throw std::runtime_error("dynamic expert residency requires gate/up and down weights");
                     }
                 }
-                packed_writeback.resize(tuple_bytes);
+                if (!placement->hip_tuple_dma) {
+                    packed_writeback.resize(tuple_bytes);
+                }
                 LLAMA_LOG_INFO("packed expert dynamic residency: stale_lookups=%" PRIu64 " writeback_buffer_bytes=%zu\n",
                         packed_min_resident_age, packed_writeback.size());
             }
@@ -863,7 +873,7 @@ struct llama_moe_cache::impl {
             const bool hip_prefill = placement->hip_prefill != llama_expert_placement::hip_overlap_mode::off;
             const bool hip_upload_requested = hip_overlap || hip_prefill || placement->hip_mtp_overlap ||
                     (std::strcmp(target_name, "ROCm") == 0 && hip_pinned && std::strcmp(hip_pinned, "1") == 0);
-            if (hip_upload_requested) {
+            if (hip_upload_requested && !placement->hip_tuple_dma) {
                 const auto buft = ggml_backend_dev_host_buffer_type(placement->target);
                 const size_t writeback_bytes = placement->hip_overlap_promotion ? tuple_bytes : 0;
                 if (writeback_bytes > SIZE_MAX - staging_bytes) {
@@ -886,10 +896,10 @@ struct llama_moe_cache::impl {
             if (placement->hip_mtp_overlap) {
                 LLAMA_LOG_INFO("packed expert HIP MTP3: single-bank upload overlap enabled\n");
             }
-            if (packed_staging || placement->hip_mtp_direct_ram) {
+            if (packed_staging || placement->hip_mtp_direct_ram || placement->hip_tuple_dma) {
                 fills.reserve(placement->n_slots);
             }
-            if (packed_staging) {
+            if (packed_staging || placement->hip_tuple_dma) {
                 if (hip_overlap || hip_prefill || placement->hip_mtp_overlap) {
                     hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
                     if (!hip_upload_backend) {
@@ -920,9 +930,11 @@ struct llama_moe_cache::impl {
                         LLAMA_LOG_INFO("packed expert overlap: early cold uploads %s\n", packed_early_copy ? "enabled" : "disabled");
                     }
                 }
-                LLAMA_LOG_INFO("packed expert %s upload: %zu bytes of native host staging on %s (%s)\n",
-                        placement->overlap ? "overlap" : "batch", ggml_backend_buffer_get_size(packed_staging.get()),
-                        ggml_backend_dev_name(placement->target), ggml_backend_dev_description(placement->target));
+                if (packed_staging) {
+                    LLAMA_LOG_INFO("packed expert %s upload: %zu bytes of native host staging on %s (%s)\n",
+                            placement->overlap ? "overlap" : "batch", ggml_backend_buffer_get_size(packed_staging.get()),
+                            ggml_backend_dev_name(placement->target), ggml_backend_dev_description(placement->target));
+                }
             } else if (placement->overlap) {
                 throw std::runtime_error("expert overlap requires native Vulkan host staging on the target and an async transfer queue without serialized submissions");
             } else if (!hip_upload_requested) {
@@ -946,19 +958,26 @@ struct llama_moe_cache::impl {
                 };
                 hip_mtp_slot_staging = allocate_pinned("LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP",
                         placement->maps.size() * sizeof(placement->maps[0].resident));
-                hip_mtp_promotion_staging = allocate_pinned("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION", tuple_bytes);
-                if (hip_mtp_promotion_staging && !hip_upload_backend) {
+                if (placement->hip_tuple_dma) {
+                    const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION");
+                    hip_mtp_promotion_async = value && std::strcmp(value, "1") == 0;
+                } else {
+                    hip_mtp_promotion_staging = allocate_pinned("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION", tuple_bytes);
+                    hip_mtp_promotion_async = bool(hip_mtp_promotion_staging);
+                }
+                if (hip_mtp_promotion_async && !hip_upload_backend) {
                     hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
                     if (!hip_upload_backend) {
                         hip_mtp_promotion_staging.reset();
+                        hip_mtp_promotion_async = false;
                         LLAMA_LOG_WARN("HIP MTP3 promotion stream unavailable, using synchronous writeback\n");
                     }
                 }
             }
             const char * rtx_slots_env = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
             if (rtx_slots_env && std::strcmp(rtx_slots_env, "0") != 0) {
-                if (placement->hip_mtp_overlap || placement->hip_mtp_direct_ram) {
-                    throw std::runtime_error("HIP MTP3 expert overlap and direct RAM require RTX cold assist off");
+                if (placement->hip_mtp_overlap || placement->hip_mtp_direct_ram || placement->hip_tuple_dma) {
+                    throw std::runtime_error("HIP MTP3 expert overlap, direct RAM and tuple DMA require RTX cold assist off");
                 }
                 char * end = nullptr;
                 const long slots = std::strtol(rtx_slots_env, &end, 10);
@@ -1490,6 +1509,16 @@ struct llama_moe_cache::impl {
         move.old_gpu_slot = map.resident[evict];
         move.new_gpu_slot = packed_slot(l, scratch_index);
         GGML_ASSERT(move.host_slot >= 0 && map.resident[move.promote] == -1 && map.host[evict] == -1);
+        if (placement->hip_tuple_dma) {
+            const auto & tuple = placement->tuples[il];
+            GGML_ASSERT(move.host_slot < llama_expert_profile::n_experts - llama_expert_profile::n_resident &&
+                    move.old_gpu_slot >= 0 && size_t(move.old_gpu_slot) < ggml_nbytes(tuple.device) / tuple.stride);
+            auto * data = static_cast<uint8_t *>(tuple.host->data) + move.host_slot * tuple.stride;
+            move.n_planes = 1;
+            move.bytes = tuple.stride;
+            move.planes[0] = {tuple.device, data, tuple.stride};
+            return move;
+        }
         move.n_planes = l.experts.size();
         GGML_ASSERT(move.n_planes <= move.planes.size());
         for (size_t i = 0; i < move.n_planes; ++i) {
@@ -1514,7 +1543,12 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(map.host[move.promote] == move.host_slot && map.resident[move.evict] == move.old_gpu_slot &&
                 l.packed_scratch[move.scratch_index] == move.promote && packed_slot(l, move.scratch_index) == move.new_gpu_slot);
         // Publish the new RAM owner only after all victim planes are available.
-        if (move.writeback_slot >= 0) {
+        if (placement->hip_tuple_dma) {
+            GGML_ASSERT(move.n_planes == 1 && victim_data == move.planes[0].host_data);
+            ++tuple_d2h_count;
+            tuple_d2h_payload_bytes += placement->tuples[move.il].payload_bytes;
+            tuple_d2h_bytes += move.bytes;
+        } else if (move.writeback_slot >= 0) {
             auto & slot = l.packed_ram_slots[move.host_slot];
             GGML_ASSERT(slot != move.writeback_slot);
             if (slot >= 0) {
@@ -1566,16 +1600,17 @@ struct llama_moe_cache::impl {
     void promote_packed(const layer & l, int32_t il, int32_t scratch_index, int32_t evict) {
         telemetry_scope scope(set_telemetry_cause, "expert_writeback");
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
+        auto * writeback = placement->hip_tuple_dma ? move.planes[0].host_data : packed_writeback.data();
         const int64_t start = ggml_time_us();
         size_t offset = 0;
         for (size_t i = 0; i < move.n_planes; ++i) {
             const auto & p = move.planes[i];
-            ggml_backend_tensor_get(p.bank, packed_writeback.data() + offset, move.old_gpu_slot * p.stride, p.stride);
+            ggml_backend_tensor_get(p.bank, writeback + offset, move.old_gpu_slot * p.stride, p.stride);
             offset += p.stride;
         }
-        commit_packed_promotion(move, packed_writeback.data());
+        commit_packed_promotion(move, writeback);
         packed_writeback_us += ggml_time_us() - start;
-        if (!packed_staging) {
+        if (!packed_staging && !placement->hip_tuple_dma) {
             LLAMA_LOG_DEBUG("packed expert serial promotion: layer=%d promoted=%d resident_slot=%d evicted=%d scratch_slot=%d host_slot=%d\n",
                     il, move.promote, move.new_gpu_slot, move.evict, move.old_gpu_slot, move.host_slot);
         }
@@ -1588,7 +1623,8 @@ struct llama_moe_cache::impl {
         const int64_t start = ggml_time_us();
         ggml_backend_synchronize(hip_upload_backend.get());
         hip_mtp_promotion_wait_us += ggml_time_us() - start;
-        const auto * data = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
+        const auto * data = placement->hip_tuple_dma ? hip_mtp_pending_move.planes[0].host_data :
+                static_cast<const uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
         commit_packed_promotion(hip_mtp_pending_move, data);
         packed_writeback_us += ggml_time_us() - start;
         ++hip_mtp_promotion_commits;
@@ -1598,8 +1634,11 @@ struct llama_moe_cache::impl {
     void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict) {
         GGML_ASSERT(!hip_mtp_pending_move.n_planes);
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
-        GGML_ASSERT(move.bytes <= ggml_backend_buffer_get_size(hip_mtp_promotion_staging.get()));
-        auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
+        auto * data = move.planes[0].host_data;
+        if (!placement->hip_tuple_dma) {
+            GGML_ASSERT(move.bytes <= ggml_backend_buffer_get_size(hip_mtp_promotion_staging.get()));
+            data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
+        }
         const int64_t start = ggml_time_us();
         try {
             for (size_t i = 0; i < move.n_planes; ++i) {
@@ -1767,18 +1806,6 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(!compact_transfer_pending);
         const auto & map = placement->maps[il];
         const bool hip_prefill = placement->hip_prefill != llama_expert_placement::hip_overlap_mode::off;
-        constexpr size_t max_regions = 30;
-        std::array<ggml_tensor *, max_regions> weights{};
-        std::array<size_t, max_regions> offsets{}, sizes{}, staging_offsets{};
-        size_t regions = 0;
-        size_t tuple_bytes = 0;
-        for (const auto * host : l.experts) {
-            tuple_bytes += host->nb[2];
-        }
-        auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
-        const size_t capacity = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
-        size_t used = size_t(bank) * 10 * tuple_bytes;
-        const size_t start = used;
         fills.clear();
         std::vector<int32_t> wave;
         for (size_t index = 0; index < 10 && begin + index < cold.size(); ++index) {
@@ -1795,6 +1822,29 @@ struct llama_moe_cache::impl {
         for (const auto & fill : fills) {
             l.packed_scratch[fill.slot] = -1;
         }
+        if (placement->hip_tuple_dma) {
+            GGML_ASSERT(hip_prefill && hip_upload_backend);
+            const bool async = placement->hip_prefill == llama_expert_placement::hip_overlap_mode::async;
+            const size_t bytes = upload_packed(hip_upload_backend.get(), l, il, false, nullptr, 0, async);
+            compact_transfer_pending = async;
+            ++prefill_overlap_submits;
+            prefill_overlap_bytes += bytes;
+            tuple_prefill_h2d_count += fills.size();
+            uploaded += bytes;
+            return wave;
+        }
+        constexpr size_t max_regions = 30;
+        std::array<ggml_tensor *, max_regions> weights{};
+        std::array<size_t, max_regions> offsets{}, sizes{}, staging_offsets{};
+        size_t regions = 0;
+        size_t tuple_bytes = 0;
+        for (const auto * host : l.experts) {
+            tuple_bytes += host->nb[2];
+        }
+        auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        const size_t capacity = packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
+        size_t used = size_t(bank) * 10 * tuple_bytes;
+        const size_t start = used;
         for (const auto & fill : fills) {
             const int32_t host_slot = map.host[fill.expert];
             for (auto * host : l.experts) {
@@ -2176,17 +2226,40 @@ struct llama_moe_cache::impl {
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false,
                          bool fine_profile = false) {
-        GGML_ASSERT(!hip_async || ((cold || placement->hip_mtp_overlap) && !submitted));
+        const bool tuple_dma = placement->hip_tuple_dma;
+        GGML_ASSERT(!hip_async || ((cold || placement->hip_mtp_overlap || tuple_dma) && !submitted));
         GGML_ASSERT(!hip_direct || (!cold && !hip_async && !submitted && !retry_bytes));
+        GGML_ASSERT(!tuple_dma || (!cold && !submitted && !retry_bytes && !hip_direct));
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
         const auto & map = placement->maps[il];
-        auto * staging = hip_direct ? nullptr : static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
-        const size_t staging_bytes = hip_direct ? 0 : hip_writeback_offset ? hip_writeback_offset :
+        const bool direct = hip_direct || tuple_dma;
+        auto * staging = direct ? nullptr : static_cast<uint8_t *>(ggml_backend_buffer_get_base(packed_staging.get()));
+        const size_t staging_bytes = direct ? 0 : hip_writeback_offset ? hip_writeback_offset :
                 packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         size_t bytes = 0;
+        const auto submit = [&](ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
+            const int64_t start = fine_profile ? ggml_time_us() : 0;
+            ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
+            if (fine_profile) {
+                packed_staging_totals.submit_us += ggml_time_us() - start;
+            }
+            bytes += size;
+        };
         try {
             for (const auto & fill : fills) {
                 const int32_t slot = cold ? fill.slot : packed_slot(l, fill.slot);
+                if (tuple_dma) {
+                    const auto & tuple = placement->tuples[il];
+                    const int32_t host_slot = map.host[fill.expert];
+                    GGML_ASSERT(host_slot >= 0 && size_t(host_slot) < ggml_nbytes(tuple.host) / tuple.stride &&
+                            slot >= 0 && size_t(slot) < ggml_nbytes(tuple.device) / tuple.stride);
+                    const auto * data = static_cast<const uint8_t *>(tuple.host->data) + host_slot * tuple.stride;
+                    submit(tuple.device, data, slot * tuple.stride, tuple.stride);
+                    ++tuple_h2d_count;
+                    tuple_h2d_payload_bytes += tuple.payload_bytes;
+                    tuple_h2d_bytes += tuple.stride;
+                    continue;
+                }
                 for (ggml_tensor * host : l.experts) {
                     const auto & binding = bindings.at(host);
                     const size_t stride = host->nb[2];
@@ -2196,12 +2269,7 @@ struct llama_moe_cache::impl {
                         copy_upload_staging(staging + bytes, data, stride, retry_bytes, fine_profile);
                         data = staging + bytes;
                     }
-                    const int64_t start = fine_profile ? ggml_time_us() : 0;
-                    ggml_backend_tensor_set_async(backend, cold ? binding.cold : binding.cached, data, slot * stride, stride);
-                    if (fine_profile) {
-                        packed_staging_totals.submit_us += ggml_time_us() - start;
-                    }
-                    bytes += stride;
+                    submit(cold ? binding.cold : binding.cached, data, slot * stride, stride);
                 }
             }
             if (submitted) {
@@ -2226,7 +2294,7 @@ struct llama_moe_cache::impl {
                 }
                 if (profile_packed_ram_copy) {
                     packed_staging_totals.upload_wait_us += us;
-                    packed_staging_totals.direct_bytes += hip_direct ? bytes : 0;
+                    packed_staging_totals.direct_bytes += direct ? bytes : 0;
                 }
                 if (trace_wait) {
                     generation_trace_upload_wait_us += us;
@@ -2586,7 +2654,8 @@ struct llama_moe_cache::impl {
 
         const size_t ids_bytes = ggml_nbytes(sel);
         const bool fine_profile = callback_start && placement && placement->hip_mtp_verify_three &&
-                !placement->overlap && !placement->hip_mtp_overlap && packed_staging && src == l.slot_map &&
+                !placement->overlap && !placement->hip_mtp_overlap &&
+                (packed_staging || placement->hip_tuple_dma) && src == l.slot_map &&
                 ggml_nelements(sel) == 30;
         struct callback_measurement {
             int64_t start;
@@ -2674,8 +2743,13 @@ struct llama_moe_cache::impl {
                 prompt_trace_array(row, scratch_slots);
                 row << ",\"strides\":[";
                 for (size_t plane = 0; plane < l.experts.size(); ++plane) {
-                    row << (plane ? "," : "") << l.experts[plane]->nb[2];
-                    trace_tuple_bytes += l.experts[plane]->nb[2];
+                    const auto * weight = l.experts[plane];
+                    const size_t payload = ggml_row_size(weight->type, weight->ne[0]) * weight->ne[1];
+                    row << (plane ? "," : "") << payload;
+                    trace_tuple_bytes += payload;
+                }
+                if (placement->hip_tuple_dma) {
+                    trace_tuple_bytes = placement->tuples[il].stride;
                 }
                 row << "],\"uploads\":[";
             }
@@ -2691,7 +2765,7 @@ struct llama_moe_cache::impl {
             const bool hip_direct = placement->hip_mtp_direct_ram && fixed_three;
             const bool hip_async_slot_map = fixed_three && hip_mtp_slot_staging && sched &&
                     ggml_backend_sched_get_n_copies(sched) == 1 && !rtx_expert;
-            const bool batch = packed_staging != nullptr || hip_direct;
+            const bool batch = packed_staging != nullptr || hip_direct || placement->hip_tuple_dma;
             if (batch) {
                 fills.clear();
             }
@@ -3032,7 +3106,7 @@ struct llama_moe_cache::impl {
             }
             if (evict >= 0 && !overlap_submitted) {
                 const int64_t promotion_start = fine_profile ? ggml_time_us() : 0;
-                if (fixed_three && hip_mtp_promotion_staging && !rtx_expert && sched &&
+                if (fixed_three && hip_mtp_promotion_async && !rtx_expert && sched &&
                         ggml_backend_sched_get_n_copies(sched) == 1) {
                     submit_hip_mtp_promotion(l, il, promote_index, evict);
                 } else {
@@ -3119,7 +3193,7 @@ struct llama_moe_cache::impl {
                 if (trace_generation) {
                     *trace_row << ",\"staging_memcpy_us\":" << generation_trace_memcpy_us
                                << ",\"upload_wait_us\":" << generation_trace_upload_wait_us
-                               << ",\"direct_bytes\":" << (hip_direct ? bytes : 0);
+                               << ",\"direct_bytes\":" << (hip_direct || placement->hip_tuple_dma ? bytes : 0);
                 }
                 *trace_row << "}\n";
                 if (trace_generation) {
@@ -3258,10 +3332,16 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",
                         hip_mtp_async_maps, hip_mtp_async_map_bytes);
             }
-            if (hip_mtp_promotion_staging) {
+            if (hip_mtp_promotion_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async promotion: submits=%zu commits=%zu bytes=%zu wait_ms=%.3f pending=%d\n",
                         hip_mtp_promotion_submits, hip_mtp_promotion_commits, hip_mtp_promotion_bytes,
                         hip_mtp_promotion_wait_us / 1000.0, hip_mtp_pending_move.n_planes != 0);
+            }
+            if (placement->hip_tuple_dma) {
+                LLAMA_LOG_INFO("packed HIP Expert tuple DMA: h2d=%zu h2d_payload_bytes=%zu h2d_bytes=%zu compact_h2d=%zu"
+                        " d2h=%zu d2h_payload_bytes=%zu d2h_bytes=%zu\n",
+                        tuple_h2d_count, tuple_h2d_payload_bytes, tuple_h2d_bytes, tuple_prefill_h2d_count,
+                        tuple_d2h_count, tuple_d2h_payload_bytes, tuple_d2h_bytes);
             }
             if (placement->overlap) {
                 LLAMA_LOG_INFO("packed expert overlap uploads: early_steps=%zu waited_steps=%zu\n",
@@ -3275,7 +3355,7 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_INFO("packed expert slots: reuse=%s permanent_hits=%zu scratch_hits=%zu ram_uploads=%zu upload_mode=%s\n",
                     "on", stats_small.hits - packed_scratch_hits, packed_scratch_hits, stats_small.misses,
-                    placement->overlap ? "overlap" : packed_staging ? "batch" : "serial");
+                    placement->overlap ? "overlap" : placement->hip_tuple_dma ? "tuple" : packed_staging ? "batch" : "serial");
             if (defer_upload_requested) {
                 LLAMA_LOG_INFO("packed expert upload deferral: deferred=%zu synchronous=%zu bytes=%zu\n",
                         packed_deferred_uploads, packed_synchronous_uploads, packed_deferred_upload_bytes);

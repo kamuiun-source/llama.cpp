@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 
 using namespace llama_expert_profile;
 
@@ -116,6 +117,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()), hip_mtp_direct_ram([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM");
         return value && std::strcmp(value, "1") == 0;
+    }()), hip_tuple_dma([] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_TUPLE_DMA");
+        return value && std::strcmp(value, "1") == 0;
     }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
@@ -151,6 +155,9 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }
     if (hip_mtp_direct_ram && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap)) {
         throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP with upload overlap off");
+    }
+    if (hip_tuple_dma && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap || hip_mtp_direct_ram)) {
+        throw std::runtime_error("HIP Expert tuple DMA requires single-bank dynamic residency and fixed three-position MTP");
     }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
@@ -221,11 +228,141 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     if (cold) {
         ggml_format_name(cold, "expert_cold.%s", source->name);
     }
-    weights.push_back({layer, shard, offset, host, bank, cold});
+    weights.push_back({layer, shard, offset, host, bank, cold, source->nb[2]});
     return host;
 }
 
+bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llama_model_params & params) {
+    if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+        throw std::runtime_error("HIP Expert tuple DMA uses native pinned buffers and requires an unlocked model load mode");
+    }
+    const auto host_buft = ggml_backend_dev_host_buffer_type(target);
+    const auto device_buft = ggml_backend_dev_buffer_type(target);
+    if (!host_buft) {
+        throw std::runtime_error("HIP Expert tuple DMA requires a native pinned host buffer type");
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(device_buft);
+    std::array<size_t, n_layers> sizes{}, alignments{};
+    std::array<int, n_layers> gate_up_count{}, down_count{};
+    std::array<ggml_type, n_layers> gate_up_type{};
+    alignments.fill(alignment);
+    for (const auto & w : weights) {
+        const auto type = w.host->type;
+        const auto & ne = w.host->ne;
+        if (ne[0] == 2560 && ne[1] == 640 &&
+                (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS)) {
+            if (gate_up_count[w.layer]++ && gate_up_type[w.layer] != type) {
+                throw std::runtime_error("HIP Expert tuple DMA requires matching gate and up types");
+            }
+            gate_up_type[w.layer] = type;
+        } else if (ne[0] == 640 && ne[1] == 2560 && (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q2_0)) {
+            ++down_count[w.layer];
+        } else {
+            throw std::runtime_error(format("unsupported HIP Expert tuple projection %s", w.host->name));
+        }
+        alignments[w.layer] = std::lcm(alignments[w.layer], ggml_type_size(type));
+        tuples[w.layer].payload_bytes += w.payload_bytes;
+    }
+    for (const bool down : {false, true}) {
+        for (const auto & w : weights) {
+            if ((w.host->ne[0] == 640) != down) {
+                continue;
+            }
+            const size_t offset = GGML_PAD(sizes[w.layer], alignment);
+            const size_t tail = ggml_backend_buft_get_alloc_size(device_buft, w.bank) - ggml_nbytes(w.bank);
+            w.host->view_offs = w.bank->view_offs = offset;
+            // MMQ can read the padded K tail past the final row of every Expert plane.
+            sizes[w.layer] = offset + w.payload_bytes + tail;
+        }
+    }
+
+    const ggml_init_params init{n_layers * ggml_tensor_overhead(), nullptr, true};
+    tuple_host_ctx.reset(ggml_init(init));
+    tuple_bank_ctx.reset(ggml_init(init));
+    if (!tuple_host_ctx || !tuple_bank_ctx) {
+        throw std::runtime_error("could not create HIP Expert tuple contexts");
+    }
+    for (int il = 0; il < n_layers; ++il) {
+        if (gate_up_count[il] != 2 || down_count[il] != 1) {
+            throw std::runtime_error("HIP Expert tuple DMA requires two gate/up planes and one down plane per layer");
+        }
+        auto & tuple = tuples[il];
+        tuple.stride = (sizes[il] + alignments[il] - 1) / alignments[il] * alignments[il];
+        tuple.host = ggml_new_tensor_1d(tuple_host_ctx.get(), GGML_TYPE_I8, (n_experts - n_resident) * tuple.stride);
+        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots) * tuple.stride);
+        ggml_format_name(tuple.host, "expert_tuple_host.%d", il);
+        ggml_format_name(tuple.device, "expert_tuple_bank.%d", il);
+    }
+    bank_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(tuple_bank_ctx.get(), device_buft));
+    host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(tuple_host_ctx.get(), host_buft));
+    if (!bank_buf || ggml_backend_buffer_is_host(bank_buf.get()) || !host_buf) {
+        throw std::runtime_error("could not allocate HIP Expert tuple buffers");
+    }
+    size_t pinned_bytes = 0;
+    size_t fallback_bytes = 0;
+    size_t resident_payload_bytes = 0;
+    size_t ram_payload_bytes = 0;
+    for (const auto & tuple : tuples) {
+        auto & bytes = ggml_backend_buffer_get_type(tuple.host->buffer) == host_buft ? pinned_bytes : fallback_bytes;
+        bytes += ggml_nbytes(tuple.host);
+        resident_payload_bytes += n_resident * tuple.payload_bytes;
+        ram_payload_bytes += (n_experts - n_resident) * tuple.payload_bytes;
+    }
+    LLAMA_LOG_INFO("expert placement HIP tuple DMA: pinned_bytes=%zu fallback_bytes=%zu bank_bytes=%zu"
+            " resident_payload_bytes=%zu ram_payload_bytes=%zu\n", pinned_bytes, fallback_bytes,
+            ggml_backend_buffer_get_size(bank_buf.get()), resident_payload_bytes, ram_payload_bytes);
+    if (fallback_bytes) {
+        throw std::runtime_error("HIP Expert tuple DMA allocation fell back to pageable memory");
+    }
+    ggml_backend_buffer_set_usage(host_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(bank_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_clear(host_buf.get(), 0);
+    ggml_backend_buffer_clear(bank_buf.get(), 0);
+
+    std::vector<char> resident;
+    for (const auto & w : weights) {
+        if (params.progress_callback && !params.progress_callback(
+                static_cast<float>(loader.size_done) / loader.size_data, params.progress_callback_user_data)) {
+            return false;
+        }
+        const auto & tuple = tuples[w.layer];
+        const auto init_view = [&](ggml_tensor * plane, ggml_tensor * raw) {
+            plane->view_src = raw;
+            plane->nb[2] = tuple.stride;
+            plane->nb[3] = plane->ne[2] * tuple.stride;
+            if (plane->view_offs + ggml_nbytes(plane) > ggml_nbytes(raw) ||
+                    ggml_backend_view_init(plane) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("could not initialize a HIP Expert tuple plane");
+            }
+        };
+        init_view(w.host, tuple.host);
+        init_view(w.bank, tuple.device);
+
+        // Keep only one dense resident plane during the initial file load.
+        const auto & map = maps[w.layer];
+        const size_t bytes = w.payload_bytes;
+        resident.resize(n_resident * bytes);
+        auto & file = *loader.files.at(w.shard);
+        file.seek(w.offset, SEEK_SET);
+        for (int expert = 0; expert < n_experts; ++expert) {
+            const int32_t slot = map.resident[expert];
+            auto * data = slot >= 0 ? resident.data() + slot * bytes :
+                    static_cast<char *>(w.host->data) + map.host[expert] * tuple.stride;
+            file.read_raw(data, bytes);
+            if (loader.check_tensors && !ggml_validate_row_data(w.host->type, data, bytes)) {
+                throw std::runtime_error(format("invalid data in expert tensor %s", w.host->name));
+            }
+        }
+        ggml_backend_tensor_set_2d(w.bank, resident.data(), 0, bytes, n_resident, tuple.stride, bytes);
+        loader.size_done += n_experts * bytes;
+    }
+    return true;
+}
+
 bool llama_expert_placement::load(llama_model_loader & loader, const llama_model_params & params) {
+    if (hip_tuple_dma) {
+        return load_tuples(loader, params);
+    }
     const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu) {
         throw std::runtime_error("packed experts require a CPU backend");
