@@ -918,6 +918,100 @@ static constexpr bool compact_moe_type(ggml_type type) {
     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q2_0;
 }
+
+static __device__ __forceinline__ void iq3_xxs_dot_shared_tokens(
+        const block_iq3_xxs & weight, const block_q8_1 * input, int input_stride,
+        int kqs, unsigned tokens, float (&acc)[3]) {
+    const int2 packed = make_int2(get_int_b2(weight.qs, kqs), get_int_b2(weight.qs, kqs + 1));
+    const auto * q3 = reinterpret_cast<const uint8_t *>(&packed);
+    const uint32_t aux = get_int_b2(weight.qs, QK_K/16 + kqs/2);
+    int sum[3] = {};
+    input += kqs/2;
+
+#pragma unroll
+    for (int l = 0; l < 8; l += 2) {
+        const uint32_t signs = unpack_ksigns(aux >> (7*l/2));
+        const int sign_l = __vcmpne4(signs & 0x08040201, 0);
+        const int sign_h = __vcmpne4(signs & 0x80402010, 0);
+        const int grid_l = __vsub4(iq3xxs_grid[q3[l]] ^ sign_l, sign_l);
+        const int grid_h = __vsub4(iq3xxs_grid[q3[l + 1]] ^ sign_h, sign_h);
+#pragma unroll
+        for (int t = 0; t < 3; ++t) {
+            if (tokens & (1u << t)) {
+                const auto & activation = input[t * input_stride];
+                sum[t] = ggml_cuda_dp4a(grid_l, get_int_b4(activation.qs, l), sum[t]);
+                sum[t] = ggml_cuda_dp4a(grid_h, get_int_b4(activation.qs, l + 1), sum[t]);
+            }
+        }
+    }
+    const int scale = aux >> 28;
+    const float weight_d = __half2float(weight.d);
+#pragma unroll
+    for (int t = 0; t < 3; ++t) {
+        if (tokens & (1u << t)) {
+            const int scaled = (scale*sum[t] + sum[t]/2)/2;
+            const float d = weight_d * __low2float(input[t * input_stride].ds);
+            acc[t] += d * scaled;
+        }
+    }
+}
+
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_iq3_xxs_moe_share_weights(
+        const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * input,
+        const int32_t * ids, float * dst, int ids_stride, int expert_stride, int row_stride,
+        int input_stride, int dst_rank_stride, int dst_token_stride) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int lane_group = QI3_XXS / VDR_IQ3_XXS_Q8_1_MMVQ;
+    const int token = threadIdx.y;
+    const int rank = blockIdx.y;
+    const int expert = ids[token * ids_stride + rank];
+    int ranks[3];
+    unsigned tokens = 0;
+    bool duplicate = false;
+#pragma unroll
+    for (int t = 0; t < 3; ++t) {
+        const auto matches = __ballot(threadIdx.x < 10 && ids[t * ids_stride + threadIdx.x] == expert);
+        ranks[t] = __ffsll(matches) - 1;
+        tokens |= matches ? 1u << t : 0;
+        duplicate |= (matches & (matches - 1)) != 0;
+    }
+    if (duplicate) {
+        // Multiple routes in the same token cannot share one rank destination.
+        tokens = 1u << token;
+        ranks[token] = rank;
+    } else if (tokens & ((1u << token) - 1)) {
+        return;
+    }
+
+    const int row0 = 2 * blockIdx.x;
+    const int weight_base = expert * expert_stride + row0 * row_stride;
+    const int kqs = VDR_IQ3_XXS_Q8_1_MMVQ * (threadIdx.x % lane_group);
+    float acc_up[2][3] = {};
+    float acc_gate[2][3] = {};
+    for (int k = threadIdx.x / lane_group; k < 10; k += warp_size / lane_group) {
+        const auto * activation = input + k * (QK_K / QK8_1);
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int block = weight_base + r * row_stride + k;
+            iq3_xxs_dot_shared_tokens(up[block], activation, input_stride, kqs, tokens, acc_up[r]);
+            iq3_xxs_dot_shared_tokens(gate[block], activation, input_stride, kqs, tokens, acc_gate[r]);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 3; ++t) {
+        if (tokens & (1u << t)) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const float u = warp_reduce_sum<warp_size>(acc_up[r][t]);
+                const float g = warp_reduce_sum<warp_size>(acc_gate[r][t]);
+                if (threadIdx.x == r) {
+                    dst[t * dst_token_stride + ranks[t] * dst_rank_stride + row0 + r] = u * ggml_cuda_op_silu_single(g);
+                }
+            }
+        }
+    }
+}
 #endif
 
 struct compact_moe_routes {
@@ -1730,6 +1824,30 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#ifdef GGML_USE_HIP
+    const auto * lookup = ids ? ids->view_src : nullptr;
+    if (lookup && lookup->op == GGML_OP_GET_ROWS && std::strcmp(lookup->name, "ffn_moe_mtp_share_iq3_weights") == 0 &&
+            src0->type == GGML_TYPE_IQ3_XXS && ne00 == 2560 && ne01 == 640 && ncols_dst == 3 &&
+            nchannels_y == 1 && nchannels_dst == 10 && ggml_is_contiguous(dst) &&
+            ids->ne[0] == 10 && ids->ne[1] == 3 && fusion_local.gate && fusion_local.glu_op == GGML_GLU_OP_SWIGLU &&
+            !fusion_local.x_bias && !fusion_local.gate_bias && !fusion_local.x_scale && !fusion_local.gate_scale &&
+            !fusion_local.shared_up && !fusion_local.shared_gate && !fusion_local.shared_dst &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VEGA20) {
+        const auto & device = ggml_cuda_info().devices[ctx.device];
+        const ggml_cuda_kernel_launch_params params(dim3(320, 10), dim3(device.warp_size, 3), 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_moe_share_weights, params,
+                static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                static_cast<const block_q8_1 *>(src1_q8_1), ids_d, dst_d, int(ids_stride), int(s02), int(s01),
+                int(stride_col_y), int(stride_channel_dst), int(stride_col_dst));
+        static const bool logged = [] {
+            GGML_LOG_INFO("HIP gfx906 IQ3_XXS shared routed weights: MTP positions=3 top_k=10\n");
+            return true;
+        }();
+        GGML_UNUSED(logged);
+        return;
+    }
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     static const bool hc_up_pair = [] {
