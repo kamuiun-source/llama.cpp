@@ -1357,6 +1357,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<int32_t> idx;
 };
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
@@ -1380,7 +1381,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    idx.resize(n_heads * n_tokens);
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1396,22 +1397,15 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
+        uint64_t mixed = (uint64_t) tok_of(i) * hparams.ple_layer_multipliers[0];
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
             // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
             const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
             cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
-        }
+            mixed ^= (uint64_t) (cut ? eos : t) * hparams.ple_layer_multipliers[s];
 
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
+            const int64_t base = (s - 1) * per_gram;
             for (int64_t g = 0; g < per_gram; ++g) {
                 const int64_t h_i = base + g;
                 idx[i * n_heads + h_i] =
