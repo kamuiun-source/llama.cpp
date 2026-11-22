@@ -32,6 +32,7 @@ public:
     void begin_generation_trace(const llama_ubatch & ubatch, uint32_t verify_width);
     void end_generation_trace(bool success);
     void record_decode_width(uint32_t tokens);
+    void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise

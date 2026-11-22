@@ -145,6 +145,8 @@ struct server_decode_telemetry {
         uint64_t staging_calls = 0;
         uint64_t staging_wall_us = 0;
         llama_expert_staging_telemetry staging;
+        std::array<ggml_backend_hip_handoff_timing, 2> hip_handoff{};
+        uint64_t hip_handoff_phase_calls = 0;
     };
 
     const bool enabled = [] {
@@ -159,6 +161,17 @@ struct server_decode_telemetry {
         const char * env = std::getenv("LLAMA_EXPERT_PROFILE_RAM_COPY");
         return env && std::strcmp(env, "1") == 0;
     }();
+    const bool expert_callback_timing = [] {
+        const char * env = std::getenv("LLAMA_EXPERT_PROFILE_CALLBACK");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const bool hip_handoff_timing = [] {
+        const char * env = std::getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    bool timing_enabled() const {
+        return enabled || expert_staging_copy || expert_callback_timing || hip_handoff_timing;
+    }
     const bool expert_prompt_trace = [] {
         const char * path = std::getenv("LLAMA_EXPERT_PREFILL_TRACE");
         return path && *path;
@@ -236,13 +249,17 @@ struct server_decode_telemetry {
         uint64_t target_tokens;
         std::optional<snapshot> before;
         std::optional<llama_expert_staging_telemetry> staging_before;
+        std::array<ggml_backend_hip_handoff_timing, 2> hip_handoff_before{};
         int64_t wall_start_us = 0;
         int previous_cuda_phase = -1;
 
         scope(server_decode_telemetry & owner, llama_context * ctx, phase kind, uint64_t tokens = 0)
             : owner(owner), ctx(ctx), kind(kind), target_tokens(tokens) {
-            if (owner.expert_staging_copy) {
+            if (owner.expert_staging_copy || owner.expert_callback_timing) {
                 staging_before = llama_get_expert_staging_telemetry();
+            }
+            if (owner.hip_handoff_timing) {
+                ggml_backend_get_hip_handoff_timing(hip_handoff_before.data());
             }
             if (owner.enabled) {
                 before.emplace(owner.read(ctx));
@@ -253,12 +270,46 @@ struct server_decode_telemetry {
                 }
                 wall_start_us = ggml_time_us();
             }
-            if (!owner.enabled && owner.expert_staging_copy) {
+            if (!owner.enabled && staging_before) {
                 wall_start_us = ggml_time_us();
             }
         }
 
+        void flush_response() {
+            // Flush after the outer scope accounts for the final decode step.
+            if (kind == server_step && !owner.pending_response.empty()) {
+                SRV_INF("decode_response_begin: %s\n", owner.pending_response.c_str());
+                owner.log_and_reset();
+                SRV_INF("decode_response_end: response=%" PRIu64 "\n", owner.response_index);
+                owner.pending_response.clear();
+            }
+        }
+
         ~scope() {
+            if (owner.hip_handoff_timing) {
+                ggml_backend_hip_handoff_timing after[2];
+                ggml_backend_get_hip_handoff_timing(after);
+                ++owner.phases[kind].hip_handoff_phase_calls;
+                for (size_t i = 0; i < 2; ++i) {
+                    auto & total = owner.phases[kind].hip_handoff[i];
+                    const auto & prev = hip_handoff_before[i];
+                    const auto & next = after[i];
+                    total.ops += next.ops - prev.ops;
+                    total.batches += next.batches - prev.batches;
+                    total.copies += next.copies - prev.copies;
+                    total.bytes += next.bytes - prev.bytes;
+                    total.pinned_copies += next.pinned_copies - prev.pinned_copies;
+                    total.pinned_bytes += next.pinned_bytes - prev.pinned_bytes;
+                    total.source_wait_us += next.source_wait_us - prev.source_wait_us;
+                    total.destination_wait_us += next.destination_wait_us - prev.destination_wait_us;
+                    total.read_us += next.read_us - prev.read_us;
+                    total.write_us += next.write_us - prev.write_us;
+                    total.async_input_batches += next.async_input_batches - prev.async_input_batches;
+                    total.async_input_copies += next.async_input_copies - prev.async_input_copies;
+                    total.async_input_bytes += next.async_input_bytes - prev.async_input_bytes;
+                    total.enqueue_us += next.enqueue_us - prev.enqueue_us;
+                }
+            }
             if (staging_before) {
                 const auto after = llama_get_expert_staging_telemetry();
                 auto & item = owner.phases[kind];
@@ -274,8 +325,18 @@ struct server_decode_telemetry {
                 total.retry_us += after.retry_us - staging_before->retry_us;
                 total.upload_wait_us += after.upload_wait_us - staging_before->upload_wait_us;
                 total.direct_bytes += after.direct_bytes - staging_before->direct_bytes;
+                total.callback_calls += after.callback_calls - staging_before->callback_calls;
+                total.callback_us += after.callback_us - staging_before->callback_us;
+                total.router_us += after.router_us - staging_before->router_us;
+                total.plan_us += after.plan_us - staging_before->plan_us;
+                total.callback_memcpy_us += after.callback_memcpy_us - staging_before->callback_memcpy_us;
+                total.submit_us += after.submit_us - staging_before->submit_us;
+                total.completion_us += after.completion_us - staging_before->completion_us;
+                total.promotion_us += after.promotion_us - staging_before->promotion_us;
+                total.map_us += after.map_us - staging_before->map_us;
             }
             if (!before) {
+                flush_response();
                 return;
             }
             const auto elapsed_us = ggml_time_us() - wall_start_us;
@@ -322,13 +383,7 @@ struct server_decode_telemetry {
                     item.totals.vk_gpu_detail[i] += after.vk_gpu_detail[i] - before->vk_gpu_detail[i];
                 }
             }
-            // Flush after the outer scope accounts for the final decode step.
-            if (kind == server_step && !owner.pending_response.empty()) {
-                SRV_INF("decode_response_begin: %s\n", owner.pending_response.c_str());
-                owner.log_and_reset();
-                SRV_INF("decode_response_end: response=%" PRIu64 "\n", owner.response_index);
-                owner.pending_response.clear();
-            }
+            flush_response();
         }
     };
 
@@ -382,6 +437,32 @@ struct server_decode_telemetry {
                         copy.calls, copy.bytes, copy.us / 1e3, copy.fill_ge2_bytes, copy.fill_ge2_us / 1e3,
                         copy.retry_bytes, copy.retry_us / 1e3, item.staging_wall_us / 1e3,
                         copy.upload_wait_us / 1e3, copy.direct_bytes);
+            }
+            if (expert_callback_timing && item.staging.callback_calls) {
+                const auto & cb = item.staging;
+                const int64_t other_us = int64_t(cb.callback_us) - int64_t(cb.router_us + cb.plan_us +
+                        cb.callback_memcpy_us + cb.submit_us + cb.completion_us + cb.promotion_us + cb.map_us);
+                SRV_INF("expert_callback_timing: phase=%s phase_calls=%" PRIu64 " callbacks=%" PRIu64
+                        " total_ms=%.3f router_ms=%.3f plan_ms=%.3f staging_memcpy_ms=%.3f"
+                        " h2d_submit_ms=%.3f h2d_completion_ms=%.3f promotion_ms=%.3f map_ms=%.3f other_ms=%.3f\n",
+                        names[i], item.staging_calls, cb.callback_calls, cb.callback_us / 1e3, cb.router_us / 1e3,
+                        cb.plan_us / 1e3, cb.callback_memcpy_us / 1e3, cb.submit_us / 1e3, cb.completion_us / 1e3,
+                        cb.promotion_us / 1e3, cb.map_us / 1e3, other_us / 1e3);
+            }
+            for (size_t dir = 0; dir < item.hip_handoff.size(); ++dir) {
+                const auto & h = item.hip_handoff[dir];
+                if (h.ops) {
+                    SRV_INF("hip_handoff_timing: phase=%s direction=%s phase_calls=%" PRIu64
+                            " ops=%" PRIu64 " batches=%" PRIu64 " copies=%" PRIu64 " bytes=%" PRIu64
+                            " pinned_copies=%" PRIu64 " pinned_bytes=%" PRIu64
+                            " source_wait_ms=%.3f destination_wait_ms=%.3f d2h_ms=%.3f h2d_ms=%.3f"
+                            " async_input_batches=%" PRIu64 " async_input_copies=%" PRIu64 " async_input_bytes=%" PRIu64
+                            " h2d_enqueue_ms=%.3f\n",
+                            names[i], dir == 0 ? "CUDA->ROCm" : "ROCm->CUDA", item.hip_handoff_phase_calls,
+                            h.ops, h.batches, h.copies, h.bytes, h.pinned_copies, h.pinned_bytes,
+                            h.source_wait_us / 1e3, h.destination_wait_us / 1e3, h.read_us / 1e3, h.write_us / 1e3,
+                            h.async_input_batches, h.async_input_copies, h.async_input_bytes, h.enqueue_us / 1e3);
+                }
             }
             if (item.calls == 0) {
                 continue;
@@ -1774,7 +1855,7 @@ private:
     server_decode_telemetry decode_telemetry;
 
     void destroy() {
-        if (decode_telemetry.enabled || decode_telemetry.expert_staging_copy) {
+        if (decode_telemetry.timing_enabled()) {
             decode_telemetry.log_and_reset();
         }
         spec.reset();
@@ -3145,7 +3226,7 @@ private:
                         slot.stats.n_draft_tokens, slot.stats.n_draft_accepted, slot.stats.n_gen);
             }
         }
-        if (decode_telemetry.enabled && decode_telemetry.per_response && slots.size() == 1) {
+        if (decode_telemetry.timing_enabled() && decode_telemetry.per_response && slots.size() == 1) {
             decode_telemetry.pending_response = string_format(
                 "response=%" PRIu64 " task=%d slot=%d prompt_tokens=%d cached_tokens=%d context_tokens=%d generated_tokens=%d"
                 " prompt_ms=%.3f decode_ms=%.3f generation_tps=%.3f draft_accepted=%d draft_generated=%d truncated=%d",
@@ -5526,7 +5607,7 @@ private:
         bool verify = false;
         const int32_t view_width = batch.view.size();
         bool mtp_verify = spec && (view_width == 2 || (view_width == 3 && llama_supports_mtp_verify_three(ctx_tgt)));
-        const bool classify = mtp_verify || decode_telemetry.enabled || decode_telemetry.expert_staging_copy || decode_telemetry.expert_decode_trace;
+        const bool classify = mtp_verify || decode_telemetry.timing_enabled() || decode_telemetry.expert_decode_trace;
         const int prefill_policy = server_expert_prefill_policy();
         for (int i = off; i < off + batch.view.size(); ++i) {
             const auto & token = batch.tokens[i];

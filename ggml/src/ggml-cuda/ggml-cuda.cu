@@ -6624,7 +6624,6 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
-
 // backend device
 
 struct ggml_backend_cuda_device_context {
@@ -6634,6 +6633,30 @@ struct ggml_backend_cuda_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
+
+#ifndef GGML_USE_MUSA
+static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
+    if (ggml_cuda_pinned_memory_disabled()) {
+        return false;
+    }
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    ggml_cuda_set_device(ctx->device);
+    const auto err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: %s writable host registration failed: %s\n",
+                __func__, ggml_backend_dev_name(dev), cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_unregister_writable_host(ggml_backend_dev_t dev, void * buffer) {
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaHostUnregister(buffer));
+}
+#endif
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -7550,6 +7573,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+#ifndef GGML_USE_MUSA
+    if (strcmp(name, "ggml_backend_register_writable_host") == 0) {
+        return (void *)ggml_backend_cuda_register_writable_host;
+    }
+    if (strcmp(name, "ggml_backend_unregister_writable_host") == 0) {
+        return (void *)ggml_backend_cuda_unregister_writable_host;
+    }
+#endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }

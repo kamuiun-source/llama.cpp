@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-expert-placement.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -1161,7 +1162,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     auto * history = build_conv_history(inp, conv_states_all, conv_kernel_size - 1, conv_channels, il);
     ggml_tensor * conv_output_silu = nullptr;
-    if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2) &&
+    static const bool mtp3_conv_history = [] {
+        const char * value = std::getenv("GGML_CUDA_SSM_CONV_HISTORY_MTP3");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const auto * placement = model.expert_placement.get();
+    const bool fused_three = mtp3_conv_history && target_mtp_verify_three_packed && n_seq_tokens == 3 &&
+            placement && placement->dynamic_resident && !placement->overlap && cparams.n_rs_seq >= 2;
+    const int n_history_slots = fused_three ? 3 : 2;
+    if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2 || fused_three) &&
             conv_kernel_size == 4 && conv_states_all->buffer && conv_kernel->buffer && conv_states_all->type == GGML_TYPE_F32 &&
             conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_states_all->ne[0])) {
         auto * dev = model.dev_layer(il);
@@ -1172,7 +1181,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         if (reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
                 ggml_backend_buffer_get_type(conv_states_all->buffer) == buft &&
                 ggml_backend_buffer_get_type(conv_kernel->buffer) == buft && head < cells &&
-                cells <= size_t(conv_states_all->ne[1]) / 2) {
+                cells <= size_t(conv_states_all->ne[1]) / n_history_slots) {
             using make_history_t = ggml_tensor * (*)(ggml_backend_dev_t, ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
             auto make_history = reinterpret_cast<make_history_t>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_make_ssm_conv_history"));
@@ -1184,7 +1193,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
                     }
                     const size_t row_size = conv_states_all->nb[1];
                     auto * slots = ggml_view_2d(ctx0, conv_states_all,
-                            conv_states_all->ne[0], 2, cells * row_size, head * row_size);
+                            conv_states_all->ne[0], n_history_slots, cells * row_size, head * row_size);
                     conv_output_silu = make_history(dev, ctx0, history, qkv_mixed, conv_kernel, slots);
                     if (conv_output_silu) {
                         ggml_backend_sched_set_tensor_backend(sched, conv_output_silu, backend);

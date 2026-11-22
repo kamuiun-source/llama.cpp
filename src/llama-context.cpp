@@ -1122,6 +1122,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (moe_cache) {
+        moe_cache->finish_pending_promotion();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2054,12 +2057,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    static const bool hip_handoff = [] {
+        for (const char * name : {"GGML_SCHED_HIP_SHARED_OVERLAP", "GGML_SCHED_HIP_DUAL_PINNED_HANDOFF", "GGML_SCHED_HIP_HANDOFF_TIMING", "GGML_SCHED_HIP_HANDOFF_WAIT_TRACE"}) {
+            const char * value = std::getenv(name);
+            if (value && std::strcmp(value, "1") == 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    const auto * placement = model.expert_placement.get();
+    const bool hip_shared_three = hip_handoff && placement && placement->hip_mtp_verify_three &&
+            placement->dynamic_resident && !placement->overlap && !placement->hip_mtp_overlap && !placement->hip_mtp_direct_ram;
     struct scheduler_verify_three_scope {
         ggml_backend_sched_t sched;
         bool previous;
         ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
     } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
-            mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
+            (mtp_verify_three_vulkan_waves || hip_shared_three) && target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -3529,6 +3544,9 @@ ggml_status llama_context::graph_compute(
     } verify{sched.get(), ggml_backend_sched_set_target_mtp_verify(sched.get(), target_mtp_verify_width == 2)};
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
+        if (moe_cache) {
+            moe_cache->finish_pending_promotion();
+        }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 

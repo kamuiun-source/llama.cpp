@@ -323,6 +323,14 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    struct ggml_backend_hip_handoff_timing {
+        uint64_t ops, batches, copies, bytes, pinned_copies, pinned_bytes;
+        uint64_t source_wait_us, destination_wait_us, read_us, write_us;
+        uint64_t async_input_batches, async_input_copies, async_input_bytes, enqueue_us;
+    };
+    // Current thread totals, in CUDA->ROCm then ROCm->CUDA order.
+    GGML_API void ggml_backend_get_hip_handoff_timing(struct ggml_backend_hip_handoff_timing timing[2]);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call

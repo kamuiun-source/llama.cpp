@@ -225,14 +225,14 @@ ggml_tensor * ggml_cuda_make_ssm_conv_history(ggml_context * ctx, ggml_tensor * 
                                              ggml_tensor * weights, ggml_tensor * slots) {
     const int64_t channels = x->ne[0];
     const int64_t tokens = x->ne[1];
-    if (channels <= 0 || channels > INT_MAX / 3 || channels % 128 != 0 || (tokens != 1 && tokens != 2) ||
+    if (channels <= 0 || channels > INT_MAX / 3 || channels % 128 != 0 || tokens < 1 || tokens > 3 ||
             x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
             x->nb[1] % sizeof(float) != 0 || x->nb[1] < size_t(channels) * sizeof(float) ||
             history->type != GGML_TYPE_F32 || history->ne[0] != 3 || history->ne[1] != channels ||
             !ggml_is_matrix(history) || !ggml_is_contiguous(history) ||
             weights->type != GGML_TYPE_F32 || weights->ne[0] != 4 || weights->ne[1] != channels ||
             !ggml_is_matrix(weights) || !ggml_is_contiguous(weights) ||
-            slots->type != GGML_TYPE_F32 || slots->ne[0] != 3 * channels || slots->ne[1] != 2 ||
+            slots->type != GGML_TYPE_F32 || slots->ne[0] != 3 * channels || slots->ne[1] != (tokens == 3 ? 3 : 2) ||
             !ggml_is_matrix(slots) || slots->nb[0] != sizeof(float) || slots->nb[1] % sizeof(float) != 0 ||
             slots->nb[1] < 3 * size_t(channels) * sizeof(float)) {
         return nullptr;
@@ -266,7 +266,7 @@ static __global__ void ssm_conv_history_f32(const float * history, const float *
     y[channel] = ggml_cuda_op_silu_single(sum + 0.0f);
 
     float * first = slots + 3 * channel;
-    if constexpr (tokens == 2) {
+    if constexpr (tokens >= 2) {
         const float x1 = x[x_stride + channel];
         sum = 0.0f;
         sum += old1 * w0;
@@ -275,6 +275,20 @@ static __global__ void ssm_conv_history_f32(const float * history, const float *
         sum += x1 * w3;
         y[channels + channel] = ggml_cuda_op_silu_single(sum + 0.0f);
 
+        if constexpr (tokens == 3) {
+            const float x2 = x[2 * x_stride + channel];
+            sum = 0.0f;
+            sum += old2 * w0;
+            sum += x0 * w1;
+            sum += x1 * w2;
+            sum += x2 * w3;
+            y[2 * channels + channel] = ggml_cuda_op_silu_single(sum + 0.0f);
+
+            first[0] = x0;
+            first[1] = x1;
+            first[2] = x2;
+            first += slot_stride;
+        }
         first[0] = old2;
         first[1] = x0;
         first[2] = x1;
@@ -294,7 +308,8 @@ void ggml_cuda_op_ssm_conv_history(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int channels = dst->ne[0];
     constexpr int threads = 128;
     const auto params = ggml_cuda_kernel_launch_params(dim3(channels / threads), threads, 0, ctx.stream());
-    const auto kernel = dst->ne[1] == 2 ? ssm_conv_history_f32<2> : ssm_conv_history_f32<1>;
+    const auto kernel = dst->ne[1] == 3 ? ssm_conv_history_f32<3> :
+            dst->ne[1] == 2 ? ssm_conv_history_f32<2> : ssm_conv_history_f32<1>;
     ggml_cuda_kernel_launch(kernel, params, static_cast<const float *>(history->data),
             static_cast<const float *>(x->data), static_cast<const float *>(weights->data), y,
             static_cast<float *>(slots->data), x->nb[1] / sizeof(float), slots->nb[1] / sizeof(float), channels);
@@ -304,4 +319,11 @@ void ggml_cuda_op_ssm_conv_history(ggml_backend_cuda_context & ctx, ggml_tensor 
         return true;
     }();
     GGML_UNUSED(logged);
+    if (dst->ne[1] == 3) {
+        static const bool logged_three = [] {
+            GGML_LOG_INFO("CUDA SSM convolution history applied: MTP positions=3 rollback_slots=3\n");
+            return true;
+        }();
+        GGML_UNUSED(logged_three);
+    }
 }

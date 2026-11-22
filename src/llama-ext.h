@@ -222,6 +222,15 @@ struct llama_expert_staging_telemetry {
     uint64_t retry_us = 0;
     uint64_t upload_wait_us = 0;
     uint64_t direct_bytes = 0;
+    uint64_t callback_calls = 0;
+    uint64_t callback_us = 0;
+    uint64_t router_us = 0;
+    uint64_t plan_us = 0;
+    uint64_t callback_memcpy_us = 0;
+    uint64_t submit_us = 0;
+    uint64_t completion_us = 0;
+    uint64_t promotion_us = 0;
+    uint64_t map_us = 0;
 };
 LLAMA_API llama_expert_staging_telemetry llama_get_expert_staging_telemetry();
 LLAMA_API int64_t llama_set_expert_prompt_trace_request(int64_t request);
