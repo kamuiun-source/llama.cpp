@@ -5837,6 +5837,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+#ifdef GGML_USE_HIP
+    static const bool disable_gfx906_graphs = ggml_cuda_env_flag("GGML_HIP_GFX906_DISABLE_GRAPHS");
+    if (disable_gfx906_graphs && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+        static std::once_flag log_flag;
+        std::call_once(log_flag, [] { GGML_LOG_INFO("HIP Graphs disabled on gfx906 (GGML_HIP_GFX906_DISABLE_GRAPHS=1)\n"); });
+        return false;
+    }
+#endif
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->instances.empty()) {
@@ -6022,10 +6030,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
-
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (!dynamic_moe_routes && graph->is_enabled()) {
+    const bool graphs_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    if (!dynamic_moe_routes && graphs_enabled) {
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
