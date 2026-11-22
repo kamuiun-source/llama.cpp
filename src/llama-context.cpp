@@ -24,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -731,8 +732,19 @@ void llama_context::init_mtp_vocab_subset() {
     }
     const char * path = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
     const char * stats = std::getenv("LLAMA_MTP_DRAFT_VOCAB_STATS");
+    uint32_t prefix = 0;
+    if (const char * value = std::getenv("LLAMA_MTP_DRAFT_VOCAB_PREFIX")) {
+        const char * end = value + std::strlen(value);
+        const auto parsed = std::from_chars(value, end, prefix);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || (prefix > 0 && prefix >= model.vocab.n_tokens())) {
+            throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX must be 0 or a positive integer smaller than the vocabulary size");
+        }
+    }
+    if (prefix > 0 && path && *path) {
+        throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX and LLAMA_MTP_DRAFT_VOCAB cannot both select a subset");
+    }
     auto * source = model.output;
-    if (!path || !*path) {
+    if (prefix == 0 && (!path || !*path)) {
         if (stats && std::strcmp(stats, "1") == 0) {
             LLAMA_LOG_INFO("mtp_draft_vocab: enabled=0 full_rows=%u subset_rows=0 full_head_bytes=%zu subset_head_bytes=0 buffer_bytes=0 full_head_retained=1 target_full_vocab=1\n",
                     model.vocab.n_tokens(), source ? ggml_nbytes(source) : 0);
@@ -748,40 +760,63 @@ void llama_context::init_mtp_vocab_subset() {
             !model.hdmd.rot.empty() || !model.hdmd.inv.empty()) {
         throw std::runtime_error("MTP draft vocabulary requires a contiguous QWEN4EXP single-head Q8_0/F16/BF16/F32 output with scalar scale and no Hadamard folding");
     }
-    const auto ids = llama_read_mtp_vocab(path, model.vocab.n_tokens());
+    if (prefix > 0 && (model.split_mode() == LLAMA_SPLIT_MODE_ROW || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR)) {
+        throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX requires a non-split output head (split mode none or layer)");
+    }
+    std::vector<int64_t> ids;
+    if (prefix > 0) {
+        ids.resize(prefix);
+        std::iota(ids.begin(), ids.end(), int64_t{0});
+    } else {
+        ids = llama_read_mtp_vocab(path, model.vocab.n_tokens());
+    }
     mtp_vocab_ctx.reset(ggml_init({2 * ggml_tensor_overhead() + 1024, nullptr, true}));
     if (!mtp_vocab_ctx) {
         throw std::runtime_error("MTP draft vocabulary metadata allocation failed");
     }
-    mtp_vocab_head = ggml_new_tensor_2d(mtp_vocab_ctx.get(), source->type, source->ne[0], ids.size());
+    mtp_vocab_head = prefix > 0
+        ? ggml_view_2d(mtp_vocab_ctx.get(), source, source->ne[0], prefix, source->nb[1], 0)
+        : ggml_new_tensor_2d(mtp_vocab_ctx.get(), source->type, source->ne[0], ids.size());
     mtp_vocab_ids = ggml_new_tensor_1d(mtp_vocab_ctx.get(), GGML_TYPE_I64, ids.size());
     ggml_set_name(mtp_vocab_head, "mtp_vocab_subset.weight");
     ggml_set_name(mtp_vocab_ids, "mtp_vocab_subset.global_ids");
-    mtp_vocab_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_vocab_ctx.get(), ggml_backend_buffer_get_type(source->buffer)));
+    auto * buft = ggml_backend_buffer_get_type(source->buffer);
+    if (prefix > 0) {
+        if (ggml_backend_view_init(mtp_vocab_head) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("MTP draft vocabulary prefix view initialization failed");
+        }
+        // The prefix view uses the model buffer. Allocate only the scatter indices.
+        mtp_vocab_buffer.reset(ggml_backend_buft_alloc_buffer_n(buft, &mtp_vocab_ids, 1));
+    } else {
+        mtp_vocab_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_vocab_ctx.get(), buft));
+    }
     if (!mtp_vocab_buffer) {
-        throw std::runtime_error("MTP draft vocabulary head allocation failed");
+        throw std::runtime_error("MTP draft vocabulary buffer allocation failed");
     }
     ggml_backend_buffer_set_usage(mtp_vocab_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    constexpr size_t chunk = 128;
-    const size_t stride = source->nb[1];
-    std::vector<uint8_t> staging(std::min(chunk, ids.size()) * stride);
-    std::array<const ggml_tensor *, chunk> sources;
-    std::array<size_t, chunk> offsets, sizes, data_offsets;
-    for (size_t first = 0; first < ids.size(); first += chunk) {
-        const size_t count = std::min(chunk, ids.size() - first);
-        for (size_t i = 0; i < count; ++i) {
-            sources[i] = source;
-            offsets[i] = size_t(ids[first + i]) * stride;
-            sizes[i] = stride;
-            data_offsets[i] = i * stride;
+    if (prefix == 0) {
+        constexpr size_t chunk = 128;
+        const size_t stride = source->nb[1];
+        std::vector<uint8_t> staging(std::min(chunk, ids.size()) * stride);
+        std::array<const ggml_tensor *, chunk> sources;
+        std::array<size_t, chunk> offsets, sizes, data_offsets;
+        for (size_t first = 0; first < ids.size(); first += chunk) {
+            const size_t count = std::min(chunk, ids.size() - first);
+            for (size_t i = 0; i < count; ++i) {
+                sources[i] = source;
+                offsets[i] = size_t(ids[first + i]) * stride;
+                sizes[i] = stride;
+                data_offsets[i] = i * stride;
+            }
+            ggml_backend_tensor_get_n(sources.data(), staging.data(), offsets.data(), sizes.data(), data_offsets.data(), count);
+            ggml_backend_tensor_set(mtp_vocab_head, staging.data(), first * stride, count * stride);
         }
-        ggml_backend_tensor_get_n(sources.data(), staging.data(), offsets.data(), sizes.data(), data_offsets.data(), count);
-        ggml_backend_tensor_set(mtp_vocab_head, staging.data(), first * stride, count * stride);
     }
     ggml_backend_tensor_set(mtp_vocab_ids, ids.data(), 0, ids.size() * sizeof(int64_t));
-    LLAMA_LOG_INFO("mtp_draft_vocab: enabled=1 full_rows=%u subset_rows=%zu full_head_bytes=%zu subset_head_bytes=%zu buffer_bytes=%zu full_head_retained=1 target_full_vocab=1 backend=%s\n",
+    LLAMA_LOG_INFO("mtp_draft_vocab: enabled=1 full_rows=%u subset_rows=%zu full_head_bytes=%zu subset_head_bytes=%zu buffer_bytes=%zu full_head_retained=1 target_full_vocab=1 backend=%s mode=%s\n",
             model.vocab.n_tokens(), ids.size(), ggml_nbytes(source), ggml_nbytes(mtp_vocab_head),
-            ggml_backend_buffer_get_size(mtp_vocab_buffer.get()), ggml_backend_buffer_name(mtp_vocab_buffer.get()));
+            ggml_backend_buffer_get_size(mtp_vocab_buffer.get()), ggml_backend_buffer_name(mtp_vocab_buffer.get()),
+            prefix > 0 ? "prefix" : "file");
 }
 
 llama_context::~llama_context() {
