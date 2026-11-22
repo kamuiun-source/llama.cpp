@@ -4414,11 +4414,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (other->type != unary->type) {
             return false;
         }
-        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
+        const ggml_tensor * input = unary->src[0];
+        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(input)) {
             return false;
         }
+        if (ggml_are_same_shape(other, unary)) {
+            return true;
+        }
 
-        return true;
+        // GDN uses one row of weights for every token of the softplus output.
+        static const bool fuse_bcast = ggml_cuda_env_flag("GGML_CUDA_UNARY_MUL_BCAST");
+        return fuse_bcast && unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS && unary->type == GGML_TYPE_F32 &&
+               mul->src[0] == unary && ggml_are_same_shape(mul, unary) &&
+               !ggml_is_empty(mul) && ggml_is_contiguous(mul) && ggml_is_contiguous(input) &&
+               input->nb[0] == sizeof(float) && other->nb[0] == sizeof(float) &&
+               other->ne[0] == unary->ne[0] && ggml_nrows(other) == 1 &&
+               other->op == GGML_OP_NONE && other->buffer && other->buffer != mul->buffer &&
+               ggml_backend_buffer_get_usage(other->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_SQR
