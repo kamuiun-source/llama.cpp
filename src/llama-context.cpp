@@ -462,6 +462,10 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
     }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !graph_reuse_disable && !model.no_alloc()) {
+        const char * value = std::getenv("LLAMA_MTP_DRAFT_GRAPH_CACHE2");
+        mtp_draft_graph_cache2 = value && std::strcmp(value, "1") == 0;
+    }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
@@ -783,6 +787,11 @@ void llama_context::init_mtp_vocab_subset() {
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    mtp_draft_graph_cache_reset();
+    if (mtp_draft_graph_cache2 || mtp_draft_graph_cache_switches != 0) {
+        LLAMA_LOG_INFO("MTP draft graph cache2: switches=%" PRIu64 " hits=%" PRIu64 "\n",
+                mtp_draft_graph_cache_switches, mtp_draft_graph_cache_hits);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -926,23 +935,48 @@ void llama_context::sched_new(const sched_params & params) {
         return;
     }
 
-    sched.reset(ggml_backend_sched_new(
+    sched = sched_create(params);
+    sched_params_cur = params;
+}
+
+ggml_backend_sched_ptr llama_context::sched_create(const sched_params & params) {
+    ggml_backend_sched_ptr result(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
-    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_copy_callback(result.get(), sched_copy_experts, this);
     if (moe_cache && moe_cache->router_host_ids_enabled()) {
-        ggml_backend_sched_set_host_copy_capture(sched.get(), true);
+        ggml_backend_sched_set_host_copy_capture(result.get(), true);
     }
     if (moe_cache && moe_cache->early_copy_enabled()) {
-        ggml_backend_sched_set_early_copy_callback(sched.get(),
+        ggml_backend_sched_set_early_copy_callback(result.get(),
                 [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
                     auto * lctx = static_cast<llama_context *>(user_data);
                     return lctx->moe_cache->copy(backend, src, dst, graph, false, true);
                 }, this);
     }
-    ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    ggml_backend_sched_set_realloc_callback(result.get(), sched_graph_realloc, this);
+    return result;
+}
 
-    sched_params_cur = params;
+void llama_context::mtp_draft_graph_cache_swap() {
+    // The inactive scheduler has no queued work, including graph-output readbacks.
+    ggml_backend_sched_synchronize(sched.get());
+    std::swap(sched, sched_draft_alt);
+    std::swap(gf_res_prev_active, gf_res_draft_alt_active);
+    sched_draft_alt_active = !sched_draft_alt_active;
+}
+
+void llama_context::mtp_draft_graph_cache_reset() {
+    mtp_draft_graph_primary_small = false;
+    if (sched_draft_alt) {
+        discard_mtp_first_draft_row();
+        if (sched_draft_alt_active) {
+            mtp_draft_graph_cache_swap();
+        }
+        sched_draft_alt.reset();
+        gf_res_draft_alt.reset();
+        gf_res_draft_alt_active = nullptr;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -956,6 +990,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    mtp_draft_graph_cache_reset();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1248,6 +1283,7 @@ bool llama_context::memory_update(bool optimize) {
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
+        mtp_draft_graph_cache_reset();
         for (auto & res : gf_res_prev) {
             res->reset();
         }
@@ -2063,11 +2099,48 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool profile) {
+static constexpr uint32_t mtp_draft_graph_cache_max_tokens = 8;
+
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
+        bool profile, bool draft_cache_eligible) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    const bool draft_cache = mtp_draft_graph_cache2 && draft_cache_eligible && gtype == LLM_GRAPH_TYPE_DECODER_MTP &&
+            ubatch.n_tokens <= mtp_draft_graph_cache_max_tokens && !opt_ctx;
+    if (mtp_draft_graph_cache2 && !draft_cache) {
+        mtp_draft_graph_cache_reset();
+    }
+
+    auto * res = get_gf_res_prev();
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto rebind_graph = [&] {
+        res = get_gf_res_prev();
+        gparams.res = res;
+        gparams.sched = sched.get();
+    };
+    const auto can_reuse = [&] {
+        return !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    };
+
+    bool reuse = false;
+    if (draft_cache) {
+        reuse = can_reuse();
+        if (!reuse && gf_res_prev_active && mtp_draft_graph_primary_small) {
+            if (!sched_draft_alt) {
+                auto alt = std::make_unique<llm_graph_result>(gf_res_reserve->get_max_nodes());
+                sched_draft_alt = sched_create(sched_params_cur);
+                gf_res_draft_alt = std::move(alt);
+            }
+            mtp_draft_graph_cache_swap();
+            rebind_graph();
+            reuse = can_reuse();
+            ++mtp_draft_graph_cache_switches;
+            mtp_draft_graph_cache_hits += reuse;
+        }
     }
 
     static const bool hip_handoff = [] {
@@ -2082,27 +2155,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto * placement = model.expert_placement.get();
     const bool hip_shared_three = hip_handoff && placement && placement->hip_mtp_verify_three &&
             placement->dynamic_resident && !placement->overlap && !placement->hip_mtp_overlap && !placement->hip_mtp_direct_ram;
+    // The alternate draft scheduler can be retired if its allocation fails.
+    auto * verify_sched = draft_cache ? nullptr : sched.get();
     struct scheduler_verify_three_scope {
         ggml_backend_sched_t sched;
         bool previous;
-        ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
-    } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
+        ~scheduler_verify_three_scope() { if (sched) { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); } }
+    } verify_three{verify_sched, verify_sched && ggml_backend_sched_set_target_mtp_verify_three(verify_sched,
             (mtp_verify_three_vulkan_waves || hip_shared_three) && target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
     struct scheduler_verify_four_scope {
         ggml_backend_sched_t sched;
         bool previous;
-        ~scheduler_verify_four_scope() { ggml_backend_sched_set_target_mtp_verify_four(sched, previous); }
-    } verify_four{sched.get(), ggml_backend_sched_set_target_mtp_verify_four(sched.get(),
+        ~scheduler_verify_four_scope() { if (sched) { ggml_backend_sched_set_target_mtp_verify_four(sched, previous); } }
+    } verify_four{verify_sched, verify_sched && ggml_backend_sched_set_target_mtp_verify_four(verify_sched,
             mtp_verify_four_enabled && target_mtp_verify_width == 4 && ubatch.n_tokens == 4)};
 
-    auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
-
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
-
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (draft_cache ? reuse : can_reuse()) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2114,28 +2182,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
-        res->reset();
+        for (;;) {
+            gf_res_prev_active = nullptr;
+            res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+            auto * gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                break;
+            }
+            if (!sched_draft_alt) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
 
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            LLAMA_LOG_WARN("%s: MTP draft graph cache2 disabled after allocation failure\n", __func__);
+            mtp_draft_graph_cache_reset();
+            mtp_draft_graph_cache2 = false;
+            rebind_graph();
         }
 
         gf_res_prev_active = res;
@@ -2158,6 +2230,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (mtp_draft_graph_cache2 && !sched_draft_alt_active) {
+        mtp_draft_graph_primary_small = draft_cache;
+    }
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2709,7 +2784,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
             }
         }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
-                decode_profile && n_tokens_all == 1);
+                decode_profile && n_tokens_all == 1, !prefill && n_tokens_all <= mtp_draft_graph_cache_max_tokens);
         expert_trace.success = res != nullptr;
 
         if (!res) {
@@ -3347,7 +3422,7 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
-    return gf_res_prev[n_outputs > 0].get();
+    return sched_draft_alt_active ? gf_res_draft_alt.get() : gf_res_prev[n_outputs > 0].get();
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -3418,6 +3493,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     discard_mtp_first_draft_row();
+    mtp_draft_graph_cache_reset();
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
@@ -4612,6 +4688,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (sched_draft_alt) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_draft_alt.get(), backend);
+            }
         }
     }
     return ret;

@@ -162,7 +162,8 @@ struct llama_context {
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret,
-                              bool   profile = false);
+                              bool   profile = false,
+                              bool   draft_cache_eligible = false);
 
     bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
     bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }
@@ -329,6 +330,10 @@ private:
 
     // create a new backend scheduler with the given parameters, unless the current one can be reused
     void sched_new(const sched_params & params);
+    ggml_backend_sched_ptr sched_create(const sched_params & params);
+
+    void mtp_draft_graph_cache_swap();
+    void mtp_draft_graph_cache_reset();
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -483,6 +488,16 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // The alternate draft graph keeps its scheduler allocations, as in Castagna's LLAMA_GRAPH_CACHE2.
+    llm_graph_result_ptr gf_res_draft_alt;
+    ggml_backend_sched_ptr sched_draft_alt;
+    llm_graph_result * gf_res_draft_alt_active = nullptr;
+    bool sched_draft_alt_active = false;
+    bool mtp_draft_graph_cache2 = false;
+    bool mtp_draft_graph_primary_small = false;
+    uint64_t mtp_draft_graph_cache_switches = 0;
+    uint64_t mtp_draft_graph_cache_hits = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
