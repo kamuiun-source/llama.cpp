@@ -40,6 +40,7 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+template <bool packed_signs = false>
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -58,8 +59,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1<packed_signs>;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1<packed_signs>;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
@@ -1023,7 +1024,7 @@ struct compact_moe_routes {
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1042,7 +1043,7 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -1230,6 +1231,16 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
+#ifdef GGML_USE_HIP
+static bool ggml_hip_gfx906_iq_sign_decode() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HIP_GFX906_IQ_SIGN_DECODE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
+}
+#endif
+
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1323,6 +1334,26 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#ifdef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
+        if (ncols_dst == 3 && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
+                fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU && !fusion.x_bias && !fusion.gate_bias &&
+                !fusion.x_scale && !fusion.gate_scale && !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
+                ggml_hip_gfx906_iq_sign_decode()) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, compact_moe_routes{});
+            static const bool logged = [] {
+                GGML_LOG_INFO("HIP gfx906 packed IQ sign decoding applied: type=%s routed SwiGLU positions=3\n", ggml_type_name(type));
+                return true;
+            }();
+            GGML_UNUSED(logged);
+            return;
+        }
+    }
+#endif
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
