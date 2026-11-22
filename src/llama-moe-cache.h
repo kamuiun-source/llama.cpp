@@ -60,7 +60,7 @@ public:
     bool early_copy_enabled() const;
     bool router_host_ids_enabled() const;
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile,
-            bool early = false, ggml_backend_sched_t sched = nullptr, bool fixed_mtp_pair = false);
+            bool early = false, ggml_backend_sched_t sched = nullptr, bool fixed_mtp_pair = false, bool mtp_four = false);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

@@ -582,9 +582,18 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr packed_staging;
     ggml_backend_ptr hip_upload_backend;
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
+    bool hip_mtp_slot_async = false;
+    bool hip_mtp4_slot_async = false;
     ggml_backend_buffer_ptr hip_mtp_promotion_staging;
     bool hip_mtp_promotion_async = false;
+    bool hip_mtp4_promotion_async = false;
     packed_promotion hip_mtp_pending_move{};
+    bool hip_mtp_pending_four = false;
+    size_t hip_mtp4_async_maps = 0;
+    size_t hip_mtp4_promotion_submits = 0;
+    size_t hip_mtp4_promotion_commits = 0;
+    size_t hip_mtp4_promotion_bytes = 0;
+    int64_t hip_mtp4_promotion_wait_us = 0;
     size_t tuple_h2d_count = 0;
     size_t tuple_h2d_payload_bytes = 0;
     size_t tuple_h2d_bytes = 0;
@@ -956,21 +965,32 @@ struct llama_moe_cache::impl {
                     }
                     return buffer;
                 };
-                hip_mtp_slot_staging = allocate_pinned("LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP",
-                        placement->maps.size() * sizeof(placement->maps[0].resident));
+                const auto enabled = [](const char * env) {
+                    const char * value = std::getenv(env);
+                    return value && std::strcmp(value, "1") == 0;
+                };
+                const char * slot3 = "LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP";
+                const char * slot4 = "LLAMA_EXPERT_HIP_MTP4_ASYNC_SLOT_MAP";
+                hip_mtp_slot_async = enabled(slot3);
+                hip_mtp4_slot_async = placement->hip_mtp_verify_four && enabled(slot4);
+                if (hip_mtp_slot_async || hip_mtp4_slot_async) {
+                    hip_mtp_slot_staging = allocate_pinned(hip_mtp_slot_async ? slot3 : slot4,
+                            placement->maps.size() * sizeof(placement->maps[0].resident));
+                }
                 if (placement->hip_tuple_dma) {
-                    const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION");
-                    hip_mtp_promotion_async = value && std::strcmp(value, "1") == 0;
+                    hip_mtp_promotion_async = enabled("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION");
+                    hip_mtp4_promotion_async = placement->hip_mtp_verify_four && enabled("LLAMA_EXPERT_HIP_MTP4_ASYNC_PROMOTION");
                 } else {
                     hip_mtp_promotion_staging = allocate_pinned("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION", tuple_bytes);
                     hip_mtp_promotion_async = bool(hip_mtp_promotion_staging);
                 }
-                if (hip_mtp_promotion_async && !hip_upload_backend) {
+                if ((hip_mtp_promotion_async || hip_mtp4_promotion_async) && !hip_upload_backend) {
                     hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
                     if (!hip_upload_backend) {
                         hip_mtp_promotion_staging.reset();
                         hip_mtp_promotion_async = false;
-                        LLAMA_LOG_WARN("HIP MTP3 promotion stream unavailable, using synchronous writeback\n");
+                        hip_mtp4_promotion_async = false;
+                        LLAMA_LOG_WARN("HIP MTP promotion stream unavailable, using synchronous writeback\n");
                     }
                 }
             }
@@ -1623,16 +1643,16 @@ struct llama_moe_cache::impl {
         }
         const int64_t start = ggml_time_us();
         ggml_backend_synchronize(hip_upload_backend.get());
-        hip_mtp_promotion_wait_us += ggml_time_us() - start;
+        (hip_mtp_pending_four ? hip_mtp4_promotion_wait_us : hip_mtp_promotion_wait_us) += ggml_time_us() - start;
         const auto * data = placement->hip_tuple_dma ? hip_mtp_pending_move.planes[0].host_data :
                 static_cast<const uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
         commit_packed_promotion(hip_mtp_pending_move, data);
         packed_writeback_us += ggml_time_us() - start;
-        ++hip_mtp_promotion_commits;
+        ++(hip_mtp_pending_four ? hip_mtp4_promotion_commits : hip_mtp_promotion_commits);
         hip_mtp_pending_move.n_planes = 0;
     }
 
-    void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict) {
+    void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict, bool mtp_four) {
         GGML_ASSERT(!hip_mtp_pending_move.n_planes);
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
         auto * data = move.planes[0].host_data;
@@ -1652,8 +1672,9 @@ struct llama_moe_cache::impl {
             throw;
         }
         hip_mtp_pending_move = move;
-        ++hip_mtp_promotion_submits;
-        hip_mtp_promotion_bytes += move.bytes;
+        hip_mtp_pending_four = mtp_four;
+        ++(mtp_four ? hip_mtp4_promotion_submits : hip_mtp_promotion_submits);
+        (mtp_four ? hip_mtp4_promotion_bytes : hip_mtp_promotion_bytes) += move.bytes;
         packed_writeback_us += ggml_time_us() - start;
     }
 
@@ -2500,7 +2521,7 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,
-            ggml_backend_sched_t sched, bool fixed_mtp_pair) {
+            ggml_backend_sched_t sched, bool fixed_mtp_pair, bool mtp_four) {
         const int64_t callback_start = profile_packed_callback && !early ? ggml_time_us() : 0;
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
@@ -2763,8 +2784,10 @@ struct llama_moe_cache::impl {
             int64_t upload_start_us = 0;
             // Non-verification microbatches have at most two positions. Wide prefill uses its own path.
             const bool fixed_three = placement->hip_mtp_verify_three && src == l.slot_map && ids.size() == 30;
+            const bool fixed_four = mtp_four && placement->hip_mtp_verify_four && src == l.slot_map && ids.size() == 40;
             const bool hip_direct = placement->hip_mtp_direct_ram && fixed_three;
-            const bool hip_async_slot_map = fixed_three && hip_mtp_slot_staging && sched &&
+            const bool hip_async_slot_map = ((fixed_three && hip_mtp_slot_async) || (fixed_four && hip_mtp4_slot_async)) &&
+                    hip_mtp_slot_staging && sched &&
                     ggml_backend_sched_get_n_copies(sched) == 1 && !rtx_expert;
             const bool batch = packed_staging != nullptr || hip_direct || placement->hip_tuple_dma;
             if (batch) {
@@ -3107,9 +3130,9 @@ struct llama_moe_cache::impl {
             }
             if (evict >= 0 && !overlap_submitted) {
                 const int64_t promotion_start = fine_profile ? ggml_time_us() : 0;
-                if (fixed_three && hip_mtp_promotion_async && !rtx_expert && sched &&
+                if (((fixed_three && hip_mtp_promotion_async) || (fixed_four && hip_mtp4_promotion_async)) && !rtx_expert && sched &&
                         ggml_backend_sched_get_n_copies(sched) == 1) {
-                    submit_hip_mtp_promotion(l, il, promote_index, evict);
+                    submit_hip_mtp_promotion(l, il, promote_index, evict, fixed_four);
                 } else {
                     promote_packed(l, il, promote_index, evict);
                 }
@@ -3154,8 +3177,12 @@ struct llama_moe_cache::impl {
                     // This callback's destination wait has drained any prior use of this layer's staging.
                     std::memcpy(staging, slots.data(), bytes_map);
                     ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
-                    ++hip_mtp_async_maps;
-                    hip_mtp_async_map_bytes += bytes_map;
+                    if (fixed_four) {
+                        ++hip_mtp4_async_maps;
+                    } else {
+                        ++hip_mtp_async_maps;
+                        hip_mtp_async_map_bytes += bytes_map;
+                    }
                 } else {
                     ggml_backend_tensor_set(dst, slots.data(), 0, bytes_map);
                     packed_synchronous_maps += defer_slot_map_requested;
@@ -3329,9 +3356,18 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP MTP3 direct RAM: steps=%zu planes=%zu bytes=%zu staging_bytes=0 completion_wait_us=%" PRIu64 "\n",
                         hip_direct_upload_steps, hip_direct_upload_planes, hip_direct_upload_bytes, hip_direct_upload_wait_us);
             }
-            if (hip_mtp_slot_staging) {
+            if (hip_mtp_slot_staging && hip_mtp_slot_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",
                         hip_mtp_async_maps, hip_mtp_async_map_bytes);
+            }
+            if (hip_mtp_slot_staging && hip_mtp4_slot_async) {
+                LLAMA_LOG_INFO("packed HIP MTP4 async slot map: copies=%zu bytes=%zu\n", hip_mtp4_async_maps,
+                        hip_mtp4_async_maps * sizeof(placement->maps[0].resident));
+            }
+            if (hip_mtp4_promotion_async) {
+                LLAMA_LOG_INFO("packed HIP MTP4 async promotion: submits=%zu commits=%zu bytes=%zu wait_ms=%.3f pending=%d\n",
+                        hip_mtp4_promotion_submits, hip_mtp4_promotion_commits, hip_mtp4_promotion_bytes,
+                        hip_mtp4_promotion_wait_us / 1000.0, hip_mtp_pending_four && hip_mtp_pending_move.n_planes != 0);
             }
             if (hip_mtp_promotion_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async promotion: submits=%zu commits=%zu bytes=%zu wait_ms=%.3f pending=%d\n",
@@ -3686,8 +3722,8 @@ bool llama_moe_cache::router_host_ids_enabled() const {
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,
-        ggml_backend_sched_t sched, bool fixed_mtp_pair) {
-    return pimpl->copy(backend, src, dst, graph, profile, early, sched, fixed_mtp_pair);
+        ggml_backend_sched_t sched, bool fixed_mtp_pair, bool mtp_four) {
+    return pimpl->copy(backend, src, dst, graph, profile, early, sched, fixed_mtp_pair, mtp_four);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

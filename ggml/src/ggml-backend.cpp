@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-mtp.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1429,7 +1430,10 @@ struct ggml_backend_sched {
     bool measure_hip_handoff;
     bool trace_hip_handoff_wait;
     bool async_hip_input;
+    bool async_hip_mtp4_input;
     bool async_hip_return;
+    bool async_hip_mtp4_return;
+    ggml_backend_sched_hip_handoff_stats hip_mtp4_return_stats;
     ggml_backend_t hip_async_input_pending;
     ggml_backend_sched_dual_pinned hip_handoff;
     ggml_backend_sched_hip_handoff_stats hip_handoff_stats[2];
@@ -1443,6 +1447,10 @@ struct ggml_backend_sched {
     bool shared_input_get_tried;
     bool target_mtp_verify;
     bool target_mtp_verify_three;
+    bool target_mtp_verify_four;
+    ggml_backend_sched_hip_handoff_stats hip_mtp4_input_stats;
+    int64_t hip_mtp4_source_wait_us;
+    int64_t hip_mtp4_destination_wait_us;
     bool mtp_three_shared_input;
     bool mtp_three_router_upload;
     bool mtp_three_merge_empty_wave;
@@ -2435,7 +2443,9 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
     }
     pinned.tried = true;
     constexpr size_t alignment = 64 * 1024;
-    const size_t capacity = shared_host_capacity * (1 + sched->async_hip_input + sched->async_hip_return);
+    const size_t capacity = shared_host_capacity *
+            (1 + (sched->async_hip_input || sched->async_hip_mtp4_input) +
+             (sched->async_hip_return || sched->async_hip_mtp4_return));
     auto * allocation = malloc(capacity + alignment - 1);
     if (!allocation) {
         GGML_LOG_WARN("packed HIP MTP3 dual-pinned handoff: host allocation failed, using ordinary staging\n");
@@ -2471,7 +2481,8 @@ static void ggml_backend_sched_record_hip_handoff(ggml_backend_sched_t sched, gg
         size_t count, size_t bytes, bool pinned, const ggml_backend_handoff_times & times,
         bool async_input = false, bool async_return = false) {
     const int direction = strncmp(ggml_backend_name(src), "CUDA", 4) == 0 ? 0 : 1;
-    auto & stats = sched->hip_handoff_stats[direction];
+    auto & stats = async_return && sched->target_mtp_verify_four ? sched->hip_mtp4_return_stats :
+            sched->hip_handoff_stats[direction];
     ++stats.ops;
     stats.copies += count;
     stats.bytes += bytes;
@@ -2629,7 +2640,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-    const bool measure_hip = sched->measure_hip_handoff && sched->target_mtp_verify_three;
+    const bool use_hip_return = hip_return && hip_return->source && hip_return->source == input_backend &&
+            hip_return->input == input && hip_return->copy == input_cpy;
+    const bool measure_hip = (sched->measure_hip_handoff && sched->target_mtp_verify_three) ||
+            (use_hip_return && sched->target_mtp_verify_four);
     const bool cuda_hip_pair = input_backend && (sched->skip_hip_device_dst_wait || sched->trace_handoff_graph || measure_hip) &&
             ggml_backend_sched_is_cuda_pair(input_backend, split_backend, "ROCm");
     ggml_backend_handoff_times handoff;
@@ -2643,8 +2657,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_sched_device_input_buffer(input_backend, input, bytes) &&
             ggml_backend_sched_device_input_buffer(split_backend, input_cpy, bytes);
     handoff.enabled |= eligible;
-    const bool use_hip_return = hip_return && hip_return->source && hip_return->source == input_backend &&
-            hip_return->input == input && hip_return->copy == input_cpy;
     GGML_ASSERT(!use_hip_return || eligible);
     const ggml_tensor * trace_input = input;
 
@@ -3096,8 +3108,10 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         if (!src || (count && src != src_backend)) {
             break;
         }
+        const bool mtp4_input = sched->async_hip_mtp4_input && sched->target_mtp_verify_four &&
+                strncmp(ggml_backend_name(src), "CUDA", 4) == 0;
         if (!count && !(sched->batch_device_inputs && ggml_backend_sched_is_cuda_vulkan_pair(src, dst_backend)) &&
-                !(sched->batch_hip_device_inputs && ggml_backend_sched_is_cuda_pair(src, dst_backend, "ROCm"))) {
+                !((sched->batch_hip_device_inputs || mtp4_input) && ggml_backend_sched_is_cuda_pair(src, dst_backend, "ROCm"))) {
             break;
         }
         ggml_tensor * copy = tensor_copy(input, backend_id, sched->cur_copy);
@@ -3167,9 +3181,12 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     }
     const bool measure_hip = sched->measure_hip_handoff && sched->target_mtp_verify_three && !upload.compute &&
             bytes <= shared_host_capacity && ggml_backend_sched_is_cuda_pair(src_backend, dst_backend, "ROCm");
-    auto * pinned = measure_hip && sched->dual_pinned_hip_handoff ?
+    const bool mtp4_input = sched->async_hip_mtp4_input && sched->target_mtp_verify_four &&
+            strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 &&
+            ggml_backend_sched_is_cuda_pair(src_backend, dst_backend, "ROCm");
+    auto * pinned = ((measure_hip && sched->dual_pinned_hip_handoff) || (mtp4_input && bytes <= shared_host_capacity)) ?
             ggml_backend_sched_get_dual_pinned(sched, src_backend, dst_backend) : nullptr;
-    const bool async_input = pinned && sched->async_hip_input && strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 &&
+    const bool async_input = pinned && (sched->async_hip_input || mtp4_input) && strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 &&
             dst_backend->iface.set_tensor_async && !sched->profile.enabled && !sched->callback_eval &&
             (!sched->hip_async_input_pending || sched->hip_async_input_pending == dst_backend);
     if (!upload.compute && !pinned && sched->device_input_staging_size < bytes) {
@@ -3186,7 +3203,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     const int64_t start_us = profile.enabled ? ggml_time_us() : 0;
 
     ggml_backend_handoff_times handoff;
-    handoff.enabled = sched->trace_handoff_graph != 0 || measure_hip;
+    handoff.enabled = sched->trace_handoff_graph != 0 || measure_hip || mtp4_input;
     bool producer_copy = false;
     if (upload.compute && !sched->target_mtp_verify_three) {
         if (sched->target_mtp_verify) {
@@ -3258,6 +3275,20 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
             async_input ? "host_batch_dual_pinned_async_input" : pinned ? "host_batch_dual_pinned" : "host_batch");
     if (measure_hip) {
         ggml_backend_sched_record_hip_handoff(sched, src_backend, count, bytes, pinned != nullptr, handoff, async_input);
+    }
+    if (mtp4_input) {
+        auto & stats = sched->hip_mtp4_input_stats;
+        ++stats.ops;
+        stats.copies += count;
+        stats.bytes += bytes;
+        stats.read_us += handoff.read_end_us - handoff.read_start_us;
+        stats.async_input_batches += async_input;
+        stats.async_input_copies += async_input ? count : 0;
+        stats.async_input_bytes += async_input ? bytes : 0;
+        stats.enqueue_us += async_input ? handoff.write_us : 0;
+        stats.write_us += async_input ? 0 : handoff.write_us;
+        sched->hip_mtp4_source_wait_us += handoff.source_wait_us;
+        sched->hip_mtp4_destination_wait_us += handoff.destination_wait_us;
     }
     for (int i = 0; i < count; ++i) {
         if (auto * entry = ggml_backend_sched_host_copy_entry(host_copies, src_backend, dst_backend, srcs[i])) {
@@ -3572,7 +3603,7 @@ static void ggml_backend_sched_start_hip_return(ggml_backend_sched_t sched, ggml
     if (strncmp(input->name, "ffn_moe_out-", sizeof("ffn_moe_out-") - 1) != 0 ||
             input->op != GGML_OP_ADD || !(input->flags & GGML_TENSOR_FLAG_COMPUTE) ||
             (input->flags & GGML_TENSOR_FLAG_INPUT) || input->type != GGML_TYPE_F32 ||
-            input->ne[0] != 2560 || input->ne[1] != 3 || !ggml_is_matrix(input) ||
+            input->ne[0] != 2560 || input->ne[1] != (sched->target_mtp_verify_four ? 4 : 3) || !ggml_is_matrix(input) ||
             !sched->hv_tensor_requires_copy[hash_id(input)] ||
             ggml_backend_sched_get_tensor_backend(sched, input) != source ||
             std::find(routed.graph.nodes, routed.graph.nodes + routed.graph.n_nodes, input) ==
@@ -3593,7 +3624,7 @@ static void ggml_backend_sched_start_hip_return(ggml_backend_sched_t sched, ggml
     pending.source = source;
     pending.input = input;
     pending.copy = copy;
-    pending.data = pinned + shared_host_capacity * (1 + sched->async_hip_input);
+    pending.data = pinned + shared_host_capacity * (1 + (sched->async_hip_input || sched->async_hip_mtp4_input));
     pending.enqueue_start_us = ggml_time_us();
     ggml_backend_tensor_get_async(source, input, pending.data, 0, bytes);
     pending.enqueue_end_us = ggml_time_us();
@@ -3725,7 +3756,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         continue;
                     }
                 }
-                if ((sched->batch_device_inputs || sched->batch_hip_device_inputs) && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                if ((sched->batch_device_inputs || sched->batch_hip_device_inputs ||
+                        (sched->async_hip_mtp4_input && sched->target_mtp_verify_four)) &&
+                        !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
                     const int count = ggml_backend_sched_batch_device_inputs(sched, split, input_id, host_copies, upload);
                     if (count > 0) {
                         input_id += count - 1;
@@ -3882,7 +3915,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         timing.submit_us += submit_us;
                         timing.wait_us += wait_us;
                     }, &data) : ggml_backend_graph_compute_async(split_backend, graph);
-            if (status == GGML_STATUS_SUCCESS && sched->async_hip_return && sched->target_mtp_verify_three &&
+            if (status == GGML_STATUS_SUCCESS && ((sched->async_hip_return && sched->target_mtp_verify_three) ||
+                    (sched->async_hip_mtp4_return && sched->target_mtp_verify_four)) &&
                     !profile.enabled && !sched->callback_eval && !split->has_custom &&
                     graph == &split->graph && routed_split_id == split_id && split_id + 1 < sched->n_splits) {
                 ggml_backend_sched_start_hip_return(sched, hip_return, *split, splits[split_id + 1]);
@@ -4035,9 +4069,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
+    const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
+    const char * async_hip_mtp4_return = getenv("GGML_SCHED_HIP_MTP4_ASYNC_RETURN");
     const bool allow_hip_handoff = placement && *placement && sched->n_copies == 1;
     const bool allow_hip_batch = allow_hip_handoff && batch_hip && strcmp(batch_hip, "1") == 0;
+    const bool allow_hip_mtp4_input = allow_hip_handoff && async_hip_mtp4_input && strcmp(async_hip_mtp4_input, "1") == 0;
+    const bool allow_hip_mtp4_return = allow_hip_handoff && async_hip_mtp4_return && strcmp(async_hip_mtp4_return, "1") == 0;
     const bool allow_hip_wait_skip = allow_hip_handoff && skip_hip_wait && strcmp(skip_hip_wait, "1") == 0;
     const bool allow_hip_shared = allow_hip_handoff && overlap_hip_shared && strcmp(overlap_hip_shared, "1") == 0;
     const bool allow_hip_dual_pinned = allow_hip_handoff && dual_pinned_hip && strcmp(dual_pinned_hip, "1") == 0;
@@ -4049,13 +4087,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int src = 0; src < n_backends; ++src) {
         for (int dst = src + 1; dst < n_backends; ++dst) {
             cuda_vulkan |= ggml_backend_sched_is_cuda_vulkan_pair(backends[src], backends[dst]);
-            if (allow_hip_batch || allow_hip_wait_skip || allow_hip_shared || allow_hip_timing) {
+            if (allow_hip_batch || allow_hip_wait_skip || allow_hip_shared || allow_hip_timing ||
+                    allow_hip_mtp4_input || allow_hip_mtp4_return) {
                 cuda_hip |= ggml_backend_sched_is_cuda_pair(backends[src], backends[dst], "ROCm");
             }
         }
     }
     cuda_vulkan = cuda_vulkan && placement && *placement;
     sched->batch_hip_device_inputs = allow_hip_batch && cuda_hip;
+    sched->async_hip_mtp4_input = allow_hip_mtp4_input && cuda_hip;
+    sched->async_hip_mtp4_return = allow_hip_mtp4_return && cuda_hip;
     sched->skip_hip_device_dst_wait = allow_hip_wait_skip && cuda_hip;
     sched->dual_pinned_hip_handoff = allow_hip_dual_pinned && cuda_hip;
     sched->measure_hip_handoff = allow_hip_timing && cuda_hip;
@@ -4299,10 +4340,23 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("packed HIP MTP3 async input: batches=%zu copies=%zu bytes=%zu enqueue_ms=%.3f\n",
                 stats.async_input_batches, stats.async_input_copies, stats.async_input_bytes, stats.enqueue_us / 1000.0);
     }
+    if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
+        const auto & stats = sched->hip_mtp4_input_stats;
+        GGML_LOG_INFO("packed HIP MTP4 input: batches=%zu copies=%zu bytes=%zu async_batches=%zu async_copies=%zu async_bytes=%zu"
+                " source_wait_ms=%.3f destination_wait_ms=%.3f read_ms=%.3f enqueue_ms=%.3f sync_write_ms=%.3f\n",
+                stats.ops, stats.copies, stats.bytes, stats.async_input_batches, stats.async_input_copies, stats.async_input_bytes,
+                sched->hip_mtp4_source_wait_us / 1000.0, sched->hip_mtp4_destination_wait_us / 1000.0,
+                stats.read_us / 1000.0, stats.enqueue_us / 1000.0, stats.write_us / 1000.0);
+    }
     if (sched->async_hip_return) {
         const auto & stats = sched->hip_handoff_stats[1];
         GGML_LOG_INFO("packed HIP MTP3 async return: copies=%zu bytes=%zu d2h_enqueue_ms=%.3f\n",
                 stats.async_return_copies, stats.async_return_bytes, stats.return_enqueue_us / 1000.0);
+    }
+    if (sched->async_hip_mtp4_return && sched->hip_mtp4_return_stats.ops) {
+        const auto & stats = sched->hip_mtp4_return_stats;
+        GGML_LOG_INFO("packed HIP MTP4 async return: copies=%zu bytes=%zu d2h_enqueue_ms=%.3f write_ms=%.3f\n",
+                stats.async_return_copies, stats.async_return_bytes, stats.return_enqueue_us / 1000.0, stats.write_us / 1000.0);
     }
     if (sched->routed_stats_rounds) {
         GGML_LOG_INFO("mtp routed schedule: rounds=%zu vulkan1_aggregate_add=%zu other_backend_aggregate_add=%zu other_aggregate_op=%zu\n",
@@ -4480,6 +4534,12 @@ bool ggml_backend_sched_set_target_mtp_verify(ggml_backend_sched_t sched, bool e
 bool ggml_backend_sched_set_target_mtp_verify_three(ggml_backend_sched_t sched, bool enabled) {
     const bool previous = sched->target_mtp_verify_three;
     sched->target_mtp_verify_three = enabled;
+    return previous;
+}
+
+bool ggml_backend_sched_set_target_mtp_verify_four(ggml_backend_sched_t sched, bool enabled) {
+    const bool previous = sched->target_mtp_verify_four;
+    sched->target_mtp_verify_four = enabled;
     return previous;
 }
 

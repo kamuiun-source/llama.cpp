@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-mtp.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -2087,6 +2088,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ~scheduler_verify_three_scope() { ggml_backend_sched_set_target_mtp_verify_three(sched, previous); }
     } verify_three{sched.get(), ggml_backend_sched_set_target_mtp_verify_three(sched.get(),
             (mtp_verify_three_vulkan_waves || hip_shared_three) && target_mtp_verify_width == 3 && ubatch.n_tokens == 3)};
+    struct scheduler_verify_four_scope {
+        ggml_backend_sched_t sched;
+        bool previous;
+        ~scheduler_verify_four_scope() { ggml_backend_sched_set_target_mtp_verify_four(sched, previous); }
+    } verify_four{sched.get(), ggml_backend_sched_set_target_mtp_verify_four(sched.get(),
+            mtp_verify_four_enabled && target_mtp_verify_width == 4 && ubatch.n_tokens == 4)};
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -3594,7 +3601,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the slot maps of the MoE cache
     const bool fixed_mtp_pair = lctx->target_mtp_verify_width == 2 && !lctx->mtp_verify_three_enabled;
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active, false, lctx->sched.get(), fixed_mtp_pair)) {
+    const bool mtp_four = lctx->mtp_verify_four_enabled && lctx->target_mtp_verify_width == 4;
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->decode_profile_active, false, lctx->sched.get(),
+            fixed_mtp_pair, mtp_four)) {
         return true;
     }
 
