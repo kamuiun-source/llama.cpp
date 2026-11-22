@@ -2026,7 +2026,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     const uint32_t n_tokens = ubatch.n_tokens;
 
     res.clear();
-    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+    res.resize(size_t(n_tokens)*n, LLAMA_TOKEN_NULL);
 
     if (n == 0) {
         return;
@@ -2058,8 +2058,17 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         // TODO: a token that belongs to more than one sequence has an ambiguous history.
         //       the n-gram architectures have to reject such batches
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const size_t row = size_t(i)*n;
 
-        for (uint32_t j = 0; j < n; ++j) {
+        uint32_t j = 0;
+        if (!by_order && n > 1 && i > 0 && ubatch.seq_id[i - 1][0] == seq_id &&
+                int64_t(ubatch.pos[i]) - ubatch.pos[i - 1] == 1) {
+            // The previous row's suffix queries the same sequence positions.
+            j = n - 1;
+            std::copy_n(res.data() + row - n + 1, j, res.data() + row);
+        }
+
+        for (; j < n; ++j) {
             const llama_pos d = (llama_pos) (n - j);
 
             llama_pos p;
@@ -2076,7 +2085,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 continue;
             }
 
-            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+            res[row + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
         }
     }
 }
