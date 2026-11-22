@@ -1020,11 +1020,15 @@ struct compact_moe_routes {
     uint8_t lanes[30]{};
 };
 
+static constexpr int iq3_lds_ncols = 2560;
+static constexpr int iq3_lds_tokens = 3;
+static constexpr int iq3_lds_activation_blocks = iq3_lds_ncols / QK8_1;
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false, bool iq3_lds_prefetch = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1044,6 +1048,29 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
+
+    const uint32_t * staged_grid = nullptr;
+    const block_q8_1 * staged_y = nullptr;
+    if constexpr (iq3_lds_prefetch) {
+        static_assert(type == GGML_TYPE_IQ3_XXS && c_rows_per_block == 2 && has_fusion && !compact && packed_signs);
+        static_assert(sizeof(block_q8_1) % sizeof(uint32_t) == 0 && alignof(block_q8_1) <= alignof(uint32_t));
+        constexpr int grid_size = 256;
+        constexpr int activation_words = iq3_lds_activation_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
+        __shared__ uint32_t grid[grid_size];
+        __shared__ uint32_t activation[iq3_lds_tokens][activation_words];
+
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < grid_size; i += iq3_lds_tokens * warp_size) {
+            grid[i] = iq3xxs_grid[i];
+        }
+        const auto * src = reinterpret_cast<const uint32_t *>(static_cast<const block_q8_1 *>(vy) + threadIdx.y * stride_col_y);
+        auto * token_activation = activation[threadIdx.y];
+        for (int i = threadIdx.x; i < activation_words; i += warp_size) {
+            token_activation[i] = src[i];
+        }
+        __syncthreads();
+        staged_grid = grid;
+        staged_y = reinterpret_cast<const block_q8_1 *>(token_activation);
+    }
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -1106,16 +1133,47 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
+    if constexpr (iq3_lds_prefetch) {
+        const int kbx = threadIdx.x / (qi/vdr);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
+        const int kbx_next = kbx + blocks_per_iter;
+        const bool has_next = kbx_next < blocks_per_row_x;
+        const auto * up = static_cast<const block_iq3_xxs *>(vx) + kbx_offset;
+        const auto * gate = static_cast<const block_iq3_xxs *>(vgate) + kbx_offset;
+        const auto * activation = staged_y + kqs/2;
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            const int row = i * stride_row_x;
+            const auto up_current = load_iq3_xxs_mmvq_weights(up[row + kbx], kqs);
+            const auto gate_current = load_iq3_xxs_mmvq_weights(gate[row + kbx], kqs);
+            iq3_xxs_mmvq_weights up_next, gate_next;
+            if (has_next) {
+                up_next = load_iq3_xxs_mmvq_weights(up[row + kbx_next], kqs);
+                gate_next = load_iq3_xxs_mmvq_weights(gate[row + kbx_next], kqs);
+            }
+
+            const auto & current = activation[kbx * (qk/QK8_1)];
+            tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_current, current, staged_grid);
+            tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_current, current, staged_grid);
+            if (has_next) {
+                const auto & next = activation[kbx_next * (qk/QK8_1)];
+                tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_next, next, staged_grid);
+                tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_next, next, staged_grid);
+            }
+        }
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
                 }
             }
         }
@@ -1341,10 +1399,32 @@ static void mul_mat_vec_q_moe_launch(
                 fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU && !fusion.x_bias && !fusion.gate_bias &&
                 !fusion.x_scale && !fusion.gate_scale && !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
                 ggml_hip_gfx906_iq_sign_decode()) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true>, launch_params,
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                ncols_dst, ids_stride, compact_moe_routes{});
+            const auto launch = [&](auto lds) {
+                constexpr bool prefetch = decltype(lds)::value;
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true, prefetch>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride, compact_moe_routes{});
+            };
+            bool use_lds = false;
+            if constexpr (type == GGML_TYPE_IQ3_XXS) {
+                static const bool lds_prefetch = [] {
+                    const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                use_lds = lds_prefetch && stride_col_y == iq3_lds_activation_blocks;
+                if (use_lds) {
+                    launch(std::true_type{});
+                    static const bool logged_lds = [] {
+                        GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU LDS prefetch applied: positions=3\n");
+                        return true;
+                    }();
+                    GGML_UNUSED(logged_lds);
+                }
+            }
+            if (!use_lds) {
+                launch(std::false_type{});
+            }
             static const bool logged = [] {
                 GGML_LOG_INFO("HIP gfx906 packed IQ sign decoding applied: type=%s routed SwiGLU positions=3\n", ggml_type_name(type));
                 return true;

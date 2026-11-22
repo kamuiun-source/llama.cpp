@@ -1246,20 +1246,27 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
+struct iq3_xxs_mmvq_weights {
+    int2 qs;
+    uint32_t aux;
+    ggml_half d;
+};
+
+static __device__ __forceinline__ iq3_xxs_mmvq_weights load_iq3_xxs_mmvq_weights(const block_iq3_xxs & bq3, int iqs) {
+    return {make_int2(get_int_b2(bq3.qs, iqs), get_int_b2(bq3.qs, iqs+1)),
+        uint32_t(get_int_b2(bq3.qs, QK_K/16 + iqs/2)), bq3.d};
+}
+
 template <bool packed_signs>
-static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-
-    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
-
-    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
-    const uint8_t * q3 = (const uint8_t *) &q3_packed;
-    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_loaded(
+        const iq3_xxs_mmvq_weights & weight, const block_q8_1 & activation, const uint32_t * grid) {
+    const uint8_t * q3 = (const uint8_t *) &weight.qs;
+    const uint32_t aux32 = weight.aux;
 
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         int grid_l, grid_h;
@@ -1274,8 +1281,8 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
             grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         }
 
-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        const int u0 = get_int_b4(activation.qs, l0 + 0);
+        const int u1 = get_int_b4(activation.qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
@@ -1283,8 +1290,15 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 
     const int ls = aux32 >> 28;
     sumi = (ls*sumi + sumi/2)/2;
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    const float d = __half2float(weight.d) * __low2float(activation.ds);
     return d * sumi;
+}
+
+template <bool packed_signs>
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const auto * bq3 = static_cast<const block_iq3_xxs *>(vbq) + kbx;
+    return vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(load_iq3_xxs_mmvq_weights(*bq3, iqs), bq8_1[iqs/2], iq3xxs_grid);
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2
