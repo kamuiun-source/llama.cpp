@@ -8,6 +8,8 @@
 
 ### Linux ROCm の転送改善
 
+- 統合版 `8aa09a859` から `codex/rocm-decode-next` を分岐。PLE行ID `5ec6ae3c0`、MTPドラフト `fbca53912`、Expert連続DMA `b46b424f1`、PLE履歴参照 `8a3b2b911`、CUDAストリーム読み出し `f58e2ba98` を独立してコミット。単体確認と対象ビルドは完了。RTX→MI50の新規単体テストはOFF/ONとも成功。実モデルの固定5問と採否判断は後回し。 [デコードの変更と確認](../rocm/10-decode-pipeline.md#デコードの待ち時間とcpu処理の見直し)
+
 - 固定4幅の作業はいったん区切り、`codex/rocm-auto-mtp` の実装と計測記録を `codex/rocm-integrated-test` に取り込む。通常運用は実績の多い固定3幅を基準とする。固定3幅でも長い待ちがあり、固定4幅もサスペンド抑止下で複数回完走しているため、幅による安定性の差は未確定。
 
 - 4幅のGPU間転送計測を補い、Shared Expert先行実行、SSM履歴融合、3候補用 `device_pending`、gfx906 IQ3_XXSの1行起動を既定OFFのオプションとして追加。Lunaの全ON・ログレベル4確認は5問完走。生成640 IDとMTP採用388/726が保存済み固定4幅と一致し、全経路が発動。生成33.81 tok/s、本体検証66.73 ms/回。ログレベル3で採った参照37.27 tok/s、60.03 msとの差は項目別に帰属できない。 [固定4幅の実装と計測](../rocm/10-decode-pipeline.md#固定4幅に残る実装)
