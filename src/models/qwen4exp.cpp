@@ -1166,11 +1166,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         const char * value = std::getenv("GGML_CUDA_SSM_CONV_HISTORY_MTP3");
         return value && std::strcmp(value, "1") == 0;
     }();
+    static const bool mtp4_conv_history = [] {
+        const char * value = std::getenv("GGML_CUDA_SSM_CONV_HISTORY_MTP4");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     const auto * placement = model.expert_placement.get();
-    const bool fused_three = mtp3_conv_history && target_mtp_verify_packed && n_seq_tokens == 3 &&
-            placement && placement->dynamic_resident && !placement->overlap && cparams.n_rs_seq >= 2;
-    const int n_history_slots = fused_three ? 3 : 2;
-    if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2 || fused_three) &&
+    const bool packed_conv_history = target_mtp_verify_packed && placement && placement->dynamic_resident && !placement->overlap;
+    const bool fused_three = mtp3_conv_history && packed_conv_history && n_seq_tokens == 3 && cparams.n_rs_seq >= 2;
+    const bool fused_four = mtp4_conv_history && packed_conv_history && n_seq_tokens == 4 &&
+            placement->hip_mtp_verify_four && cparams.n_rs_seq >= 3;
+    const int n_history_slots = fused_four ? 4 : fused_three ? 3 : 2;
+    if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2 || fused_three || fused_four) &&
             conv_kernel_size == 4 && conv_states_all->buffer && conv_kernel->buffer && conv_states_all->type == GGML_TYPE_F32 &&
             conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_states_all->ne[0])) {
         auto * dev = model.dev_layer(il);

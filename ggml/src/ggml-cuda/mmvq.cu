@@ -1274,8 +1274,13 @@ static void mul_mat_vec_q_moe_launch(
             }
             return value && std::strcmp(value, "4") == 0 ? 4 : 2;
         }();
-        if (swiglu_rows != 2 && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
-                (ncols_dst == 2 || ncols_dst == 3) && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
+        static const bool mtp4_swiglu_single_row = [] {
+            const char * value = std::getenv("GGML_HIP_GFX906_MOE_SWIGLU_MTP4_ROWS");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const int swiglu_rows_selected = ncols_dst == 4 ? (mtp4_swiglu_single_row ? 1 : 2) : swiglu_rows;
+        if (swiglu_rows_selected != 2 && ncols_x == 2560 && nrows_x == 640 && nchannels_dst == 10 && nchannels_y.z == 1 &&
+                ncols_dst >= 2 && ncols_dst <= 4 && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
                 !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
                 !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
@@ -1290,10 +1295,17 @@ static void mul_mat_vec_q_moe_launch(
                     stride_channel_x, stride_channel_y, stride_channel_dst,
                     ncols_dst, ids_stride, compact_moe_routes{});
             };
-            if (swiglu_rows == 1) {
+            if (swiglu_rows_selected == 1) {
                 launch(std::integral_constant<int, 1>{});
             } else {
                 launch(std::integral_constant<int, 4>{});
+            }
+            if (ncols_dst == 4) {
+                static const bool logged = [] {
+                    GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU applied: MTP positions=4 rows_per_block=1\n");
+                    return true;
+                }();
+                GGML_UNUSED(logged);
             }
             return;
         }
