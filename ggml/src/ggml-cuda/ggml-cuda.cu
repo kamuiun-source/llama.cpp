@@ -4488,6 +4488,59 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_cuda_try_gdn_gated_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_GDN_GATED_NORM");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_ADA_LOVELACE ||
+            !ctx.stream_context().concurrent_events.empty() ||
+            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+        return false;
+    }
+
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * weighted = cgraph->nodes[i + 1];
+    const ggml_tensor * sigmoid = cgraph->nodes[i + 2];
+    ggml_tensor * dst = cgraph->nodes[i + 3];
+    if (weighted->src[0] != norm || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+            dst->src[0] != weighted || dst->src[1] != sigmoid) {
+        return false;
+    }
+
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * weight = weighted->src[1];
+    const ggml_tensor * gate = sigmoid->src[0];
+    if (x->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            x->ne[0] != 128 || x->ne[1] != 48 || x->ne[2] != 3 || x->ne[3] != 1 ||
+            !ggml_are_same_shape(dst, x) || !ggml_are_same_shape(gate, x) ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(weight) ||
+            weight->ne[0] != x->ne[0] || ggml_nrows(weight) != 1 ||
+            gate->nb[0] != sizeof(float) || gate->nb[1] != x->nb[1] || gate->nb[2] < x->nb[2] ||
+            !ggml_cuda_is_aligned(x, 16) || !ggml_cuda_is_aligned(dst, 16) ||
+            !ggml_cuda_is_aligned(weight, 16) || !ggml_cuda_is_aligned(gate, 16)) {
+        return false;
+    }
+
+    // Only identical layouts can overlap: each lane reads and writes its own float4.
+    const auto safe_overlap = [dst](const ggml_tensor * src) {
+        const auto in = reinterpret_cast<uintptr_t>(src->data);
+        const auto out = reinterpret_cast<uintptr_t>(dst->data);
+        if (in == out) {
+            return ggml_are_same_layout(src, dst);
+        }
+        return in < out ? out - in >= ggml_nbytes(src) : in - out >= ggml_nbytes(dst);
+    };
+    if (!safe_overlap(x) || !safe_overlap(weight) || !safe_overlap(gate)) {
+        return false;
+    }
+
+    ggml_cuda_op_gdn_gated_norm(ctx, norm, weight, gate, dst);
+    return true;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5296,6 +5349,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_try_gdn_gated_norm(*cuda_ctx, cgraph, i)) {
+        return 3;
+    }
+#endif
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);

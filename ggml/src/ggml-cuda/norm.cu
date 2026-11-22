@@ -229,6 +229,51 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void gdn_gated_norm_f32(const float4 * x, const float4 * weight, const float4 * gate, float4 * dst,
+                                          int width, int64_t gate_token_stride, float eps) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const int64_t head = blockIdx.x;
+    const int64_t token = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int64_t i = (token*gridDim.x + head)*WARP_SIZE + lane;
+    const float4 v = x[i];
+
+    // Use the same float4 accumulation and warp reduction as RMS norm with 128 columns.
+    float sum = 0.0f;
+    sum += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    sum = warp_reduce_sum(sum);
+    const float scale = rsqrtf(sum / width + eps);
+
+    const float4 w = weight[lane];
+    const float4 z = gate[token*gate_token_stride + head*WARP_SIZE + lane];
+    float4 result = make_float4(scale*v.x, scale*v.y, scale*v.z, scale*v.w);
+    result.x *= w.x;
+    result.y *= w.y;
+    result.z *= w.z;
+    result.w *= w.w;
+    result.x *= 1.0f / (1.0f + expf(-z.x));
+    result.y *= 1.0f / (1.0f + expf(-z.y));
+    result.z *= 1.0f / (1.0f + expf(-z.z));
+    result.w *= 1.0f / (1.0f + expf(-z.w));
+    dst[i] = result;
+}
+
+void ggml_cuda_op_gdn_gated_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * weight,
+                                const ggml_tensor * gate, ggml_tensor * dst) {
+    const ggml_tensor * x = norm->src[0];
+    const float eps = ggml_get_op_params_f32(norm, 0);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const ggml_cuda_kernel_launch_params launch_params{dim3(x->ne[1], x->ne[2]), dim3(WARP_SIZE), 0, ctx.stream()};
+    ggml_cuda_kernel_launch(gdn_gated_norm_f32, launch_params,
+        (const float4 *) x->data, (const float4 *) weight->data, (const float4 *) gate->data, (float4 *) dst->data,
+        (int) x->ne[0], (int64_t) (gate->nb[2] / sizeof(float4)), eps);
+}
+#endif
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {

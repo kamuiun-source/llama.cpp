@@ -718,6 +718,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    static const bool fuse_gated_norm = [] {
+        const char * value = std::getenv("GGML_CUDA_GDN_GATED_NORM");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (fuse_gated_norm && input->type == GGML_TYPE_F32 && input->ne[0] == 128 && input->ne[1] == 48 &&
+            input->ne[2] == 3 && input->ne[3] == 1) {
+        const auto reg = ggml_backend_dev_backend_reg(model.dev_layer(layer));
+        if (reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            // Compute the gate before the norm so that both inputs are ready at the start of the fusion.
+            ggml_build_forward_expand(gf, input);
+            ggml_build_forward_expand(gf, gate);
+        }
+    }
+
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
