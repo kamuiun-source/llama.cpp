@@ -95,7 +95,8 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE");
         const bool hip_dynamic = dynamic_resident &&
                 std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "ROCm") == 0;
-        return (hip_overlap != hip_overlap_mode::off || hip_dynamic) && value && std::strcmp(value, "1") == 0;
+        return value && ((std::strcmp(value, "1") == 0 && (hip_overlap != hip_overlap_mode::off || hip_dynamic)) ||
+                (std::strcmp(value, "auto") == 0 && hip_dynamic));
     }()), hip_mtp_gate_up_overlap([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_OVERLAP");
         return value && std::strcmp(value, "1") == 0;
@@ -138,6 +139,10 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()) {
     const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
+    const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
+    if (hip_mtp_verify_three && std::strcmp(mtp_three, "auto") == 0 && !hip_tuple_dma) {
+        throw std::runtime_error("HIP automatic MTP verification width requires Expert tuple DMA");
+    }
     if (hip_mtp_verify_three && (max_ubatch != 2 || n_expert_used != 10)) {
         throw std::runtime_error("HIP 3-position MTP requires two-token microbatches and top-10 routing");
     }
@@ -157,7 +162,7 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP with upload overlap off");
     }
     if (hip_tuple_dma && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap || hip_mtp_direct_ram)) {
-        throw std::runtime_error("HIP Expert tuple DMA requires single-bank dynamic residency and fixed three-position MTP");
+        throw std::runtime_error("HIP Expert tuple DMA requires single-bank dynamic residency and three-position MTP support");
     }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
