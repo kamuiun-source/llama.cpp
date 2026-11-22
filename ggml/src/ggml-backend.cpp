@@ -835,6 +835,7 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 
 struct ggml_backend_handoff_times {
     bool enabled = false;
+    bool read_async = false;
     int64_t source_wait_us = 0;
     int64_t destination_wait_us = 0;
     int64_t source_first_us = 0;
@@ -1433,6 +1434,10 @@ struct ggml_backend_sched {
     bool measure_hip_handoff;
     bool trace_hip_handoff_wait;
     bool async_hip_input;
+    bool hip_producer_d2h;
+    size_t hip_producer_d2h_batches;
+    int64_t hip_producer_d2h_submit_us;
+    int64_t hip_producer_d2h_wait_us;
     bool async_hip_mtp4_input;
     bool async_hip_return;
     bool async_hip_mtp4_return;
@@ -2495,7 +2500,7 @@ static void ggml_backend_sched_record_hip_handoff(ggml_backend_sched_t sched, gg
             stats.async_return_copies += count;
             stats.async_return_bytes += bytes;
             stats.return_enqueue_us += read_us;
-        } else {
+        } else if (!times.read_async) {
             stats.read_us += read_us;
         }
         if (async_input) {
@@ -2526,7 +2531,7 @@ static void ggml_backend_sched_record_hip_handoff(ggml_backend_sched_t sched, gg
     timing.pinned_bytes += pinned ? bytes : 0;
     timing.source_wait_us += times.source_wait_us;
     timing.destination_wait_us += times.destination_wait_us;
-    timing.read_us += async_return ? 0 : read_us;
+    timing.read_us += async_return || times.read_async ? 0 : read_us;
     if (async_input) {
         ++timing.async_input_batches;
         timing.async_input_copies += count;
@@ -2539,7 +2544,7 @@ static void ggml_backend_sched_record_hip_handoff(ggml_backend_sched_t sched, gg
         GGML_LOG_INFO("hip_handoff_wait: direction=%s copies=%zu bytes=%zu pinned=%d h2d_async=%d d2h_async=%d"
                 " source_start_us=%lld source_end_us=%lld dst1_start_us=%lld dst1_end_us=%lld"
                 " dst2_start_us=%lld dst2_end_us=%lld read_start_us=%lld read_end_us=%lld write_start_us=%lld write_end_us=%lld\n",
-                direction == 0 ? "CUDA->ROCm" : "ROCm->CUDA", count, bytes, pinned, async_input, async_return,
+                direction == 0 ? "CUDA->ROCm" : "ROCm->CUDA", count, bytes, pinned, async_input, async_return || times.read_async,
                 (long long) times.source_first_us, (long long) times.source_last_us,
                 (long long) times.destination_first_us, (long long) times.destination_last_us,
                 (long long) times.destination_second_us, (long long) times.destination_second_end_us,
@@ -3205,6 +3210,9 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     const bool async_input = pinned && (sched->async_hip_input || mtp4_input) && strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 &&
             dst_backend->iface.set_tensor_async && !sched->profile.enabled && !sched->callback_eval &&
             (!sched->hip_async_input_pending || sched->hip_async_input_pending == dst_backend);
+    const bool producer_d2h = sched->hip_producer_d2h && measure_hip && pinned &&
+            strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 && src_backend->iface.get_tensor_async &&
+            !sched->profile.enabled && !sched->callback_eval;
     if (!upload.compute && !pinned && sched->device_input_staging_size < bytes) {
         auto * staging = (uint8_t *) realloc(sched->device_input_staging, bytes);
         if (!staging) {
@@ -3220,6 +3228,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
 
     ggml_backend_handoff_times handoff;
     handoff.enabled = sched->trace_handoff_graph != 0 || measure_hip || measure_mtp4 || mtp4_input;
+    handoff.read_async = producer_d2h;
     bool producer_copy = false;
     if (upload.compute && !sched->target_mtp_verify_three) {
         if (sched->target_mtp_verify) {
@@ -3264,8 +3273,9 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
             handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
         }
     } else {
-        // Keep the ordinary synchronous bulk path for every other input layout and backend.
-        handoff.source_wait([&] { ggml_backend_synchronize(src_backend); });
+        if (!producer_d2h) {
+            handoff.source_wait([&] { ggml_backend_synchronize(src_backend); });
+        }
         handoff.destination_wait([&] { ggml_backend_synchronize(dst_backend); });
         if (sched->hip_async_input_pending == dst_backend) {
             // The existing destination wait drains the previous H2D reader of the dedicated slab.
@@ -3274,7 +3284,20 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         if (upload.compute) {
             sched->shared_input_pending = false;
         }
-        handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
+        if (producer_d2h) {
+            // The destination wait releases the pinned slab before CUDA writes to it.
+            handoff.read([&] {
+                for (int i = 0; i < count; ++i) {
+                    ggml_backend_tensor_get_async(src_backend, srcs[i], staging + data_offsets[i], offsets[i], sizes[i]);
+                }
+            });
+            handoff.source_wait([&] { ggml_backend_synchronize(src_backend); });
+            ++sched->hip_producer_d2h_batches;
+            sched->hip_producer_d2h_submit_us += handoff.read_end_us - handoff.read_start_us;
+            sched->hip_producer_d2h_wait_us += handoff.source_wait_us;
+        } else {
+            handoff.read([&] { ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count); });
+        }
     }
     if (async_input) {
         sched->hip_async_input_pending = dst_backend;
@@ -3288,6 +3311,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     }
     ggml_backend_sched_log_handoff(sched, split, src_backend, dst_backend, srcs, count, bytes, handoff,
             producer_copy ? "host_batch_shared_producer" : upload.compute ? "host_batch_shared" :
+            producer_d2h ? "host_batch_hip_producer" :
             async_input ? "host_batch_dual_pinned_async_input" : pinned ? "host_batch_dual_pinned" : "host_batch");
     if (measure_hip || measure_mtp4 || mtp4_input) {
         ggml_backend_sched_record_hip_handoff(sched, src_backend, count, bytes, pinned != nullptr, handoff, async_input, false, mtp4_input);
@@ -4077,6 +4101,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
+    const char * hip_producer_d2h = getenv("GGML_SCHED_HIP_PRODUCER_D2H");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
     const char * async_hip_mtp4_return = getenv("GGML_SCHED_HIP_MTP4_ASYNC_RETURN");
@@ -4108,6 +4133,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->async_hip_mtp4_return = allow_hip_mtp4_return && cuda_hip;
     sched->skip_hip_device_dst_wait = allow_hip_wait_skip && cuda_hip;
     sched->dual_pinned_hip_handoff = allow_hip_dual_pinned && cuda_hip;
+    sched->hip_producer_d2h = sched->batch_hip_device_inputs && sched->dual_pinned_hip_handoff &&
+            hip_producer_d2h && strcmp(hip_producer_d2h, "1") == 0;
     sched->measure_hip_handoff = allow_hip_timing && cuda_hip;
     sched->trace_hip_handoff_wait = allow_hip_wait_trace && cuda_hip;
     if (cuda_hip && async_hip_input && strcmp(async_hip_input, "1") == 0) {
@@ -4353,6 +4380,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         const auto & stats = sched->hip_handoff_stats[0];
         GGML_LOG_INFO("packed HIP MTP3 async input: batches=%zu copies=%zu bytes=%zu enqueue_ms=%.3f\n",
                 stats.async_input_batches, stats.async_input_copies, stats.async_input_bytes, stats.enqueue_us / 1000.0);
+    }
+    if (sched->hip_producer_d2h) {
+        GGML_LOG_INFO("packed HIP MTP3 producer D2H: batches=%zu submit_ms=%.3f wait_ms=%.3f\n",
+                sched->hip_producer_d2h_batches, sched->hip_producer_d2h_submit_us / 1000.0, sched->hip_producer_d2h_wait_us / 1000.0);
     }
     if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
         const auto & stats = sched->hip_mtp4_input_stats;

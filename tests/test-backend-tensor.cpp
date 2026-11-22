@@ -701,9 +701,76 @@ static bool test_cuda_hip_copy(bool timing) {
     return ok;
 }
 
+static bool test_cuda_hip_producer_d2h() {
+    ggml_backend_ptr cuda(ggml_backend_init_by_name("CUDA0", nullptr));
+    ggml_backend_ptr hip(ggml_backend_init_by_name("ROCm0", nullptr));
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    if (!cuda || !hip || !cpu) {
+        fprintf(stderr, "Required CUDA, ROCm, and CPU backends are unavailable\n");
+        return false;
+    }
+
+    constexpr size_t graph_size = 16;
+    constexpr int64_t columns = 2560;
+    constexpr int64_t rows = 3;
+    ggml_context_ptr ctx(ggml_init({4 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true}));
+    if (!ctx) {
+        return false;
+    }
+    auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, columns, rows);
+    auto * doubled = ggml_scale(ctx.get(), input, 2.0f);
+    auto * tripled = ggml_scale(ctx.get(), input, 3.0f);
+    auto * output = ggml_add(ctx.get(), doubled, tripled);
+    ggml_set_input(input);
+    ggml_set_output(output);
+    auto * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = {cuda.get(), hip.get(), cpu.get()};
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 3, graph_size, false, false));
+    ggml_backend_sched_set_target_mtp_verify_three(sched.get(), true);
+    ggml_backend_sched_set_tensor_backend(sched.get(), input, cuda.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), doubled, cuda.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), tripled, cuda.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, hip.get());
+    if (!ggml_backend_sched_alloc_graph(sched.get(), graph)) {
+        return false;
+    }
+
+    std::vector<float> first(columns * rows, -7.0f);
+    std::vector<float> second(columns * rows);
+    for (size_t i = 0; i < second.size(); ++i) {
+        second[i] = float(i % 31);
+    }
+    ggml_backend_hip_handoff_timing before[2], after[2];
+    ggml_backend_get_hip_handoff_timing(before);
+    bool ok = true;
+    for (const auto * values : {&first, &second}) {
+        ggml_backend_tensor_set_async(cuda.get(), input, values->data(), 0, ggml_nbytes(input));
+        if (ggml_backend_sched_graph_compute_async(sched.get(), graph) != GGML_STATUS_SUCCESS) {
+            ok = false;
+            break;
+        }
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_get_hip_handoff_timing(after);
+    // Both executions must use the pinned two-input batch.
+    ok = ok && after[0].batches - before[0].batches == 2 && after[0].pinned_copies - before[0].pinned_copies == 4;
+    std::vector<float> actual(second.size());
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        ok = ok && actual[i] == second[i] * 5.0f;
+    }
+    printf("CUDA -> ROCm scheduler batch %s\n", ok ? "PASSED" : "FAILED");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
+    if (argc == 2 && strcmp(argv[1], "--cuda-hip-producer-d2h") == 0) {
+        return test_cuda_hip_producer_d2h() ? 0 : 1;
+    }
     if (argc > 1 && strcmp(argv[1], "--cuda-hip-copy") == 0) {
         const bool timing = argc == 3 && strcmp(argv[2], "--timing") == 0;
         if (argc != 2 && !timing) {
