@@ -48,6 +48,7 @@ struct llama_expert_placement {
     const bool hip_overlap_promotion;
     const bool overlap;
     const bool dynamic_resident;
+    const bool hip_mtp_verify_four;
     const bool hip_mtp_verify_three;
     const bool hip_mtp_gate_up_overlap;
     const bool hip_mtp_gate_up_fuse_hits;

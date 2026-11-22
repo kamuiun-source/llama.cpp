@@ -1593,7 +1593,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     target_mtp_verify_three(params.target_mtp_verify_three),
-    target_mtp_verify_three_packed(params.target_mtp_verify_three_packed),
+    target_mtp_verify_packed(params.target_mtp_verify_packed),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2447,7 +2447,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }();
     const bool fast_three = mtp_waves && mtp_three_fast;
     const int32_t prefill_waves = mtp_waves ? 2 : moe_cache ? moe_cache->get_prefill_waves(il, n_tokens, n_expert_used) : 0;
-    const bool compact_prefill = !mtp_waves && !target_mtp_verify_three_packed &&
+    const bool compact_prefill = !mtp_waves && !target_mtp_verify_packed &&
         moe_cache && moe_cache->compact_prefill(n_tokens);
     if (mtp_waves && (!can_cpu_share || gate_up_exps_b || gate_exps_b || up_exps_b || down_exps_b || post_exp_norm ||
             type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f)) {
@@ -2638,7 +2638,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    auto * gate_up_full_map = target_mtp_verify_three_packed && moe_cache ?
+    auto * gate_up_full_map = target_mtp_verify_packed && moe_cache ?
             moe_cache->get_hip_mtp_gate_up_full_map(il) : nullptr;
     if (gate_up_full_map) {
         if (!can_cpu_share || !up_exps || !gate_exps || gate_up_exps || up_exps_s || gate_exps_s ||
@@ -2750,7 +2750,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         experts = build_experts(cur, selected_experts, cache.slots, true);
     }
-    if (!gate_up_full_map && moe_cache && moe_cache->get_cold_slot_map(il, target_mtp_verify_three_packed)) {
+    if (!gate_up_full_map && moe_cache && moe_cache->get_cold_slot_map(il, target_mtp_verify_packed)) {
         if (gate_up_exps_b || gate_exps_b || up_exps_b || !loras->empty()) {
             throw std::runtime_error("expert overlap requires bias-free gate/up projections and no LoRA");
         }
@@ -2767,7 +2767,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_merged", il);
     }
 
-    if (moe_cache && il >= 0 && cache.slots && !cache.cpu_ids && !moe_cache->get_cold_slot_map(il, target_mtp_verify_three_packed) &&
+    if (moe_cache && il >= 0 && cache.slots && !cache.cpu_ids && !moe_cache->get_cold_slot_map(il, target_mtp_verify_packed) &&
             can_cpu_share && type_op == LLM_FFN_SILU && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
             !gate_up_exps_b && !gate_exps_b && !up_exps_b && !down_exps_b &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm) {
@@ -2878,8 +2878,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     ggml_tensor * slot_map = full_map ? full_map :
             mtp_verify_three ? moe_cache->get_mtp_verify_map(il, prefill_wave) :
             prefill_wave >= 0 ? moe_cache->get_prefill_map(il, prefill_wave) :
-            cold ? moe_cache->get_cold_slot_map(il, target_mtp_verify_three_packed) :
-            moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr, target_mtp_verify_three_packed);
+            cold ? moe_cache->get_cold_slot_map(il, target_mtp_verify_packed) :
+            moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr, target_mtp_verify_packed);
     if (slot_map == nullptr) {
         return unavailable(format("no slots for %" PRId64 " tokens and %" PRId64 " selected experts", selected_experts->ne[1], selected_experts->ne[0]).c_str());
     }
@@ -2913,7 +2913,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, cold ? "ffn_moe_cold_slots" : "ffn_moe_slots", il);
-    if (!full_map && target_mtp_verify_three_packed && moe_cache->uses_hip_mtp_compact()) {
+    if (!full_map && target_mtp_verify_packed && moe_cache->uses_hip_mtp_compact()) {
         ggml_set_name(slots, "ffn_moe_mtp_compact_slots");
         slots->op_params[0] = -1;
         if (moe_cache->get_hip_mtp_gate_up_full_map(il)) {
@@ -2928,7 +2928,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         const char * value = std::getenv("GGML_HIP_GFX906_MTP3_IQ3_XXS_SHARE_WEIGHTS");
         return value && std::strcmp(value, "1") == 0;
     }();
-    if (shared_iq3_weights && target_mtp_verify_three_packed && !full_map && !cold && prefill_wave < 0 &&
+    if (shared_iq3_weights && target_mtp_verify_packed && !full_map && !cold && prefill_wave < 0 &&
             !moe_cache->get_cold_slot_map(il, true) && selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3 &&
             up_exps && gate_exps && up_exps->type == GGML_TYPE_IQ3_XXS && gate_exps->type == GGML_TYPE_IQ3_XXS &&
             up_exps->ne[0] == 2560 && up_exps->ne[1] == 640 && ggml_are_same_shape(up_exps, gate_exps)) {

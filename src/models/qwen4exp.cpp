@@ -1167,7 +1167,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         return value && std::strcmp(value, "1") == 0;
     }();
     const auto * placement = model.expert_placement.get();
-    const bool fused_three = mtp3_conv_history && target_mtp_verify_three_packed && n_seq_tokens == 3 &&
+    const bool fused_three = mtp3_conv_history && target_mtp_verify_packed && n_seq_tokens == 3 &&
             placement && placement->dynamic_resident && !placement->overlap && cparams.n_rs_seq >= 2;
     const int n_history_slots = fused_three ? 3 : 2;
     if (cparams.n_rs_seq >= 1 && n_seqs == 1 && (n_seq_tokens == 1 || n_seq_tokens == 2 || fused_three) &&

@@ -31,6 +31,7 @@ LLAMA_API const float * llama_read_mtp_first_draft_row(struct llama_context * ct
 LLAMA_API void llama_discard_mtp_first_draft_row(struct llama_context * ctx);
 LLAMA_API llama_mtp_draft_row_stats llama_get_mtp_draft_row_stats(const struct llama_context * ctx);
 LLAMA_API bool llama_supports_mtp_verify_three(const struct llama_context * ctx);
+LLAMA_API bool llama_supports_mtp_verify_four(const struct llama_context * ctx);
 LLAMA_API void llama_set_mtp_logit_trace(struct llama_context * ctx, bool enabled);
 
 //

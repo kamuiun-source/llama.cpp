@@ -1344,7 +1344,8 @@ struct llama_moe_cache::impl {
         }
         const layer & l = layers[il];
         if (placement) {
-            const int32_t max_tokens = placement->hip_mtp_verify_three ? 3 : placement->max_ubatch;
+            const int32_t max_tokens = placement->hip_mtp_verify_four ? 4 :
+                    placement->hip_mtp_verify_three ? 3 : placement->max_ubatch;
             return n_tokens > 0 && n_tokens <= max_tokens && n_expert_used > 0 &&
                     n_expert_used <= placement->n_slots / n_tokens ? (mtp_three && l.hip_mtp_hot_map ? l.hip_mtp_hot_map : l.slot_map) : nullptr;
         }

@@ -165,6 +165,7 @@ struct llama_context {
                               bool   profile = false);
 
     bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
+    bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }
     void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
 
     int encode(const llama_batch_ext & batch_inp);
@@ -425,6 +426,7 @@ private:
 
     ggml_backend_sched_ptr sched;
     bool mtp_verify_three_enabled = false;
+    bool mtp_verify_four_enabled = false;
     bool mtp_verify_three_vulkan_waves = false;
     bool mtp_logit_trace_enabled = false;
     uint32_t target_mtp_verify_width = 0;

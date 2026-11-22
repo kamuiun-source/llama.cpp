@@ -839,7 +839,7 @@ struct llm_graph_params {
 
     llm_graph_result * res;
     bool target_mtp_verify_three = false;
-    bool target_mtp_verify_three_packed = false;
+    bool target_mtp_verify_packed = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -917,7 +917,7 @@ struct llm_graph_params {
             mtp_vocab_head == other.mtp_vocab_head &&
             mtp_vocab_ids == other.mtp_vocab_ids &&
             target_mtp_verify_three == other.target_mtp_verify_three &&
-            target_mtp_verify_three_packed == other.target_mtp_verify_three_packed &&
+            target_mtp_verify_packed == other.target_mtp_verify_packed &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1091,7 +1091,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const bool target_mtp_verify_three;
-    const bool target_mtp_verify_three_packed;
+    const bool target_mtp_verify_packed;
 
     const llama_prec_policy * prec_policy;
 

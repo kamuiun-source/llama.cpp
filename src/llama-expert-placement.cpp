@@ -91,7 +91,11 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
         return std::strcmp(backend, "Vulkan") == 0 ||
                (std::strcmp(backend, "ROCm") == 0 && hip_dynamic && std::strcmp(hip_dynamic, "1") == 0);
-    }()), hip_mtp_verify_three([&] {
+    }()), hip_mtp_verify_four([&] {
+        const char * value = std::getenv("LLAMA_MTP_VERIFY_FOUR");
+        return value && std::strcmp(value, "1") == 0 && dynamic_resident &&
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "ROCm") == 0;
+    }()), hip_mtp_verify_three(hip_mtp_verify_four || [&] {
         const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE");
         const bool hip_dynamic = dynamic_resident &&
                 std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "ROCm") == 0;
@@ -121,7 +125,7 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()), hip_tuple_dma([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_TUPLE_DMA");
         return value && std::strcmp(value, "1") == 0;
-    }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
+    }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_four ? 4 : hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
         const bool small = value && std::strcmp(value, "1") == 0;
@@ -140,7 +144,11 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
     const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
-    if (hip_mtp_verify_three && std::strcmp(mtp_three, "auto") == 0 && !hip_tuple_dma) {
+    if (hip_mtp_verify_four && (!hip_tuple_dma || (mtp_three &&
+            (std::strcmp(mtp_three, "1") == 0 || std::strcmp(mtp_three, "auto") == 0)))) {
+        throw std::runtime_error("HIP four-position MTP requires Expert tuple DMA and three-position mode off");
+    }
+    if (hip_mtp_verify_three && mtp_three && std::strcmp(mtp_three, "auto") == 0 && !hip_tuple_dma) {
         throw std::runtime_error("HIP automatic MTP verification width requires Expert tuple DMA");
     }
     if (hip_mtp_verify_three && (max_ubatch != 2 || n_expert_used != 10)) {

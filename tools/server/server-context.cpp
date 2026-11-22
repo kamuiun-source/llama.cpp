@@ -1100,6 +1100,8 @@ struct server_slot {
     size_t mtp_draft2_proposed = 0;
     size_t mtp_draft2_first_accepted = 0;
     size_t mtp_draft2_both_accepted = 0;
+    size_t mtp_draft3_proposed = 0;
+    std::array<size_t, 3> mtp_draft3_accepted = {};
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -1143,6 +1145,8 @@ struct server_slot {
         n_accepted_per_pos.clear();
         mtp_depth = {};
         mtp_draft2_proposed = 0;
+        mtp_draft3_proposed = 0;
+        mtp_draft3_accepted = {};
         mtp_draft2_first_accepted = 0;
         mtp_draft2_both_accepted = 0;
 
@@ -1512,6 +1516,10 @@ struct server_slot {
         if (llama_supports_mtp_verify_three(ctx_tgt)) {
             SLT_INF(*this, "MTP 3-position verify: draft2_proposed=%zu first_accepted=%zu both_accepted=%zu\n",
                     mtp_draft2_proposed, mtp_draft2_first_accepted, mtp_draft2_both_accepted);
+        }
+        if (llama_supports_mtp_verify_four(ctx_tgt)) {
+            SLT_INF(*this, "MTP 4-position verify: draft3_proposed=%zu first_accepted=%zu second_accepted=%zu third_accepted=%zu\n",
+                    mtp_draft3_proposed, mtp_draft3_accepted[0], mtp_draft3_accepted[1], mtp_draft3_accepted[2]);
         }
         if (mtp_adaptive) {
             SLT_INF(*this, "MTP adaptive depth: decisions=%zu explore=%zu depth2=%zu chain=%zu proposed2=%zu first=%zu chain_first=%zu proposed2_first=%zu both=%zu draft2_us=%.1f draft3_us=%.1f round2_us=%.1f round3_us=%.1f\n",
@@ -2238,16 +2246,21 @@ private:
 
         const char * mtp_three = std::getenv("LLAMA_MTP_VERIFY_THREE");
         const bool mtp_adaptive = mtp_three && std::strcmp(mtp_three, "auto") == 0;
-        if (mtp_adaptive || (mtp_three && std::strcmp(mtp_three, "1") == 0)) {
+        const char * mtp_four = std::getenv("LLAMA_MTP_VERIFY_FOUR");
+        const bool mtp_fixed_four = mtp_four && std::strcmp(mtp_four, "1") == 0;
+        if (mtp_fixed_four || mtp_adaptive || (mtp_three && std::strcmp(mtp_three, "1") == 0)) {
             const bool mtp_only = spec_mtp && std::all_of(params_base.speculative.types.begin(),
                     params_base.speculative.types.end(), [](common_speculative_type type) {
                         return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
                     });
-            if (!spec || !mtp_only || common_speculative_n_max(spec.get()) != 2 || params_base.speculative.has_synth() ||
+            const bool supported = mtp_fixed_four ? llama_supports_mtp_verify_four(ctx_tgt) : llama_supports_mtp_verify_three(ctx_tgt);
+            const int n_draft = mtp_fixed_four ? 3 : 2;
+            if (!spec || !mtp_only || common_speculative_n_max(spec.get()) != n_draft || params_base.speculative.has_synth() ||
                     (mtp_adaptive && params_base.speculative.draft.n_min > 1) ||
-                    !llama_supports_mtp_verify_three(ctx_tgt) || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                    !supported || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                     ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-                SRV_ERR("%s", "three-position MTP requires supported packed Qwen4Exp placement, two draft tokens, real acceptance, one slot, and target and draft rollback\n");
+                SRV_ERR("%d-position MTP requires supported packed Qwen4Exp placement, %d draft tokens, real acceptance, one slot, and target and draft rollback\n",
+                        n_draft + 1, n_draft);
                 return false;
             }
         }
@@ -5606,7 +5619,8 @@ private:
         bool decode = false;
         bool verify = false;
         const int32_t view_width = batch.view.size();
-        bool mtp_verify = spec && (view_width == 2 || (view_width == 3 && llama_supports_mtp_verify_three(ctx_tgt)));
+        bool mtp_verify = spec && (view_width == 2 || (view_width == 3 && llama_supports_mtp_verify_three(ctx_tgt)) ||
+                (view_width == 4 && llama_supports_mtp_verify_four(ctx_tgt)));
         const bool classify = mtp_verify || decode_telemetry.timing_enabled() || decode_telemetry.expert_decode_trace;
         const int prefill_policy = server_expert_prefill_policy();
         for (int i = off; i < off + batch.view.size(); ++i) {
@@ -5705,7 +5719,7 @@ private:
             {
                 std::string err;
 
-                if (ret == 1 && (n_batch == 1 || (mtp_verify && view_width == 3))) {
+                if (ret == 1 && (n_batch == 1 || (mtp_verify && view_width >= 3))) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
@@ -6044,6 +6058,13 @@ private:
                     ++slot.mtp_draft2_proposed;
                     slot.mtp_draft2_first_accepted += accepted.size() >= 2;
                     slot.mtp_draft2_both_accepted += accepted.size() >= 3;
+                }
+                if (n_draft == 3 && !slot.spec_is_replay && llama_supports_mtp_verify_four(ctx_tgt) &&
+                        common_speculative_last_draft_type(spec.get(), slot.id) == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    ++slot.mtp_draft3_proposed;
+                    for (size_t pos = 0; pos + 1 < accepted.size(); ++pos) {
+                        ++slot.mtp_draft3_accepted[pos];
+                    }
                 }
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

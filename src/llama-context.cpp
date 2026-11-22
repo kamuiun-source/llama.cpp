@@ -369,10 +369,18 @@ llama_context::llama_context(
         const bool hip_three = placement->hip_mtp_verify_three &&
                 (params.n_outputs_max == 0 || params.n_outputs_max >= 3) &&
                 (params.n_outputs_max_per_seq == 0 || params.n_outputs_max_per_seq >= 3);
-        mtp_verify_three_enabled = mtp_three && (strcmp(mtp_three, "1") == 0 || strcmp(mtp_three, "auto") == 0) &&
+        const bool mtp_shape =
                 model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
-                cparams.n_seq_max == 1 && cparams.n_batch >= 3 && cparams.n_ubatch == 2 &&
-                (vulkan_waves || hip_three) && cparams.n_rs_seq == 2;
+                cparams.n_seq_max == 1 && cparams.n_batch >= 3 && cparams.n_ubatch == 2;
+        mtp_verify_four_enabled = placement->hip_mtp_verify_four && mtp_shape && cparams.n_batch >= 4 &&
+                (params.n_outputs_max == 0 || params.n_outputs_max >= 4) &&
+                (params.n_outputs_max_per_seq == 0 || params.n_outputs_max_per_seq >= 4) && cparams.n_rs_seq == 3;
+        if (placement->hip_mtp_verify_four && !mtp_verify_four_enabled) {
+            throw std::runtime_error("HIP four-position MTP requires one target sequence, three recurrent snapshots, and room for four tokens and outputs");
+        }
+        mtp_verify_three_enabled = mtp_verify_four_enabled ||
+                (mtp_three && (strcmp(mtp_three, "1") == 0 || strcmp(mtp_three, "auto") == 0) &&
+                 mtp_shape && (vulkan_waves || hip_three) && cparams.n_rs_seq == 2);
         mtp_verify_three_vulkan_waves = mtp_verify_three_enabled && vulkan_waves;
         if (placement->hip_mtp_verify_three && !mtp_verify_three_enabled) {
             throw std::runtime_error("HIP 3-position MTP requires a single target sequence, two recurrent snapshots and room for three tokens and outputs");
@@ -1056,6 +1064,10 @@ void llama_context::sched_reserve() {
         if (!graph_reserve(3, n_seqs, 3, mctx.get())) {
             throw std::runtime_error("failed to allocate packed three-position MTP buffers");
         }
+        target_mtp_verify_width = 4;
+        if (mtp_verify_four_enabled && !graph_reserve(4, n_seqs, 4, mctx.get())) {
+            throw std::runtime_error("failed to allocate packed four-position MTP buffers");
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -1188,7 +1200,7 @@ uint32_t llama_context::n_ubatch_prefill() const {
 }
 
 uint32_t llama_context::n_ubatch_reserve() const {
-    const uint32_t n_verify = mtp_verify_three_enabled ? 3 : 0;
+    const uint32_t n_verify = mtp_verify_four_enabled ? 4 : mtp_verify_three_enabled ? 3 : 0;
     return std::max(n_ubatch_prefill(), n_verify);
 }
 
@@ -2412,10 +2424,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
             target_mtp_verify_width = 2;
         } else if (batch_inp.tokens.size() == 3 && mtp_verify_three_enabled) {
             target_mtp_verify_width = 3;
+        } else if (batch_inp.tokens.size() == 4 && mtp_verify_four_enabled) {
+            target_mtp_verify_width = 4;
         }
     }
-    if (target_mtp_verify && batch_inp.tokens.size() == 3 && target_mtp_verify_width != 3) {
-        LLAMA_LOG_ERROR("%s: three-position MTP verification is unavailable\n", __func__);
+    if (target_mtp_verify && batch_inp.tokens.size() >= 3 && target_mtp_verify_width != batch_inp.tokens.size()) {
+        LLAMA_LOG_ERROR("%s: %zu-position MTP verification is unavailable\n", __func__, batch_inp.tokens.size());
         return -1;
     }
     if (!memory) {
@@ -2631,6 +2645,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        if (target_mtp_verify_width == 4 && ubatch.n_tokens != 4) {
+            LLAMA_LOG_ERROR("%s: four-position MTP requires a single microbatch\n", __func__);
+            return -1;
+        }
 
         // count the outputs in this ubatch
         {
@@ -3476,8 +3494,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.target_mtp_verify_three =*/ mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3,
-        /*.target_mtp_verify_three_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
-                target_mtp_verify_width == 3 && ubatch.n_tokens == 3,
+        /*.target_mtp_verify_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
+                target_mtp_verify_width >= 3 && ubatch.n_tokens == target_mtp_verify_width,
     };
 }
 
@@ -5680,6 +5698,10 @@ llama_mtp_draft_row_stats llama_get_mtp_draft_row_stats(const llama_context * ct
 
 bool llama_supports_mtp_verify_three(const llama_context * ctx) {
     return ctx->supports_mtp_verify_three();
+}
+
+bool llama_supports_mtp_verify_four(const llama_context * ctx) {
+    return ctx->supports_mtp_verify_four();
 }
 
 void llama_set_mtp_logit_trace(llama_context * ctx, bool enabled) {
