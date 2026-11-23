@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -40,6 +41,7 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+template <bool packed_signs = false>
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -58,8 +60,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1<packed_signs>;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1<packed_signs>;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
@@ -1019,11 +1021,15 @@ struct compact_moe_routes {
     uint8_t lanes[30]{};
 };
 
+static constexpr int iq3_lds_ncols = 2560;
+static constexpr int iq3_lds_activation_blocks = iq3_lds_ncols / QK8_1;
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false,
+          int iq3_lds_tokens = 0, int iq3_lds_row_groups = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1042,7 +1048,33 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
+
+    static_assert(iq3_lds_row_groups == 1 || (iq3_lds_row_groups == 2 && iq3_lds_tokens == 3));
+
+    const uint32_t * staged_grid = nullptr;
+    const block_q8_1 * staged_y = nullptr;
+    if constexpr (iq3_lds_tokens != 0) {
+        static_assert(iq3_lds_tokens == 2 || iq3_lds_tokens == 3);
+        static_assert(type == GGML_TYPE_IQ3_XXS && c_rows_per_block == 2 && has_fusion && !compact && packed_signs);
+        static_assert(sizeof(block_q8_1) % sizeof(uint32_t) == 0 && alignof(block_q8_1) <= alignof(uint32_t));
+        constexpr int grid_size = 256;
+        constexpr int activation_words = iq3_lds_activation_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
+        __shared__ uint32_t grid[grid_size];
+        __shared__ uint32_t activation[iq3_lds_tokens][activation_words];
+
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < grid_size; i += iq3_lds_tokens * warp_size) {
+            grid[i] = iq3xxs_grid[i];
+        }
+        const auto * src = reinterpret_cast<const uint32_t *>(static_cast<const block_q8_1 *>(vy) + threadIdx.y * stride_col_y);
+        auto * token_activation = activation[threadIdx.y];
+        for (int i = threadIdx.x; i < activation_words; i += warp_size) {
+            token_activation[i] = src[i];
+        }
+        __syncthreads();
+        staged_grid = grid;
+        staged_y = reinterpret_cast<const block_q8_1 *>(token_activation);
+    }
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -1075,7 +1107,6 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     uint32_t token_idx          = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
@@ -1099,90 +1130,126 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
-    // partial sum for each thread
-    float tmp[c_rows_per_block] = {0.0f};
-    float tmp_gate[c_rows_per_block] = {0.0f};
+#pragma unroll 1
+    for (int group = 0; group < iq3_lds_row_groups; ++group) {
+        const int row0 = c_rows_per_block*(iq3_lds_row_groups*blockIdx.x + group);
+        const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+        // partial sum for each thread
+        float tmp[c_rows_per_block] = {0.0f};
+        float tmp_gate[c_rows_per_block] = {0.0f};
+
+        if constexpr (iq3_lds_tokens != 0) {
+            const int kbx = threadIdx.x / (qi/vdr);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+            const int kbx_next = kbx + blocks_per_iter;
+            const bool has_next = kbx_next < blocks_per_row_x;
+            const auto * up = static_cast<const block_iq3_xxs *>(vx) + kbx_offset;
+            const auto * gate = static_cast<const block_iq3_xxs *>(vgate) + kbx_offset;
+            const auto * activation = staged_y + kqs/2;
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                const int row = i * stride_row_x;
+                const auto up_current = load_iq3_xxs_mmvq_weights(up[row + kbx], kqs);
+                const auto gate_current = load_iq3_xxs_mmvq_weights(gate[row + kbx], kqs);
+                iq3_xxs_mmvq_weights up_next, gate_next;
+                if (has_next) {
+                    up_next = load_iq3_xxs_mmvq_weights(up[row + kbx_next], kqs);
+                    gate_next = load_iq3_xxs_mmvq_weights(gate[row + kbx_next], kqs);
+                }
+
+                const auto & current = activation[kbx * (qk/QK8_1)];
+                tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_current, current, staged_grid);
+                tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_current, current, staged_grid);
+                if (has_next) {
+                    const auto & next = activation[kbx_next * (qk/QK8_1)];
+                    tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_next, next, staged_grid);
+                    tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_next, next, staged_grid);
                 }
             }
-        }
-    }
+        } else {
+            for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby = kbx * (qk/QK8_1);
+                const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
-    ggml_cuda_pdl_lc();
-
-    // Warp-level reduction only - no shared memory needed
 #pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
-            }
-        }
-    }
-
-    // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        float result = tmp[threadIdx.x];
-        if constexpr (has_fusion) {
-            const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
-
-            if constexpr (type == GGML_TYPE_NVFP4) {
-                if (x_scale) {
-                    result *= x_scale[channel_x];
-                }
-            }
-            if (x_bias) {
-                result += x_bias[bias_idx];
-            }
-            if (use_gate) {
-                float gate_value = tmp_gate[threadIdx.x];
-                if constexpr (type == GGML_TYPE_NVFP4) {
-                    if (gate_scale) {
-                        gate_value *= gate_scale[channel_x];
+                for (int i = 0; i < c_rows_per_block; ++i) {
+                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
-                if (gate_bias) {
-                    gate_value += gate_bias[bias_idx];
-                }
-                switch (active_glu) {
-                    case GGML_GLU_OP_SWIGLU:
-                        result *= ggml_cuda_op_silu_single(gate_value);
-                        break;
-                    case GGML_GLU_OP_GEGLU:
-                        result *= ggml_cuda_op_gelu_single(gate_value);
-                        break;
-                    case GGML_GLU_OP_SWIGLU_OAI:
-                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                        break;
-                    case GGML_GLU_OP_SWIGLU_CLAMP:
-                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
-                        break;
-                    default:
-                        result = result * gate_value;
-                        break;
+            }
+        }
+
+        ggml_cuda_pdl_lc();
+
+        // Warp-level reduction only - no shared memory needed
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
                 }
             }
         }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
-    }
 
-    if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
-    } else if constexpr (type != GGML_TYPE_NVFP4) {
-        GGML_UNUSED_VARS(x_scale, gate_scale);
+        // Write results
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            float result = tmp[threadIdx.x];
+            if constexpr (has_fusion) {
+                const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
+
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    if (x_scale) {
+                        result *= x_scale[channel_x];
+                    }
+                }
+                if (x_bias) {
+                    result += x_bias[bias_idx];
+                }
+                if (use_gate) {
+                    float gate_value = tmp_gate[threadIdx.x];
+                    if constexpr (type == GGML_TYPE_NVFP4) {
+                        if (gate_scale) {
+                            gate_value *= gate_scale[channel_x];
+                        }
+                    }
+                    if (gate_bias) {
+                        gate_value += gate_bias[bias_idx];
+                    }
+                    switch (active_glu) {
+                        case GGML_GLU_OP_SWIGLU:
+                            result *= ggml_cuda_op_silu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_GEGLU:
+                            result *= ggml_cuda_op_gelu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_OAI:
+                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_CLAMP:
+                            result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                            break;
+                        default:
+                            result = result * gate_value;
+                            break;
+                    }
+                }
+            }
+            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        }
+
+        if constexpr (!has_fusion) {
+            GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
+        } else if constexpr (type != GGML_TYPE_NVFP4) {
+            GGML_UNUSED_VARS(x_scale, gate_scale);
+        }
     }
 }
 
@@ -1229,6 +1296,16 @@ static void mul_mat_vec_q_switch_fusion(
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
+
+#ifdef GGML_USE_HIP
+static bool ggml_hip_gfx906_iq_sign_decode() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HIP_GFX906_IQ_SIGN_DECODE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
+}
+#endif
 
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
@@ -1323,6 +1400,71 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#ifdef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
+        if ((ncols_dst == 2 || ncols_dst == 3) && ncols_x == iq3_lds_ncols && nrows_x == 640 && nchannels_dst == 10 &&
+                nchannels_y.z == 1 &&
+                fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU && !fusion.x_bias && !fusion.gate_bias &&
+                !fusion.x_scale && !fusion.gate_scale && !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
+                ggml_hip_gfx906_iq_sign_decode()) {
+            const auto launch = [&](auto lds, auto groups) {
+                constexpr int lds_tokens = decltype(lds)::value;
+                constexpr int row_groups = decltype(groups)::value;
+                const dim3 block_nums_lds(row_groups == 1 ? block_nums.x : nrows_x / (rows_per_block*row_groups), block_nums.y);
+                const ggml_cuda_kernel_launch_params launch_params_lds(block_nums_lds, block_dims, 0, stream);
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true, lds_tokens, row_groups>, launch_params_lds,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride, compact_moe_routes{});
+                if constexpr (lds_tokens != 0) {
+                    static const bool logged_lds = [] {
+                        if constexpr (row_groups == 2) {
+                            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU LDS prefetch applied: positions=%d row_groups=%d\n",
+                                    lds_tokens, row_groups);
+                        } else {
+                            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU LDS prefetch applied: positions=%d\n", lds_tokens);
+                        }
+                        return true;
+                    }();
+                    GGML_UNUSED(logged_lds);
+                }
+            };
+            bool use_lds = false;
+            if constexpr (type == GGML_TYPE_IQ3_XXS) {
+                static const bool lds_prefetch = [] {
+                    const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                use_lds = lds_prefetch && stride_col_y == iq3_lds_activation_blocks;
+                if (use_lds) {
+                    if (ncols_dst == 2) {
+                        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
+                    } else {
+                        static const bool lds_row_groups = [] {
+                            const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
+                            return value && std::strcmp(value, "1") == 0;
+                        }();
+                        if (lds_row_groups && nrows_x % (2*rows_per_block) == 0) {
+                            launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
+                        } else {
+                            launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});
+                        }
+                    }
+                }
+            }
+            if (!use_lds) {
+                launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
+            }
+            static std::once_flag logged[2];
+            std::call_once(logged[ncols_dst - 2], [ncols_dst] {
+                GGML_LOG_INFO("HIP gfx906 packed IQ sign decoding applied: type=%s routed SwiGLU positions=%u\n",
+                        ggml_type_name(type), ncols_dst);
+            });
+            return;
+        }
+    }
+#endif
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
