@@ -31,6 +31,7 @@ exec sudo docker run --rm -it --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     -e HOME=/tmp -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
     --user "$(id -u):$(id -g)" "${gpu_groups[@]}" \
+    --ulimit memlock=22548578304:22548578304 \
     --device=/dev/kfd --device="$mi50_render" \
     --volume "$repo_root:/workspace/llama.cpp" \
     --volume "$models_dir:/models:ro" \

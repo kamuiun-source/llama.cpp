@@ -147,9 +147,6 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
             throw std::runtime_error("select only one packed expert prefill experiment");
         }
         return large ? 512 : small ? 32 : 0;
-    }()), hip_tuple_mlock([] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_TUPLE_MLOCK");
-        return value && std::strcmp(value, "1") == 0;
     }()) {
     const bool vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "Vulkan") == 0;
     const char * hip_dynamic = std::getenv("LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY");
@@ -182,14 +179,6 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     if (hip_tuple_dma && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap || hip_mtp_direct_ram)) {
         throw std::runtime_error("HIP Expert tuple DMA requires single-bank dynamic residency and three-position MTP support");
     }
-    if (hip_tuple_mlock && !hip_tuple_dma) {
-        throw std::runtime_error("LLAMA_EXPERT_HIP_TUPLE_MLOCK=1 requires HIP Expert tuple DMA");
-    }
-#ifndef __linux__
-    if (hip_tuple_mlock) {
-        throw std::runtime_error("LLAMA_EXPERT_HIP_TUPLE_MLOCK=1 is supported only on Linux");
-    }
-#endif
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
         throw std::runtime_error("HIP expert promotion requires the HIP split placement");
     }
@@ -263,8 +252,8 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     return host;
 }
 
-llama_expert_placement::tuple_buffer_locks::~tuple_buffer_locks() {
 #ifdef __linux__
+llama_expert_placement::tuple_buffer_locks::~tuple_buffer_locks() {
     while (locked != 0) {
         const auto & range = ranges[--locked];
         if (munlock(const_cast<void *>(range.addr), range.size) != 0) {
@@ -273,11 +262,9 @@ llama_expert_placement::tuple_buffer_locks::~tuple_buffer_locks() {
                     range.addr, range.size, std::strerror(error), error);
         }
     }
-#endif
 }
 
 std::unique_ptr<llama_expert_placement::tuple_buffer_locks> llama_expert_placement::lock_tuple_host() const {
-#ifdef __linux__
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         throw std::runtime_error("HIP Expert tuple mlock could not determine the OS page size");
@@ -345,10 +332,8 @@ std::unique_ptr<llama_expert_placement::tuple_buffer_locks> llama_expert_placeme
     LLAMA_LOG_INFO("expert placement HIP tuple mlock: requested=1 buffers=%zu bytes=%zu page_bytes=%zu\n",
             locks->locked, total_bytes, total_page_bytes);
     return locks;
-#else
-    throw std::runtime_error("LLAMA_EXPERT_HIP_TUPLE_MLOCK=1 is supported only on Linux");
-#endif
 }
+#endif
 
 bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llama_model_params & params) {
     if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
@@ -411,7 +396,12 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
         ggml_format_name(tuple.host, "expert_tuple_host.%d", il);
         ggml_format_name(tuple.device, "expert_tuple_bank.%d", il);
     }
+#ifdef __linux__
     tuple_host_locks.reset();
+    constexpr int mlock_requested = 1;
+#else
+    constexpr int mlock_requested = 0;
+#endif
     bank_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(tuple_bank_ctx.get(), device_buft));
     host_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(tuple_host_ctx.get(), host_buft));
     if (!bank_buf || ggml_backend_buffer_is_host(bank_buf.get()) || !host_buf) {
@@ -429,11 +419,13 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
     }
     LLAMA_LOG_INFO("expert placement HIP tuple DMA: pinned_bytes=%zu fallback_bytes=%zu bank_bytes=%zu"
             " resident_payload_bytes=%zu ram_payload_bytes=%zu mlock_requested=%d\n", pinned_bytes, fallback_bytes,
-            ggml_backend_buffer_get_size(bank_buf.get()), resident_payload_bytes, ram_payload_bytes, hip_tuple_mlock);
+            ggml_backend_buffer_get_size(bank_buf.get()), resident_payload_bytes, ram_payload_bytes, mlock_requested);
     if (fallback_bytes) {
         throw std::runtime_error("HIP Expert tuple DMA allocation fell back to pageable memory");
     }
-    auto locks = hip_tuple_mlock ? lock_tuple_host() : nullptr;
+#ifdef __linux__
+    auto locks = lock_tuple_host();
+#endif
     ggml_backend_buffer_set_usage(host_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     ggml_backend_buffer_set_usage(bank_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     ggml_backend_buffer_clear(host_buf.get(), 0);
@@ -476,7 +468,9 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
         ggml_backend_tensor_set_2d(w.bank, resident.data(), 0, bytes, n_resident, tuple.stride, bytes);
         loader.size_done += n_experts * bytes;
     }
+#ifdef __linux__
     tuple_host_locks = std::move(locks);
+#endif
     return true;
 }
 
