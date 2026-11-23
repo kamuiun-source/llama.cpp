@@ -76,6 +76,7 @@ struct llama_expert_placement {
     llama_mlock host_lock;
 
 private:
+#ifdef __linux__
     struct tuple_buffer_locks {
         llama_memory_ranges ranges;
         size_t locked = 0;
@@ -83,10 +84,10 @@ private:
         ~tuple_buffer_locks();
     };
 
-    const bool hip_tuple_mlock;
     // Release OS locks before freeing the native host buffers.
     std::unique_ptr<tuple_buffer_locks> tuple_host_locks;
 
     std::unique_ptr<tuple_buffer_locks> lock_tuple_host() const;
+#endif
     bool load_tuples(llama_model_loader & loader, const llama_model_params & params);
 };

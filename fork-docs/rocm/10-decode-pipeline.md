@@ -169,6 +169,7 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 2026-11-22の運用判断として、入力H2D、戻りD2H、スロット表、昇格時の書き戻しの非同期化と、Expertの連続配置・直接DMAをONにする。従来の単一バンク・固定3幅のDocker起動オプションに以下を加える。個別検証は別作業として保留する。
 
 ```bash
+  --ulimit memlock=22548578304:22548578304 \
   -e GGML_SCHED_HIP_BATCH_DEVICE_INPUTS=1 \
   -e GGML_SCHED_HIP_DUAL_PINNED_HANDOFF=1 \
   -e GGML_SCHED_HIP_ASYNC_INPUT=1 \
@@ -179,6 +180,8 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 ```
 
 直接DMAは、ROCmの単一バンク・固定3幅と `--load-mode none` で検証した。既存の `LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM` は未設定または `0` にする。連続配置はモデル読み込み時に決まるため、切り替えるときはサーバーを起動し直す。計測用のExpertミス集計と詳細トレースは通常起動に含めない。
+
+Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を、読み込み前にOSでもページ固定する。以前の `LLAMA_EXPERT_HIP_TUPLE_MLOCK` は廃止した。Qwen3.8 Flash Nextの検証構成では固定対象が6領域・約19.56 GiBで、Dockerでは上記の21 GiBの `memlock` 上限を使う。`docker_images/rocm_cuda/enter.sh` から入る場合も同じ上限を設定する。上限不足で固定に失敗した場合は、必要バイト数と現在の上限を起動ログに出す。
 
 ## Expert原本の連続配置と直接DMAの調査
 
