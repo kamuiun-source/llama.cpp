@@ -213,6 +213,7 @@ docker run --rm --gpus all \
   -e GGML_CUDA_GDN_GATED_NORM=1 \
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
   -e GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1 \
+  -e GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1 \
   -e LLAMA_EXPERT_HIP_PREFILL=1 \
@@ -229,7 +230,7 @@ Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を�
 
 移植ブランチでSSMとGDNの融合を含むビルドでは、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
-MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、この4設定と直接DMAを共通にする。
+MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
 
 ##### 統合後の移植版を固定5問で確認
 
@@ -576,6 +577,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | GDNのRMS正規化とsigmoidゲートの融合 | `GGML_CUDA_GDN_GATED_NORM` | `1` | `1` | `0` |
 | MI50のIQ2_S・IQ3_XXS符号復号 | `GGML_HIP_GFX906_IQ_SIGN_DECODE` | `1` | `1` | `0` |
 | MI50のIQ2_S Q8_1入力共有 | `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT` | `1` | `1`（LDS・4行がOFFのとき発動） | `0` |
+| MI50のIQ4_NL down復号短縮 | `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE` | `1` | `1` | `0` |
 | MI50のIQ3_XXS LDS先読み | `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH` | `1` | `1` | `0` |
 | MI50のIQ3_XXS LDS出力4行 | `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS` | `1` | `1` | `0` |
 | MI50のIQ2_S LDS先読み | `GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH` | `0` | `1` | `0` |
@@ -884,7 +886,9 @@ Lunaが既存の `e3883094f` ビルドをハッシュで照合し、同じコン
 
 5問全体の2回合算はON 45.60、OFF 45.39 tok/s（+0.46%）。隣接ペアのON−OFF差は+0.50、−0.09 tok/sで方向が揃わず、条件間の差は今回の反復で見えたばらつきに収まる。前回のONで第5問が47.84 tok/s（2654.46 ms）まで落ちた事象は再現せず、今回のONの第5問は各ペアで16.40 ms、1.43 ms短かった。第5問のExpert転送待ちは149.36〜149.80 msで近い。
 
-各回とも640生成IDと本文が基準と一致し、MTP採用数は全5問で一致（計358/549）、検証各276回。応答中のスワップアウトは各回ともホスト・コンテナ0 MiB。ホストスワップインは実行順に43.77 / 335.85 / 28.89 / 83.22 MiB、コンテナは17.12 / 11.72 / 12.39 / 14.66 MiB。全20応答完走、全サーバー終了コード0、ランナー終了コード0。計測と解析はGit外の `/home/t-saka/rocm-iq4-nl-compact-decode-abab-20261125/corrected/`。復号短縮フラグの既定値は従来どおり。
+各回とも640生成IDと本文が基準と一致し、MTP採用数は全5問で一致（計358/549）、検証各276回。応答中のスワップアウトは各回ともホスト・コンテナ0 MiB。ホストスワップインは実行順に43.77 / 335.85 / 28.89 / 83.22 MiB、コンテナは17.12 / 11.72 / 12.39 / 14.66 MiB。全20応答完走、全サーバー終了コード0、ランナー終了コード0。計測と解析はGit外の `/home/t-saka/rocm-iq4-nl-compact-decode-abab-20261125/corrected/`。
+
+2026-11-25、単体・実モデルともにIQ4_NL downのカーネルが短縮し、通常実行の反復で出力とMTP採用数が一致し、第5問の失速も再現しなかったため、移植ブランチの固定3幅の通常起動で `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` を採用した。全体速度差の+0.46%は今回の反復のばらつきに収まる。個別比較は `0` を指定する。
 
 #### 固定3幅のIQ2_Sへの横展開
 

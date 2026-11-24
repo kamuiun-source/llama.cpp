@@ -12,7 +12,7 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有。移植ブランチの通常起動で採用する。比較時は `0`。符号復号をON、IQ2_SのLDS先読みとLDSなし4行をOFFにする。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
 
-`GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮試作。既定OFF。[単体の出力・時間・メモリ要求](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)
+`GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。移植ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
 
 ## Windows Vulkan・高速固定3幅の採用設定
 
