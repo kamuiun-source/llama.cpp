@@ -36,6 +36,8 @@
 
 - 両型LDS先読みON・2行の固定5問を、`--cache-ram 0` でサーバーを再起動しながら3回測定。合算42.53 tok/s、検証48.10 ms/回、全15応答完走。全回MTP採用358/549・出力一致で、応答中のスワップアウトは0。[計測結果](../rocm/10-decode-pipeline.md#iq2_sとiq3_xxsの両方でlds先読み2行)
 
+- 両型LDS先読みOFFを同じ固定3幅で2回追加。生成は37.30と42.73 tok/s、合算39.83 tok/s。第1回だけ第4・5問の本体検証が伸び、スワップアウトは両回0。先行ON 3回の合算42.53 tok/sはOFFの速い回とほぼ同じで、両型の通常設定は変更していない。[ON/OFF結果](../rocm/10-decode-pipeline.md#両型lds先読みoffの追加2回)
+
 ### Linux ROCm の転送改善
 
 - Expert並行転送の最適化は保留し、`codex/rocm-castagna-port` に戻る。別ブランチ `codex/rocm-expert-single-kernel-overlap` の固定3幅再計測は、スワップアウト0の4試行でOFF 40.77、スピンON 40.14 tok/s。500 ms以上の停止やDMAタイムアウトは発生せず、並行転送をOFFのままにする。
