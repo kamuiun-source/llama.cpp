@@ -2935,6 +2935,18 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         ggml_set_name(slots, "ffn_moe_mtp_share_iq3_weights");
     }
 
+#ifdef __linux__
+    static const bool hip_mtp_single_kernel_overlap = [] {
+        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_SINGLE_KERNEL_OVERLAP");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (hip_mtp_single_kernel_overlap && !shared_iq3_weights && target_mtp_verify_packed && !full_map && !cold &&
+            prefill_wave < 0 && !moe_cache->get_cold_slot_map(il, true) &&
+            selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3) {
+        ggml_set_name(slots, "ffn_moe_mtp_single_kernel_overlap");
+    }
+#endif
+
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(gf, slots);
 

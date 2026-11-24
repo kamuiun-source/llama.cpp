@@ -1341,6 +1341,59 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+struct ggml_hip_expert_overlap {
+    static constexpr int max_uploads = 4;
+    static constexpr int rows_per_group = 4;
+    static constexpr int groups = 640 / rows_per_group;
+    static constexpr int wait_timeout_ms = 5000;
+
+    struct gpu_sample {
+        uint64_t entered;
+        struct {
+            uint64_t wait_start;
+            uint64_t ready;
+            uint64_t done;
+        } phase[max_uploads];
+    };
+
+    struct slots {
+        int ids[max_uploads];
+        unsigned count;
+    };
+
+    hipStream_t upload_stream = nullptr;
+    hipEvent_t events[max_uploads] = {};
+    unsigned * host_ticket = nullptr;
+    unsigned * device_ticket = nullptr;
+    uint64_t timeout_ticks = 0;
+    unsigned base = 0;
+    const ggml_cgraph * graph = nullptr;
+    const ggml_tensor * first = nullptr;
+    const ggml_tensor * output = nullptr;
+    const ggml_tensor * bank = nullptr;
+    slots cold = {};
+    int experts[max_uploads] = {};
+    char bank_name[GGML_MAX_NAME] = {};
+
+    gpu_sample * gpu_samples = nullptr;
+    gpu_sample * host_samples = nullptr;
+    hipEvent_t samples_done = nullptr;
+    unsigned sample_sequence = 0;
+    slots sample_cold = {};
+    int sample_experts[max_uploads] = {};
+    char sample_bank_name[GGML_MAX_NAME] = {};
+    bool samples_pending = false;
+
+    gpu_sample * begin_gpu_sample();
+    void submit_gpu_sample(hipStream_t stream);
+    void collect_gpu_samples();
+
+    ~ggml_hip_expert_overlap();
+    void finish(bool publish);
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1378,6 +1431,9 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device);
 
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    std::unique_ptr<ggml_hip_expert_overlap> expert_overlap;
+#endif
 
     ~ggml_backend_cuda_context();
 

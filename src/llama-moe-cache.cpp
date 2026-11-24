@@ -497,6 +497,10 @@ struct llama_moe_cache::impl {
     bool defer_slot_map_requested = false;
     using submit_expert_upload_t = bool (*)(ggml_backend_t);
     submit_expert_upload_t submit_expert_upload = nullptr;
+    using stage_hip_expert_overlap_t = bool (*)(ggml_backend_t, const ggml_cgraph *, const ggml_tensor *,
+            const ggml_tensor *, const void * const *, const int *, const int *, unsigned, size_t);
+    stage_hip_expert_overlap_t stage_hip_expert_overlap = nullptr;
+    size_t hip_expert_overlap_staged[4] = {};
     using overlap_expert_upload_t = bool (*)(ggml_backend_t, const ggml_cgraph *, ggml_tensor *, const int32_t *,
             const int32_t *, const uint32_t *, ggml_tensor * const *, const void *, const size_t *, const size_t *, const size_t *, size_t);
     overlap_expert_upload_t overlap_expert_upload = nullptr;
@@ -822,6 +826,14 @@ struct llama_moe_cache::impl {
             const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
             const char * target_name = target_reg ? ggml_backend_reg_name(target_reg) : "";
             const auto reg = std::strcmp(target_name, "Vulkan") == 0 ? target_reg : nullptr;
+#ifdef __linux__
+            const char * single_kernel_overlap = std::getenv("LLAMA_EXPERT_HIP_MTP3_SINGLE_KERNEL_OVERLAP");
+            if (placement->hip_tuple_dma && std::strcmp(target_name, "ROCm") == 0 &&
+                    single_kernel_overlap && std::strcmp(single_kernel_overlap, "1") == 0) {
+                stage_hip_expert_overlap = reinterpret_cast<stage_hip_expert_overlap_t>(
+                        ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_hip_stage_expert_overlap_v2"));
+            }
+#endif
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
             const char * telemetry = std::getenv("LLAMA_DECODE_TELEMETRY");
             packed_miss_histogram = telemetry && std::strcmp(telemetry, "1") == 0 &&
@@ -2245,6 +2257,46 @@ struct llama_moe_cache::impl {
         }
     }
 
+    size_t stage_hip_single_kernel_upload(ggml_backend_t backend, const ggml_cgraph * graph, const ggml_tensor * lookup,
+            const layer & l, int32_t il, int32_t promote_index, int32_t evict) {
+        constexpr size_t max_uploads = 4;
+        if (fills.empty() || fills.size() > max_uploads) {
+            return 0;
+        }
+        const auto & tuple = placement->tuples[il];
+        const auto & map = placement->maps[il];
+        std::array<const void *, max_uploads> sources;
+        std::array<int, max_uploads> slots, experts;
+        const auto promotion = evict >= 0 ? prepare_packed_promotion(l, il, promote_index, evict) : packed_promotion{};
+        for (size_t i = 0; i < fills.size(); ++i) {
+            const auto & fill = fills[i];
+            const int host_slot = map.host[fill.expert];
+            const int slot = packed_slot(l, fill.slot);
+            if (host_slot < 0 || size_t(host_slot) >= ggml_nbytes(tuple.host) / tuple.stride) {
+                return 0;
+            }
+            // A concurrent promotion may only read and replace storage outside the DMA regions.
+            if (evict >= 0 && (host_slot == promotion.host_slot || slot == promotion.old_gpu_slot ||
+                    slot == promotion.new_gpu_slot)) {
+                return 0;
+            }
+            sources[i] = static_cast<const uint8_t *>(tuple.host->data) + host_slot * tuple.stride;
+            slots[i] = slot;
+            experts[i] = fill.expert;
+        }
+        telemetry_scope scope(set_telemetry_cause, "expert_upload");
+        if (!stage_hip_expert_overlap(backend, graph, lookup, tuple.device, sources.data(), slots.data(), experts.data(), fills.size(),
+                tuple.stride)) {
+            return 0;
+        }
+        const size_t bytes = fills.size() * tuple.stride;
+        tuple_h2d_count += fills.size();
+        tuple_h2d_payload_bytes += fills.size() * tuple.payload_bytes;
+        tuple_h2d_bytes += bytes;
+        ++hip_expert_overlap_staged[fills.size() - 1];
+        return bytes;
+    }
+
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false,
                          bool fine_profile = false) {
@@ -3087,8 +3139,36 @@ struct llama_moe_cache::impl {
             if (fine_profile) {
                 packed_staging_totals.plan_us += ggml_time_us() - plan_begin;
             }
+            const auto write_slot_map = [&] {
+                telemetry_scope scope(set_telemetry_cause, "slot_map");
+                const int64_t map_start = fine_profile ? ggml_time_us() : 0;
+                const size_t bytes_map = ggml_nbytes(dst);
+                if (hip_async_slot_map && dst->buffer &&
+                        ggml_backend_buffer_get_type(dst->buffer) == ggml_backend_get_default_buffer_type(backend)) {
+                    GGML_ASSERT(bytes_map == sizeof(slots));
+                    auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get()));
+                    staging += il * sizeof(slots);
+                    // This callback's destination wait has drained any prior use of this layer's staging.
+                    std::memcpy(staging, slots.data(), bytes_map);
+                    ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
+                    if (fixed_four) {
+                        ++hip_mtp4_async_maps;
+                    } else {
+                        ++hip_mtp_async_maps;
+                        hip_mtp_async_map_bytes += bytes_map;
+                    }
+                } else {
+                    ggml_backend_tensor_set(dst, slots.data(), 0, bytes_map);
+                    packed_synchronous_maps += defer_slot_map_requested;
+                }
+                if (fine_profile) {
+                    packed_staging_totals.map_us += ggml_time_us() - map_start;
+                }
+            };
             bool upload_submitted = false;
             bool overlap_submitted = false;
+            bool hip_single_kernel_submitted = false;
+            bool slot_map_written = false;
             const bool can_overlap = !hip_direct && (!use_waves || overlap_three_fit) && overlap_expert_upload &&
                     !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
@@ -3103,7 +3183,16 @@ struct llama_moe_cache::impl {
                         overlap_submitted = overlap_packed_upload(backend, graph, dst, l, il, n_used, slots, promote_index, evict, bytes, overlap_copied_bytes);
                         mtp_overlap_submitted += overlap_three_fit && overlap_submitted;
                     }
-                    if (!overlap_submitted && !fills.empty()) {
+                    if (stage_hip_expert_overlap && fixed_three && !early && !profile && !use_waves && !rtx_expert &&
+                            !fills.empty() && fills.size() <= std::size(hip_expert_overlap_staged) && sched && ggml_backend_sched_get_n_copies(sched) == 1 &&
+                            std::strcmp(lookup->name, "ffn_moe_mtp_single_kernel_overlap") == 0) {
+                        // The slot-map H2D must be submitted ahead of the large tuple copies.
+                        write_slot_map();
+                        slot_map_written = true;
+                        bytes = stage_hip_single_kernel_upload(backend, graph, lookup, l, il, promote_index, evict);
+                        hip_single_kernel_submitted = bytes != 0;
+                    }
+                    if (!hip_single_kernel_submitted && !overlap_submitted && !fills.empty()) {
                         bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr,
                                 overlap_copied_bytes, false, hip_direct, fine_profile);
                     }
@@ -3114,7 +3203,7 @@ struct llama_moe_cache::impl {
                     throw;
                 }
             }
-            if (n_uploads > 0 && !upload_submitted && !overlap_submitted) {
+            if (n_uploads > 0 && !hip_single_kernel_submitted && !upload_submitted && !overlap_submitted) {
                 if (!batch) {
                     telemetry_scope scope(set_telemetry_cause, "expert_upload");
                     ggml_backend_synchronize(backend);
@@ -3152,7 +3241,7 @@ struct llama_moe_cache::impl {
                 packed_overlap_uploads += bytes != 0;
                 packed_overlap_upload_bytes += bytes;
                 ++packed_deferred_maps;
-            } else if (defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
+            } else if (!slot_map_written && defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
                 ++packed_deferred_maps;
                 if (upload_submitted) {
                     ++packed_deferred_uploads;
@@ -3166,32 +3255,11 @@ struct llama_moe_cache::impl {
                     ++packed_wait_count;
                     upload_submitted = false;
                 }
-                telemetry_scope scope(set_telemetry_cause, "slot_map");
-                const int64_t map_start = fine_profile ? ggml_time_us() : 0;
-                const size_t bytes_map = ggml_nbytes(dst);
-                if (hip_async_slot_map && dst->buffer &&
-                        ggml_backend_buffer_get_type(dst->buffer) == ggml_backend_get_default_buffer_type(backend)) {
-                    GGML_ASSERT(bytes_map == sizeof(slots));
-                    auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get()));
-                    staging += il * sizeof(slots);
-                    // This callback's destination wait has drained any prior use of this layer's staging.
-                    std::memcpy(staging, slots.data(), bytes_map);
-                    ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
-                    if (fixed_four) {
-                        ++hip_mtp4_async_maps;
-                    } else {
-                        ++hip_mtp_async_maps;
-                        hip_mtp_async_map_bytes += bytes_map;
-                    }
-                } else {
-                    ggml_backend_tensor_set(dst, slots.data(), 0, bytes_map);
-                    packed_synchronous_maps += defer_slot_map_requested;
-                }
-                if (fine_profile) {
-                    packed_staging_totals.map_us += ggml_time_us() - map_start;
+                if (!slot_map_written) {
+                    write_slot_map();
                 }
             }
-            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !upload_submitted && !overlap_submitted;
+            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !hip_single_kernel_submitted && !upload_submitted && !overlap_submitted;
             stats_small.hits += hits + scratch_hits;
             packed_scratch_hits += scratch_hits;
             stats_small.misses += n_uploads;
@@ -3373,6 +3441,11 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed HIP MTP3 async promotion: submits=%zu commits=%zu bytes=%zu wait_ms=%.3f pending=%d\n",
                         hip_mtp_promotion_submits, hip_mtp_promotion_commits, hip_mtp_promotion_bytes,
                         hip_mtp_promotion_wait_us / 1000.0, hip_mtp_pending_move.n_planes != 0);
+            }
+            if (stage_hip_expert_overlap) {
+                LLAMA_LOG_INFO("packed expert HIP MTP3 single-kernel overlap staged: cold1=%zu cold2=%zu cold3=%zu cold4=%zu\n",
+                        hip_expert_overlap_staged[0], hip_expert_overlap_staged[1],
+                        hip_expert_overlap_staged[2], hip_expert_overlap_staged[3]);
             }
             if (placement->hip_tuple_dma) {
                 LLAMA_LOG_INFO("packed HIP Expert tuple DMA: h2d=%zu h2d_payload_bytes=%zu h2d_bytes=%zu compact_h2d=%zu"

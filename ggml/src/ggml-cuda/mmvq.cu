@@ -4,6 +4,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -918,6 +919,91 @@ static constexpr bool compact_moe_type(ggml_type type) {
     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q2_0;
 }
+
+#ifdef __linux__
+template<bool sample_timeline>
+static __global__ void mul_mat_vec_iq3_xxs_moe_overlap(
+        const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * input,
+        const int32_t * ids, float * dst, int ids_stride, int expert_stride, int row_stride,
+        int input_stride, int dst_rank_stride, int dst_token_stride,
+        ggml_hip_expert_overlap::slots cold, unsigned * ready, unsigned base, uint64_t timeout_ticks,
+        ggml_hip_expert_overlap::gpu_sample * samples) {
+    constexpr int wave_size = ggml_cuda_get_physical_warp_size();
+    constexpr int lane_group = QI3_XXS / VDR_IQ3_XXS_Q8_1_MMVQ;
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    const int iqs = (lane % lane_group) * VDR_IQ3_XXS_Q8_1_MMVQ;
+
+    ggml_hip_expert_overlap::gpu_sample * sample = nullptr;
+    if constexpr (sample_timeline) {
+        if (lane == 0) {
+            sample = samples + row;
+            sample->entered = wall_clock64();
+        }
+    }
+
+    for (int phase = -1; phase < int(cold.count); ++phase) {
+        if (phase >= 0) {
+            if (phase == 0) {
+                // Each workgroup finishes its hot output rows before any cold wait.
+                __syncthreads();
+            }
+            const unsigned expected = base + phase + 1;
+            const uint64_t begin = wall_clock64();
+            if constexpr (sample_timeline) {
+                if (lane == 0) {
+                    sample->phase[phase].wait_start = begin;
+                }
+            }
+            while (!__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected)) {
+                if (__any(wall_clock64() - begin >= timeout_ticks)) {
+                    // Never let down projection consume partial output.
+                    __builtin_trap();
+                }
+                __builtin_amdgcn_s_sleep(1);
+            }
+            if constexpr (sample_timeline) {
+                if (lane == 0) {
+                    sample->phase[phase].ready = wall_clock64();
+                }
+            }
+        }
+
+        for (int position = 0; position < 3; ++position) {
+            for (int rank = 0; rank < 10; ++rank) {
+                const int slot = ids[position * ids_stride + rank];
+                int ticket = -1;
+                for (unsigned i = 0; i < cold.count; ++i) {
+                    if (slot == cold.ids[i]) {
+                        ticket = i;
+                    }
+                }
+                if (ticket != phase) {
+                    continue;
+                }
+                const int weight_row = slot * expert_stride + row * row_stride;
+                float u = 0.f;
+                float g = 0.f;
+                for (int block = lane / lane_group; block < 10; block += wave_size / lane_group) {
+                    const auto * x = input + position * input_stride + block * (QK_K / QK8_1);
+                    u += vec_dot_iq3_xxs_q8_1(up + weight_row, x, block, iqs);
+                    g += vec_dot_iq3_xxs_q8_1(gate + weight_row, x, block, iqs);
+                }
+                u = warp_reduce_sum<wave_size>(u);
+                g = warp_reduce_sum<wave_size>(g);
+                if (lane == 0) {
+                    dst[position * dst_token_stride + rank * dst_rank_stride + row] = u * ggml_cuda_op_silu_single(g);
+                }
+            }
+        }
+        if constexpr (sample_timeline) {
+            if (phase >= 0 && lane == 0) {
+                sample->phase[phase].done = wall_clock64();
+            }
+        }
+    }
+}
+#endif
 
 static __device__ __forceinline__ void iq3_xxs_dot_shared_tokens(
         const block_iq3_xxs & weight, const block_q8_1 * input, int input_stride,
@@ -1838,6 +1924,37 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
 #ifdef GGML_USE_HIP
+#ifdef __linux__
+    if (ctx.expert_overlap && ctx.expert_overlap->graph && ctx.expert_overlap->output == dst) {
+        auto & plan = *ctx.expert_overlap;
+        constexpr int rows = ggml_hip_expert_overlap::rows_per_group;
+        const auto & device = ggml_cuda_info().devices[ctx.device];
+        const ggml_cuda_kernel_launch_params params(dim3(ggml_hip_expert_overlap::groups), dim3(device.warp_size, rows), 0, stream);
+        auto * samples = plan.begin_gpu_sample();
+        const auto launch = [&](auto sample_timeline) {
+            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_moe_overlap<decltype(sample_timeline)::value>, params,
+                    static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                    static_cast<const block_q8_1 *>(src1_q8_1), ids_d, dst_d, int(ids_stride), int(s02), int(s01),
+                    int(stride_col_y), int(stride_channel_dst), int(stride_col_dst), plan.cold, plan.device_ticket,
+                    plan.base, plan.timeout_ticks, samples);
+        };
+        if (samples) {
+            launch(std::true_type{});
+        } else {
+            launch(std::false_type{});
+        }
+        static std::atomic<bool> logged[ggml_hip_expert_overlap::max_uploads] = {};
+        const unsigned count = plan.cold.count;
+        plan.finish(true);
+        if (samples) {
+            plan.submit_gpu_sample(stream);
+        }
+        if (!logged[count - 1].exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU single-kernel overlap: MTP positions=3 cold_uploads=%u\n", count);
+        }
+        return;
+    }
+#endif
     const auto * lookup = ids ? ids->view_src : nullptr;
     if (lookup && lookup->op == GGML_OP_GET_ROWS && std::strcmp(lookup->name, "ffn_moe_mtp_share_iq3_weights") == 0 &&
             src0->type == GGML_TYPE_IQ3_XXS && ne00 == 2560 && ne01 == 640 && ncols_dst == 3 &&
