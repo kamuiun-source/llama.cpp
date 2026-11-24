@@ -630,6 +630,7 @@ struct llama_moe_cache::impl {
     int64_t prompt_trace_request_id = -1;
     std::vector<llama_pos> prompt_trace_positions;
     std::unique_ptr<FILE, decltype(&fclose)> generation_trace{nullptr, fclose};
+    bool next_router_trace = false;
     std::vector<llama_pos> generation_trace_positions;
     uint64_t generation_trace_step = 0;
     uint64_t generation_trace_memcpy_us = 0;
@@ -1040,6 +1041,8 @@ struct llama_moe_cache::impl {
                 if (!generation_trace) {
                     throw std::runtime_error("could not open packed expert generation trace");
                 }
+                const char * next_router = std::getenv("LLAMA_EXPERT_NEXT_ROUTER_TRACE");
+                next_router_trace = next_router && std::strcmp(next_router, "1") == 0;
                 std::ostringstream header;
                 header << "{\"type\":\"header\",\"version\":1,\"experts\":" << llama_expert_profile::n_experts
                        << ",\"resident_count\":" << llama_expert_profile::n_resident
@@ -3663,6 +3666,36 @@ void llama_moe_cache::end_generation_trace(bool success) {
     std::ostringstream row;
     row << "{\"type\":\"end\",\"request\":" << self.generation_trace_request << ",\"step\":" << self.generation_trace_step
         << ",\"success\":" << (success ? "true" : "false") << "}\n";
+    self.write_expert_trace(self.generation_trace.get(), row.str());
+}
+
+bool llama_moe_cache::next_router_trace_active() const {
+    const auto & self = *pimpl;
+    return self.next_router_trace && self.generation_trace_verify_width == 3 &&
+            self.generation_trace_positions.size() == 3;
+}
+
+void llama_moe_cache::trace_next_router(int32_t il, const ggml_tensor * ids) {
+    const auto & self = *pimpl;
+    constexpr int n_tokens = 3;
+    constexpr int n_used = 10;
+    std::array<int32_t, n_tokens * n_used> predicted;
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ggml_nbytes(ids) == sizeof(predicted));
+    ggml_backend_tensor_get(ids, predicted.data(), 0, sizeof(predicted));
+
+    std::ostringstream row;
+    row << "{\"type\":\"router_prediction\",\"request\":" << self.generation_trace_request
+        << ",\"step\":" << self.generation_trace_step << ",\"layer\":" << il << ",\"positions\":";
+    prompt_trace_array(row, self.generation_trace_positions);
+    row << ",\"predicted\":[";
+    for (int token = 0; token < n_tokens; ++token) {
+        row << (token ? ",[" : "[");
+        for (int rank = 0; rank < n_used; ++rank) {
+            row << (rank ? "," : "") << predicted[token * n_used + rank];
+        }
+        row << ']';
+    }
+    row << "]}\n";
     self.write_expert_trace(self.generation_trace.get(), row.str());
 }
 

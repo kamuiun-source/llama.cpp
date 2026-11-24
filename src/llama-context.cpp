@@ -2100,7 +2100,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    gparams.trace_next_router = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_expert_used() == 10 &&
+            model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed &&
+            moe_cache && moe_cache->next_router_trace_active();
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2159,6 +2162,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (!res->t_next_router.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        for (size_t i = 0; i < res->t_next_router.size(); ++i) {
+            moe_cache->trace_next_router(i + 1, res->t_next_router[i]);
+        }
+    }
 
     return res;
 }

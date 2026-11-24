@@ -31,6 +31,8 @@ public:
     void end_prompt_trace(bool success);
     void begin_generation_trace(const llama_ubatch & ubatch, uint32_t verify_width);
     void end_generation_trace(bool success);
+    bool next_router_trace_active() const;
+    void trace_next_router(int32_t il, const ggml_tensor * ids);
     void record_decode_width(uint32_t tokens);
     void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;
