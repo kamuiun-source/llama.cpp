@@ -1105,9 +1105,8 @@ struct llama_moe_cache::impl {
                         model.hparams.n_expert_used() != 10 || model.hparams.n_expert_groups > 1 ||
                         !placement->hip_tuple_dma || !placement->hip_mtp_verify_three || placement->hip_mtp_verify_four ||
                         !placement->dynamic_resident || placement->overlap || placement->hip_mtp_overlap ||
-                        placement->hip_prefill == llama_expert_placement::hip_overlap_mode::async ||
-                        hip_mtp_promotion_async || (single_kernel && std::strcmp(single_kernel, "1") == 0)) {
-                    throw std::runtime_error("HIP next Router prefetch requires Qwen4EXP packed MTP3 tuple DMA and serial promotion, with other Expert upload overlap off");
+                        (single_kernel && std::strcmp(single_kernel, "1") == 0)) {
+                    throw std::runtime_error("HIP next Router prefetch requires Qwen4EXP packed MTP3 tuple DMA with dynamic residency. Disable split and single-kernel Expert overlap.");
                 }
                 init_next_prefetch();
             }
@@ -1776,6 +1775,7 @@ struct llama_moe_cache::impl {
     void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict, bool mtp_four) {
         GGML_ASSERT(!hip_mtp_pending_move.n_planes);
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
+        wait_next_prefetch_source(il, move.host_slot);
         auto * data = move.planes[0].host_data;
         if (!placement->hip_tuple_dma) {
             GGML_ASSERT(move.bytes <= ggml_backend_buffer_get_size(hip_mtp_promotion_staging.get()));
