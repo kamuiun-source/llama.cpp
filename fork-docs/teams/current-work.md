@@ -6,6 +6,8 @@
 
 ## 現在の状態
 
+- 次層Expert先読みON/OFFを固定3幅の5問で計6回実施。応答中スワップアウト0の合算はOFF 35.88（2回）、ON 38.18 tok/s（3回）。最後の組は38.55→39.29 tok/s。OFFの第5問でも182.32 MiBの退避が発生。Astraはヒープの正味退避増加、固定領域のTHP変化、既存サンプラーの一時複製を確認した。回収の発行元とヒープ内のオブジェクトは未特定。[実測と既存経路](../rocm/09-single-bank-mtp3.md#スワップを監視したonoff比較)
+
 - 次層Expert先読みの比較ログ `LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` を追加。固定3幅の生成検証に絞り、スケジューラ分割とHCノード数、通常H2D、予測IDの読み出し、先読みH2D・ヒットD2Dを比較する。保存済み起動ログではHC pre・comb・postは先読みON/OFFとも有効。GPU時間とカーネル回数は既存プロファイラーで別計測する。[計測設定](../rocm/09-single-bank-mtp3.md#次層expert先読み単体のonoff計測)
 
 - Astraが次層Expert先読みのスワップをレビュー。明示的なホストのExpert複製や継続的な割り当て増加は確認できず、退避の一部は既存cuBLASLtの書き込み領域と特定。先読みONのまま `--ctx-checkpoints 2` で5問を3回測り、応答中スワップアウトは0、155.36、0 MiB。チェックポイント削減後も再現した。[コードレビューと実測](../rocm/09-single-bank-mtp3.md#先読みonのスワップアウトをastraがレビュー)
