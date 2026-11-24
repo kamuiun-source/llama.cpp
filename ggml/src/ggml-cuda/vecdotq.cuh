@@ -1248,6 +1248,38 @@ static __device__ __forceinline__ float vec_dot_iq_q8_1_loaded(
     return d * sumi;
 }
 
+static __device__ __forceinline__ void vec_dot_iq2_s_q8_1_pair(
+        const iq2_s_mmvq_weights & up, const iq2_s_mmvq_weights & gate, const block_q8_1 & activation,
+        float & up_sum, float & gate_sum) {
+    const auto decode = [](const iq2_s_mmvq_weights & weight, int l) {
+        const auto * qs = reinterpret_cast<const uint8_t *>(&weight.qs);
+        const auto * signs = reinterpret_cast<const uint8_t *>(&weight.signs);
+        const uint64_t grid = iq2s_grid[qs[l/2] | ((int(weight.qh) << (8-l)) & 0x300)];
+        return make_int2(iq_apply_packed_signs(uint32_t(grid), signs[l/2]),
+                         iq_apply_packed_signs(uint32_t(grid >> 32), signs[l/2] >> 4));
+    };
+
+    int sum_up[2] = {};
+    int sum_gate[2] = {};
+#pragma unroll
+    for (int l = 0; l < 8; l += 2) {
+        const int u0 = get_int_b4(activation.qs, l);
+        const int u1 = get_int_b4(activation.qs, l + 1);
+        const int2 up_grid = decode(up, l);
+        const int2 gate_grid = decode(gate, l);
+        const int half = l / 4;
+        sum_up[half]   = ggml_cuda_dp4a(up_grid.x, u0, sum_up[half]);
+        sum_gate[half] = ggml_cuda_dp4a(gate_grid.x, u0, sum_gate[half]);
+        sum_up[half]   = ggml_cuda_dp4a(up_grid.y, u1, sum_up[half]);
+        sum_gate[half] = ggml_cuda_dp4a(gate_grid.y, u1, sum_gate[half]);
+    }
+    const int up_scaled = (sum_up[0]*(up.scales & 0x0F) + sum_up[1]*(up.scales >> 4) + (sum_up[0] + sum_up[1])/2)/4;
+    const int gate_scaled = (sum_gate[0]*(gate.scales & 0x0F) + sum_gate[1]*(gate.scales >> 4) + (sum_gate[0] + sum_gate[1])/2)/4;
+    const float activation_d = __low2float(activation.ds);
+    up_sum   += (__half2float(up.d) * activation_d) * up_scaled;
+    gate_sum += (__half2float(gate.d) * activation_d) * gate_scaled;
+}
+
 template <bool packed_signs>
 static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {

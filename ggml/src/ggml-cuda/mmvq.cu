@@ -1020,7 +1020,7 @@ static constexpr int iq_lds_activation_blocks = iq_lds_ncols / QK8_1;
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
-          int iq_lds_tokens = 0, int iq_row_groups = 1>
+          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1043,6 +1043,9 @@ static __global__ void mul_mat_vec_q_moe(
 
     static_assert(iq_row_groups == 1 || (iq_row_groups == 2 && (iq_lds_tokens == 3 ||
         (iq_lds_tokens == 0 && type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion && packed_signs))));
+
+    static_assert(!iq2_paired_dot || (type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion &&
+        packed_signs && iq_lds_tokens == 0 && iq_row_groups == 1));
 
     using grid_entry = std::conditional_t<type == GGML_TYPE_IQ2_S, uint64_t, uint32_t>;
     const grid_entry * staged_grid = nullptr;
@@ -1167,10 +1170,17 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
                 for (int i = 0; i < c_rows_per_block; ++i) {
-                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    const int weight = kbx_offset + i*stride_row_x + kbx;
+                    if constexpr (iq2_paired_dot) {
+                        const auto up = load_iq_mmvq_weights(static_cast<const block_iq2_s *>(vx)[weight], kqs);
+                        const auto gate = load_iq_mmvq_weights(static_cast<const block_iq2_s *>(vgate)[weight], kqs);
+                        vec_dot_iq2_s_q8_1_pair(up, gate, y[kby + kqs/2], tmp[i], tmp_gate[i]);
+                    } else {
+                        tmp[i] += vec_dot_q_cuda(vx, &y[kby], weight, kqs);
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], weight, kqs);
+                            }
                         }
                     }
                 }
@@ -1441,6 +1451,29 @@ static void mul_mat_vec_q_moe_launch(
             const bool use_lds = (live_lds_mode < 0 ? lds_prefetch : live_lds_mode != 0) &&
                 stride_col_y == iq_lds_activation_blocks &&
                 (type == GGML_TYPE_IQ3_XXS || ncols_dst == 3);
+            static std::once_flag logged[2];
+            std::call_once(logged[ncols_dst - 2], [ncols_dst] {
+                GGML_LOG_INFO("HIP gfx906 packed IQ sign decoding applied: type=%s routed SwiGLU positions=%u\n",
+                        ggml_type_name(type), ncols_dst);
+            });
+            if constexpr (type == GGML_TYPE_IQ2_S) {
+                static const bool paired_dot = [] {
+                    const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_PAIRED_DOT");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                if (paired_dot && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true>, launch_params,
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        ncols_dst, ids_stride);
+                    static const bool logged = [] {
+                        GGML_LOG_INFO("HIP gfx906 IQ2_S routed SwiGLU paired dot applied: positions=3 rows_per_block=2\n");
+                        return true;
+                    }();
+                    GGML_UNUSED(logged);
+                    return;
+                }
+            }
             if (use_no_lds_row_groups) {
                 if constexpr (type == GGML_TYPE_IQ2_S) {
                     launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{});
@@ -1461,11 +1494,6 @@ static void mul_mat_vec_q_moe_launch(
             } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
                 launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
             }
-            static std::once_flag logged[2];
-            std::call_once(logged[ncols_dst - 2], [ncols_dst] {
-                GGML_LOG_INFO("HIP gfx906 packed IQ sign decoding applied: type=%s routed SwiGLU positions=%u\n",
-                        ggml_type_name(type), ncols_dst);
-            });
             return;
         }
     }

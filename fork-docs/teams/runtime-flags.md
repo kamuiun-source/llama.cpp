@@ -10,6 +10,8 @@
 
 IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` で有効になり、`GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS=1` も指定すると4行になる。両変数の既定はOFF。IQ2_Sだけで試す場合はIQ3_XXSのLDSフラグをOFFにする。
 
+`GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有を試すフラグ。既定OFF。符号復号をONにし、IQ2_SのLDS先読みとLDSなし4行はOFFにする。[同一入力での単体比較](../rocm/10-decode-pipeline.md#iq2_sのgateupでq8_1入力を共有)
+
 ## Windows Vulkan・高速固定3幅の採用設定
 
 | 対象 | 設定 |
