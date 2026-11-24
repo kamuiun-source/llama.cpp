@@ -1015,12 +1015,54 @@ static __global__ void mul_mat_vec_iq3_xxs_moe_share_weights(
 static constexpr int iq_lds_ncols = 2560;
 static constexpr int iq_lds_activation_blocks = iq_lds_ncols / QK8_1;
 
+#ifdef GGML_USE_HIP
+static __device__ __forceinline__ uint32_t iq4_nl_down_bank_selector(uint32_t shifted) {
+#if defined(__gfx906__)
+    uint32_t result;
+    asm("v_and_or_b32 %0, %1, %2, %3" : "=v"(result) :
+        "v"(shifted), "s"(uint32_t{0x04040404}), "v"(uint32_t{0x03020100}));
+    return result;
+#else
+    return 0x03020100u | (shifted & 0x04040404u);
+#endif
+}
+
+static __device__ __forceinline__ int2 iq4_nl_down_decode(uint32_t q) {
+    const auto * table = reinterpret_cast<const uint32_t *>(kvalues_iq4nl);
+    const uint32_t even = q & 0x07070707u;
+    const uint32_t odd = (q >> 4) & 0x07070707u;
+    const uint32_t even_low = ggml_hip_perm(table[1], table[0], even);
+    const uint32_t even_high = ggml_hip_perm(table[3], table[2], even);
+    const uint32_t odd_low = ggml_hip_perm(table[1], table[0], odd);
+    const uint32_t odd_high = ggml_hip_perm(table[3], table[2], odd);
+    // Move each nibble's high bit directly to the byte selector's bank bit.
+    const uint32_t even_select = iq4_nl_down_bank_selector(q >> 1);
+    const uint32_t odd_select = iq4_nl_down_bank_selector(q >> 5);
+    return make_int2(ggml_hip_perm(even_high, even_low, even_select), ggml_hip_perm(odd_high, odd_low, odd_select));
+}
+
+static __device__ __forceinline__ float vec_dot_iq4_nl_down_compact(
+        const void * weights, const block_q8_1 * activation, const int & block, const int & iqs) {
+    const auto & weight = static_cast<const block_iq4_nl *>(weights)[block];
+    const auto * q8 = reinterpret_cast<const int *>(activation->qs) + iqs;
+    int sum = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+        const int2 decoded = iq4_nl_down_decode(get_int_b2(weight.qs, iqs + l));
+        sum = ggml_cuda_dp4a(decoded.x, q8[l], sum);
+        sum = ggml_cuda_dp4a(decoded.y, q8[l + 4], sum);
+    }
+    const float d = __half2float(weight.d) * __low2float(activation->ds);
+    return d * sum;
+}
+#endif
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
-          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false>
+          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1039,7 +1081,13 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
+    static_assert(!iq4_compact_decode || (type == GGML_TYPE_IQ4_NL && c_rows_per_block == 2 && !has_fusion &&
+        !packed_signs && iq_lds_tokens == 0 && iq_row_groups == 1 && !iq2_paired_dot));
+#ifdef GGML_USE_HIP
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = iq4_compact_decode ? vec_dot_iq4_nl_down_compact : get_vec_dot_q_cuda<packed_signs>(type);
+#else
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
+#endif
 
     static_assert(iq_row_groups == 1 || (iq_row_groups == 2 && (iq_lds_tokens == 3 ||
         (iq_lds_tokens == 0 && type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion && packed_signs))));
@@ -1399,6 +1447,26 @@ static void mul_mat_vec_q_moe_launch(
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
 #ifdef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        static const bool compact_decode = [] {
+            const char * value = std::getenv("GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (compact_decode && !has_fusion && !fusion.shared_up && ncols_x == 640 && nrows_x == 2560 &&
+                ncols_dst == 3 && nchannels_dst == 10 && nchannels_y.z == 10 &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+            static const bool logged = [] {
+                GGML_LOG_INFO("HIP gfx906 IQ4_NL routed down compact decode applied: positions=3 rows_per_block=2\n");
+                return true;
+            }();
+            GGML_UNUSED(logged);
+            return;
+        }
+    }
     if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
         if ((ncols_dst == 2 || ncols_dst == 3) && ncols_x == iq_lds_ncols && nrows_x == 640 && nchannels_dst == 10 &&
                 nchannels_y.z == 1 &&
