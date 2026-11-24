@@ -6,6 +6,8 @@
 
 ## 現在の状態
 
+- 次層Expertの先読みには、層LのRouter入力を層L+1の既存Routerへ渡す方法がある。Mixtral-Offloadingに実装例があり、QWEN4EXPのHCを通る実入力との差と、MI50にないExpertの捕捉率は未計測。従来の履歴先読みおよび同層の並行転送と分けて扱う。[調査メモ](../rocm/09-single-bank-mtp3.md#現在の隠れ状態で次層のrouterを先に実行する候補)
+
 ### Linux ROCm の転送改善
 
 - `GGML_HIP_MTP3_EXPERT_SPIN_WAVE_LEADER_RETRY=1` を既定OFFで追加。gfx906の命令列でレーン0だけの再読と全レーンでの最終確認を確認。スピンの失敗反復のL1無効化は残った。固定5問×2組は全4回完走して出力とMTP一致、合算36.55→32.29 tok/s、0.5秒以上の出力間隔は1→3件。 [レーン0再試行](../rocm/09-single-bank-mtp3.md#waveのレーン0でスピン再試行)
