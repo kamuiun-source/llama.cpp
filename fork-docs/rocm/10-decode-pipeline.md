@@ -212,6 +212,7 @@ docker run --rm --gpus all \
   -e GGML_CUDA_UNARY_MUL_BCAST=1 \
   -e GGML_CUDA_GDN_GATED_NORM=1 \
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
+  -e GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1 \
   -e LLAMA_EXPERT_HIP_PREFILL=1 \
@@ -228,7 +229,7 @@ Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を�
 
 移植ブランチでSSMとGDNの融合を含むビルドでは、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
-MI50の固定3幅では、符号復号・LDS先読み・出力4行を上記の3つの `GGML_HIP_GFX906_IQ*` フラグで有効にする。出力4行はIQ3_XXSのgate/up＋SwiGLUの3位置経路で適用する。Expert初期配置の比較では、この3設定と直接DMAを共通にする。
+MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、この4設定と直接DMAを共通にする。
 
 ##### 統合後の移植版を固定5問で確認
 
@@ -574,6 +575,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | SSMのsoftplusと係数乗算の融合 | `GGML_CUDA_UNARY_MUL_BCAST` | `1` | `1` | `0` |
 | GDNのRMS正規化とsigmoidゲートの融合 | `GGML_CUDA_GDN_GATED_NORM` | `1` | `1` | `0` |
 | MI50のIQ2_S・IQ3_XXS符号復号 | `GGML_HIP_GFX906_IQ_SIGN_DECODE` | `1` | `1` | `0` |
+| MI50のIQ2_S Q8_1入力共有 | `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT` | `1` | `1`（LDS・4行がOFFのとき発動） | `0` |
 | MI50のIQ3_XXS LDS先読み | `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH` | `1` | `1` | `0` |
 | MI50のIQ3_XXS LDS出力4行 | `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS` | `1` | `1` | `0` |
 | MI50のIQ2_S LDS先読み | `GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH` | `0` | `1` | `0` |
@@ -675,7 +677,7 @@ CUDAとHIPを増分ビルド。符号復号・LDS先読みを両条件で有効�
 
 #### IQ2_Sのgate/upでQ8_1入力を共有
 
-`GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` は、gfx906のIQ2_S・実3位置・LDSなし・2行のgate/up＋SwiGLUで、gateとupの内積に同じQ8_1入力を使う試作。既定OFF。量子化形式、重みの配置、積和順序とSwiGLUの式は現行と同じ。符号復号はON、IQ2_SのLDSとLDSなし4行はOFFで測る。
+`GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` は、gfx906のIQ2_S・実3位置・LDSなし・2行のgate/up＋SwiGLUで、gateとupの内積に同じQ8_1入力を使う。通常の固定3幅の起動設定に採用した。量子化形式、重みの配置、積和順序とSwiGLUの式は現行と同じ。符号復号はON、IQ2_SのLDSとLDSなし4行はOFFで使う。
 
 同一のHIPバイナリ、K=2,560、M=640、3位置・top-10、16個の合成Expertで、同じ重み・入力・Expert IDを使用。各条件3回、1回あたり50ウォームアップと1,000グラフ実行。2条件で19,200個のFP32出力は全試行でビット一致した。下表は1グラフあたりの平均時間で、投入と最終同期を含む。
 
@@ -750,6 +752,25 @@ Lunaが移植ブランチ `d1addaed1` を増分ビルドし、Docker内の `llam
 各検証のgate/upをMI50の同一ストリームの時刻順に並べ、48層の型順が全検証で同じことを確認した。IQ2_Sの26層すべてで中央値が13.60〜32.64 µs短縮。層0の中央値は265.60→232.96 µsで、ONでも最長。OFFには最大9.99 msの外れ値があったので、10.9%の平均短縮に加え、外れ値の影響を受けにくい1カーネル中央値182.40→166.88 µs（8.5%短縮）も見る。ONとOFFでプロファイラー構成が異なるため、IQ4_NLやIQ3_XXSの差を今回のパッチには帰属しない。
 
 IQ2_Sのソース変更はgate/upの内積でQ8_1入力を共用する部分。入力量子化は別カーネルで回数26,208のまま。重みの復号、積和、wave内リダクション、SwiGLUは融合カーネル内にあり、保存済みのrocprofは個別命令区間の時間を記録していない。比較の元データとスクリプトはGit外の `/home/t-saka/rocm-iq2-paired-dot-real-20261125/breakdown-*`。
+
+#### 固定3幅のIQ4_NL downの内訳
+
+Q8_1共有・正式採用設定ONのトレースを再利用し、実3位置273検証のうち、45層のIQ4_NL downを12,285回確認した。K=640、M=2,560、3位置×top-10。MI50の同じストリームでdispatch順と形状を照合し、各down直前のSwiGLU出力のQ8_1量子化と、直後のExpert出力の重み付き加算を対応づけた。
+
+| 処理 | 平均 ms/検証 | 1層のカーネル中央値 µs |
+| --- | ---: | ---: |
+| down入力のQ8_1量子化 | 0.237 | 4.96 |
+| IQ4_NL downの行列積 | 3.830 | 85.76 |
+| Expert出力の重み付き加算 | 0.237 | 5.12 |
+| 合計（GPUカーネル時間） | 4.304 | |
+
+行列積が3処理の約89%。down行列積の層別中央値は層0が138.56 µsで最長、次点は約87.36 µs。層0は以前のトレースでは88.00 µsで、計測条件差を含め再現性は未確認。各工程のカーネル時間は得られるが、記録上は依存するカーネルの時刻が部分的に重なるため、サブµsの隙間は評価しない。カーネル内の重み読み出し、16値テーブル復号、整数内積、wave内の加算は個別計時されていない。
+
+以前の3行詰めは、従来の40/64レーンによる2行計算を60/64レーンに詰め、1 waveで3行を計算する。過去の同じ合成入力・Expert IDの単体比較では行列積中央値が85.60→61.92 µs、VGPR割り当ては32→24（いずれもLDSとscratchは0）。入力のQ8_1量子化は両方3.04 µs。FP32加算順が変わり、76,800出力中24,237個が数値一致、最大絶対差は3.81e-6だった。過去の実モデルは40.77→38.48 tok/sで、生成IDとMTP採用数が異なる。単体では高速化したため、実モデルの失速を3行カーネルの実行時間だけに帰属できない。
+
+次の実装候補は、2行の配置・積和・waveリダクション順を保ち、同じトークンとExpert順位のQ8_1値・スケールが2出力行でどうロードされるかを現在のISAで確認すること。コンパイラがすでに値を共有していれば、重みのロード待ちと復号コストの区別を優先する。確認は同じ重み・入力・Expert IDで行列積単体の時間とビット一致を比較する。今回の調査ではIQ4_NLカーネルに変更を加えていない。
+
+再集計はGit外の `/home/t-saka/rocm-iq4-nl-down-breakdown-20261125/`。旧試作の単体と実モデルのログはそれぞれ `/tmp/llama-rocm-iq4-nl-down-kernel-ab-20261123/`、`/tmp/llama-rocm-iq4-nl-down-wave-20261123/`。
 
 #### 固定3幅のIQ2_Sへの横展開
 
