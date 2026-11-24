@@ -120,15 +120,6 @@ Expertの書き戻し時間は47.59 / 47.58 ms。MI50の計算区間は854.92か
 
 生ログ、層別集計、再集計スクリプト、実行コマンドは Git 外の `/tmp/llama-rocm-single-bank-mtp3-prefetch-study/`。診断コンテナは終了コード0。
 
-
-### 現在の隠れ状態で次層のRouterを先に実行する候補
-
-層LのRouterに入力する隠れ状態を、同じトークンの層L+1のRouter重みに適用し、予測したExpertのうちMI50にないものを層Lの計算中に先読みする。層L+1に到達したら、その時点の入力で通常のRouterを実行し、必要なExpertが揃うまで不足分を転送する。上の履歴ベースの集計ではこの予測を行っていない。本フォークでこの方式の予測精度、転送の重なり、速度は未計測。
-
-Mixtral-Offloadingの§3.2–3.3は隣接層の残差接続を根拠に、現在層のRouter入力と次層の既存Routerを使う。現在層の必須ロード後に次層の候補1〜2件を別枠へ先読みし、実際に参照する場合にキャッシュへ取り込む。AdapMoEも既存の後続層のゲートを利用する。Qwen3-30B-A3Bの別研究では最初の2層で状態差が目立ち、それ以降の予測recall@kは平均約90%だった。これはQwen3.8 Flash Nextのキャッシュミス捕捉率や速度の実測ではない。[Mixtral-Offloading](https://arxiv.org/html/2312.17238) · [AdapMoE](https://arxiv.org/html/2408.10284) · [Speculating Experts Accelerates Inference](https://arxiv.org/html/2603.19289)
-
-フォークのQWEN4EXPは、AttentionまたはRecurrentの後にHCのFFN入力 `ffn_mix.cur` を作り、層別の `ffn_gate_inp` に渡す。予測に使える入力はこの層L側のテンソル。層L+1の正規の入力はその層のAttentionまたはRecurrentとHC処理を経るため、層ごとの精度は実測する。固定3幅の照合では、3位置の候補を層内で重複排除し、対象層での実ミスの捕捉件数・バイト数と不要転送量を集計する。実転送を評価する場合は、層L+1のRouter確定までに完了した分と、転送・予測に起因する待ちを区別する。過去のID・スロットトレースにはRouter入力がないため、比較には予測側のIDの追加記録が必要。
-
 ## RAM原本からMI50へ直接アップロードする試作
 
 | 作業 | 変更範囲 | 確認条件 |

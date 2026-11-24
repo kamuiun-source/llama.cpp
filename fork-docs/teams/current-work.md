@@ -40,8 +40,6 @@
 
 ### Linux ROCm の転送改善
 
-- 次層Expertの先読みには、層LのRouter入力を層L+1の既存Routerへ渡す方法がある。Mixtral-Offloadingに実装例があり、QWEN4EXPのHCを通る実入力との差と、MI50にないExpertの捕捉率は未計測。従来の履歴先読みおよび同層の並行転送と分けて扱う。[調査メモ](../rocm/09-single-bank-mtp3.md#現在の隠れ状態で次層のrouterを先に実行する候補)
-
 - Expert並行転送の最適化は保留し、`codex/rocm-castagna-port` に戻る。別ブランチ `codex/rocm-expert-single-kernel-overlap` の固定3幅再計測は、スワップアウト0の4試行でOFF 40.77、スピンON 40.14 tok/s。500 ms以上の停止やDMAタイムアウトは発生せず、並行転送をOFFのままにする。
 
 - 固定4幅の作業はいったん区切り、`codex/rocm-auto-mtp` の実装と計測記録を `codex/rocm-integrated-test` に取り込む。通常運用は実績の多い固定3幅を基準とする。固定3幅でも長い待ちがあり、固定4幅もサスペンド抑止下で複数回完走しているため、幅による安定性の差は未確定。
