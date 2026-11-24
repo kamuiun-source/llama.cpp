@@ -9,6 +9,9 @@
 ## 現在の状態
 
 
+- ProMoE型の実ミス優先を同じバイナリ・固定5問で追加OFF→ON→ON→OFF。追加2回ずつで39.86→40.90 tok/s、初回込み各3回は39.96→40.74 tok/s、総H2D平均72.17→65.71 GiB。全6回の出力とMTP採用一致、応答中スワップアウト0。既定OFFのまま。[再計測](../rocm/09-single-bank-mtp3.md#promoe型の実ミス優先)
+
+
 - ProMoE型の実ミス優先を `LLAMA_EXPERT_HIP_NEXT_ROUTER_DEMAND_PRIORITY=1` で試作。先読みを2件ずつ発行し、正規Router確定時に未発行4,342件を取り消し、必要だった918件は通常H2D。固定5問の出力とMTP採用一致、応答中スワップアウト0。総H2D 72.17→65.71 GiB、生成40.17→40.44 tok/s（各1回）。試作は既定OFF。[計測結果](../rocm/09-single-bank-mtp3.md#promoe型の実ミス優先)
 
 
