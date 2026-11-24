@@ -593,6 +593,20 @@ struct llama_moe_cache::impl {
     ggml_tensor * next_prefetch_bank = nullptr;
     const std::vector<ggml_tensor *> * next_prefetch_predictions = nullptr;
     std::array<int32_t, next_prefetch_slots> next_prefetch_ids{};
+    std::array<ggml_backend_event_ptr, next_prefetch_slots> next_prefetch_events;
+    std::array<int32_t, next_prefetch_slots> next_prefetch_source_slots{};
+    size_t next_prefetch_sources = 0;
+    size_t next_prefetch_completed = 0;
+    int32_t next_prefetch_source_layer = -1;
+    bool next_prefetch_tail_pending = false;
+    bool next_prefetch_hit_wait = false;
+    size_t next_prefetch_dependencies = 0;
+    size_t next_prefetch_dependency_slots = 0;
+    size_t next_prefetch_source_waits = 0;
+    size_t next_prefetch_tail_waits = 0;
+    int64_t next_prefetch_consumer_wait_us = 0;
+    int64_t next_prefetch_source_wait_us = 0;
+    int64_t next_prefetch_tail_wait_us = 0;
     int32_t next_prefetch_layer = -1;
     size_t next_prefetch_count = 0;
     size_t next_prefetch_launches = 0;
@@ -1690,6 +1704,7 @@ struct llama_moe_cache::impl {
     void promote_packed(const layer & l, int32_t il, int32_t scratch_index, int32_t evict) {
         telemetry_scope scope(set_telemetry_cause, "expert_writeback");
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
+        wait_next_prefetch_source(il, move.host_slot);
         auto * writeback = placement->hip_tuple_dma ? move.planes[0].host_data : packed_writeback.data();
         const int64_t start = ggml_time_us();
         size_t offset = 0;
@@ -2333,20 +2348,27 @@ struct llama_moe_cache::impl {
         if (!next_prefetch_buffer) {
             throw std::runtime_error("could not allocate HIP next Router prefetch bank");
         }
+        const char * hit_wait = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT");
+        if (hit_wait && std::strcmp(hit_wait, "1") == 0) {
+            for (auto & event : next_prefetch_events) {
+                event.reset(ggml_backend_event_new(placement->target));
+                if (!event) {
+                    break;
+                }
+            }
+            next_prefetch_hit_wait = bool(next_prefetch_events.back());
+            if (!next_prefetch_hit_wait) {
+                LLAMA_LOG_WARN("packed expert HIP next Router prefetch: per-slot events unavailable, using full-stream wait\n");
+            }
+        }
         LLAMA_LOG_INFO("packed expert HIP next Router prefetch: slots=%d bank_bytes=%zu\n",
                 next_prefetch_slots, ggml_backend_buffer_get_size(next_prefetch_buffer.get()));
+        if (next_prefetch_hit_wait) {
+            LLAMA_LOG_INFO("packed expert HIP next Router prefetch: hit_wait=1\n");
+        }
     }
 
-    void finish_next_prefetch(size_t hits = 0) {
-        if (next_prefetch_layer < 0) {
-            return;
-        }
-        const int64_t start = ggml_time_us();
-        ggml_backend_synchronize(next_prefetch_backend.get());
-        if (next_profile_start) {
-            ++next_profile_prefetch_waits;
-        }
-        next_prefetch_wait_us += ggml_time_us() - start;
+    void retire_next_prefetch(size_t hits) {
         next_prefetch_hits += hits;
         next_prefetch_unused += next_prefetch_count - hits;
         next_prefetch_count = 0;
@@ -2354,11 +2376,55 @@ struct llama_moe_cache::impl {
         ggml_reset(next_prefetch_views.get());
     }
 
+    void finish_next_prefetch(size_t hits = 0) {
+        if (next_prefetch_layer < 0 && !next_prefetch_tail_pending) {
+            return;
+        }
+        const int64_t start = ggml_time_us();
+        ggml_backend_synchronize(next_prefetch_backend.get());
+        if (next_profile_start) {
+            ++next_profile_prefetch_waits;
+        }
+        const int64_t elapsed = ggml_time_us() - start;
+        next_prefetch_wait_us += elapsed;
+        if (next_prefetch_hit_wait) {
+            ++next_prefetch_tail_waits;
+            next_prefetch_tail_wait_us += elapsed;
+            next_prefetch_tail_pending = false;
+        }
+        retire_next_prefetch(hits);
+    }
+
+    void complete_next_prefetch_prefix(size_t count) {
+        next_prefetch_completed = count;
+        next_prefetch_tail_pending = count < next_prefetch_sources;
+    }
+
+    void wait_next_prefetch_source(int32_t il, int32_t host_slot) {
+        if (!next_prefetch_tail_pending || il != next_prefetch_source_layer) {
+            return;
+        }
+        for (size_t i = next_prefetch_completed; i < next_prefetch_sources; ++i) {
+            if (next_prefetch_source_slots[i] == host_slot) {
+                const int64_t start = ggml_time_us();
+                ggml_backend_event_synchronize(next_prefetch_events[i].get());
+                next_prefetch_source_wait_us += ggml_time_us() - start;
+                ++next_prefetch_source_waits;
+                complete_next_prefetch_prefix(i + 1);
+                break;
+            }
+        }
+    }
+
     void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il) {
         if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
             return;
         }
-        finish_next_prefetch();
+        const int32_t target = il + 1;
+        if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
+                (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
+            finish_next_prefetch();
+        }
         auto * prediction = (*next_prefetch_predictions)[il];
         auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
         GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
@@ -2376,7 +2442,6 @@ struct llama_moe_cache::impl {
             next_profile_read_wait_us += ggml_time_us() - wait_start;
         }
 
-        const int32_t target = il + 1;
         const auto & map = placement->maps[target];
         const auto & scratch = layers[target].packed_scratch;
         const auto & tuple = placement->tuples[target];
@@ -2393,9 +2458,19 @@ struct llama_moe_cache::impl {
                 }
                 GGML_ASSERT(size_t(host_slot) < ggml_nbytes(tuple.host) / tuple.stride);
                 next_prefetch_layer = target;
+                if (next_prefetch_hit_wait) {
+                    next_prefetch_source_layer = target;
+                    next_prefetch_source_slots[next_prefetch_count] = host_slot;
+                    next_prefetch_sources = next_prefetch_count + 1;
+                    next_prefetch_completed = 0;
+                    next_prefetch_tail_pending = true;
+                }
                 const int64_t start = next_profile_start ? ggml_time_us() : 0;
                 ggml_backend_tensor_set_async(next_prefetch_backend.get(), next_prefetch_bank, host + host_slot * tuple.stride,
                         next_prefetch_count * tuple.stride, tuple.stride);
+                if (next_prefetch_hit_wait) {
+                    ggml_backend_event_record(next_prefetch_events[next_prefetch_count].get(), next_prefetch_backend.get());
+                }
                 if (start) {
                     next_profile_h2d_submit_us += ggml_time_us() - start;
                 }
@@ -2420,7 +2495,7 @@ struct llama_moe_cache::impl {
         return found == end ? -1 : static_cast<int32_t>(found - next_prefetch_ids.begin());
     }
 
-    void copy_next_prefetch(const llama_expert_placement::tuple_bank & tuple, int32_t from, int32_t to) {
+    void copy_next_prefetch(ggml_backend_t backend, const llama_expert_placement::tuple_bank & tuple, int32_t from, int32_t to) {
         const int64_t start = next_profile_start ? ggml_time_us() : 0;
         auto * ctx = next_prefetch_views.get();
         auto * src = ggml_view_1d(ctx, next_prefetch_bank, tuple.stride, from * tuple.stride);
@@ -2428,7 +2503,6 @@ struct llama_moe_cache::impl {
         if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS || ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("could not bind HIP next Router prefetch views");
         }
-        auto * backend = next_prefetch_backend.get();
         ggml_backend_tensor_copy_async(backend, backend, src, dst);
         if (start) {
             next_profile_d2d_submit_us += ggml_time_us() - start;
@@ -2491,6 +2565,8 @@ struct llama_moe_cache::impl {
                 packed_ram_base ? packed_ram_offset : ggml_backend_buffer_get_size(packed_staging.get());
         size_t bytes = 0;
         size_t prefetch_hits = 0;
+        std::array<moe_cache_lru::fill, next_prefetch_slots> needed;
+        int32_t last_needed = -1;
         const auto submit = [&](ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
             const int64_t start = callback_totals ? ggml_time_us() : 0;
             ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
@@ -2509,7 +2585,13 @@ struct llama_moe_cache::impl {
                             slot >= 0 && size_t(slot) < ggml_nbytes(tuple.device) / tuple.stride);
                     const int32_t prefetched = next_prefetch_slot(il, fill.expert);
                     if (prefetched >= 0) {
-                        copy_next_prefetch(tuple, prefetched, slot);
+                        if (next_prefetch_hit_wait) {
+                            GGML_ASSERT(prefetch_hits < needed.size());
+                            needed[prefetch_hits] = {prefetched, slot};
+                            last_needed = std::max(last_needed, prefetched);
+                        } else {
+                            copy_next_prefetch(next_prefetch_backend.get(), tuple, prefetched, slot);
+                        }
                         ++prefetch_hits;
                         continue;
                     }
@@ -2539,27 +2621,40 @@ struct llama_moe_cache::impl {
             if (submitted) {
                 *submitted = submit_expert_upload(backend);
             }
+            if (last_needed >= 0) {
+                GGML_ASSERT(!hip_async && !submitted);
+                // The H2D stream is FIFO. The last needed event covers all hits.
+                ggml_backend_event_wait(backend, next_prefetch_events[last_needed].get());
+                ++next_prefetch_dependencies;
+                next_prefetch_dependency_slots += last_needed + 1;
+                for (size_t i = 0; i < prefetch_hits; ++i) {
+                    copy_next_prefetch(backend, placement->tuples[il], needed[i].expert, needed[i].slot);
+                }
+            }
         } catch (...) {
+            // Queued copies can still read the staging buffer after a failed fill.
+            if (bytes != 0 || last_needed >= 0) {
+                ggml_backend_synchronize(backend);
+            }
             if (il == next_prefetch_layer) {
                 finish_next_prefetch();
             }
-            // Queued copies can still read the staging buffer after a failed fill.
-            if (bytes != 0) {
-                ggml_backend_synchronize(backend);
-            }
             throw;
         }
-        if (il == next_prefetch_layer) {
+        if (il == next_prefetch_layer && !next_prefetch_hit_wait) {
             // The normal slots cannot be published until both upload streams have finished writing them.
             finish_next_prefetch(prefetch_hits);
         }
         if (!hip_async && (!submitted || !*submitted)) {
             const bool trace_wait = !generation_trace_positions.empty();
-            const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy || callback_totals;
+            const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy || callback_totals || last_needed >= 0;
             const int64_t start = measure_wait ? ggml_time_us() : 0;
             ggml_backend_synchronize(backend);
             if (measure_wait) {
                 const uint64_t us = ggml_time_us() - start;
+                if (last_needed >= 0) {
+                    next_prefetch_consumer_wait_us += us;
+                }
                 if (callback_totals) {
                     callback_totals->completion_us += us;
                 }
@@ -2580,6 +2675,11 @@ struct llama_moe_cache::impl {
                     hip_direct_upload_wait_us += us;
                 }
             }
+        }
+        if (il == next_prefetch_layer && next_prefetch_hit_wait) {
+            // The consumer sync above has drained the shared bank reads before its next use.
+            complete_next_prefetch_prefix(last_needed + 1);
+            retire_next_prefetch(prefetch_hits);
         }
         return bytes;
     }
@@ -3439,7 +3539,11 @@ struct llama_moe_cache::impl {
                 }
             }
             if (il == next_prefetch_layer) {
-                finish_next_prefetch();
+                if (next_prefetch_hit_wait) {
+                    retire_next_prefetch(0);
+                } else {
+                    finish_next_prefetch();
+                }
             }
             if (evict >= 0 && !overlap_submitted) {
                 const int64_t promotion_start = fine_profile ? ggml_time_us() : 0;
@@ -3612,6 +3716,12 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: launches=%zu hits=%zu unused=%zu h2d_bytes=%zu d2d_bytes=%zu wait_us=%" PRId64 "\n",
                     next_prefetch_launches, next_prefetch_hits, next_prefetch_unused,
                     next_prefetch_h2d_bytes, next_prefetch_d2d_bytes, next_prefetch_wait_us);
+            LLAMA_LOG_INFO("packed expert HIP next Router hit wait: enabled=%d dependencies=%zu dependency_prefix_slots=%zu"
+                    " consumer_cpu_wait_us=%" PRId64 " source_waits=%zu source_cpu_wait_us=%" PRId64
+                    " tail_waits=%zu tail_cpu_wait_us=%" PRId64 "\n",
+                    next_prefetch_hit_wait, next_prefetch_dependencies, next_prefetch_dependency_slots,
+                    next_prefetch_consumer_wait_us, next_prefetch_source_waits, next_prefetch_source_wait_us,
+                    next_prefetch_tail_waits, next_prefetch_tail_wait_us);
         }
         for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
             if (!layers[il].slot_map) {
@@ -3932,7 +4042,7 @@ bool llama_moe_cache::next_router_prefetch_enabled() const {
 
 void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions) {
     auto & self = *pimpl;
-    GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0);
+    GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
 }
 
