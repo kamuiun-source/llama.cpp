@@ -183,6 +183,29 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 
 Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を、読み込み前にOSでもページ固定する。以前の `LLAMA_EXPERT_HIP_TUPLE_MLOCK` は廃止した。Qwen3.8 Flash Nextの検証構成では固定対象が6領域・約19.56 GiBで、Dockerでは上記の21 GiBの `memlock` 上限を使う。`docker_images/rocm_cuda/enter.sh` から入る場合も同じ上限を設定する。上限不足で固定に失敗した場合は、必要バイト数と現在の上限を起動ログに出す。
 
+#### MI50のカーネル時間を集計する
+
+既存のROCTx計測を使い、`host-marks.csv` とrocprofv3のマーカー、カーネル、メモリコピーのCSVを同じ計測ディレクトリに保存する。`verify_submit_3` の開始と `verify_sync_3` の終了の間を本体検証として集計する。プロンプトのプリフィル、RTXのカーネル、MTPドラフトを含めない。
+
+```bash
+python3 fork-docs/scripts/report-rocm-verify-kernels.py "$run_dir" --width 3 --json "$run_dir/mi50-kernel-report.json"
+```
+
+カーネル別の回数、合計、検証1回あたりの時間、p50、p95、最大値を表示し、JSONに生の名前と起動形状を残す。`copyBuffer` とGPUメモリコピーは演算から分ける。重なったGPU処理を区間の和集合でも表示する。MI50でカーネルやコピーが観測されない区間には、RTXの演算、CPU処理、同期などが含まれる。
+
+2026-11-24に統合版 `85e2ae78a` を再ビルドし、RTX 4070 TiとMI50で固定3幅・単一バンク・直接DMAの固定5問を実行した。5問完走、生成640 IDとMTP採用349/566は保存済み結果と一致。ROCTxの全1,124境界を照合し、実際に3位置を検証した281回を集計した。rocprof有効時の生成は35.14 tok/s。
+
+| MI50の演算 | 主な量子型 | 合計 ms | 1検証あたり ms | 演算時間の割合 |
+| --- | --- | ---: | ---: | ---: |
+| gate/up＋SwiGLU | IQ2_S、IQ3_XXS、IQ4_XS | 3,337.91 | 11.88 | 69.38% |
+| down | IQ4_NL、Q2_0 | 1,204.81 | 4.29 | 25.04% |
+| Q8_1入力量子化 | Q8_1 | 146.23 | 0.52 | 3.04% |
+| その他 | Expert重み付き加算、行参照 | 122.40 | 0.44 | 2.54% |
+
+個別ではIQ2_Sのgate/up＋SwiGLUが7.03 ms/検証、IQ3_XXSが4.72 ms/検証、IQ4_NLのdownが3.91 ms/検証。IQ2_Sの融合は第1問で150.0 msと123.3 msの長い2件があった（通常の中央値0.232 ms）。この2件を除いてもgate/up＋SwiGLUが演算時間の67.5%で最上位。1検証の壁時計57.36 msのうち、MI50演算区間の和集合17.07 ms、コピー区間の和集合13.77 ms。両者を合わせた区間は28.57 msで、残り28.79 msはMI50で観測された演算またはコピーの外側にあった。
+
+収集に使ったランナー、ROCTxの計測shim、報告JSONと生ログはGit外の `/home/t-saka/rocm-mtp3-integrated-trace-20261124/`。
+
 ## Expert原本の連続配置と直接DMAの調査
 
 単一バンクの現行レイアウトは、RAMとVRAMともに各層のdown、gate、upごとに別の量子化テンソルを持つ。RAMは各プレーン212 Expert、MI50は各プレーン300常駐＋30仮置き。各Expertのアドレスは `plane_base + slot * plane.nb[2]`。昇格後は退避した物理スロットを仮置きに回すので、論理的に近いExpertや仮置き枠が物理的にも連続する保証はない。現行のステージングは選ばれたExpertの3面を連続に詰めた後、宛先が異なるため3本のH2Dを同一ストリームへ発行して最後に1回待つ。既存の原本直接転送フラグはステージングのCPUコピーを省くが、3本の発行を維持する。

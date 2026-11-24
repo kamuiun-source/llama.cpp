@@ -8,6 +8,8 @@
 
 ### Linux ROCm の転送改善
 
+- Expert並行転送の試作は `codex/rocm-expert-single-kernel-overlap` の `2d02d1a6c` に保存。統合版 `85e2ae78a` に戻して固定3幅の本体検証281回をrocprofで計測。MI50演算時間の69.38%がgate/up＋SwiGLU（11.88 ms/検証）、25.04%がdown（4.29 ms）。個別最大はIQ2_Sの融合（7.03 ms/検証）。第1問の長い2件を除いてもgate/up＋SwiGLUが首位。 [再実行と内訳](../rocm/10-decode-pipeline.md#mi50のカーネル時間を集計する)
+
 - 固定4幅の作業はいったん区切り、`codex/rocm-auto-mtp` の実装と計測記録を `codex/rocm-integrated-test` に取り込む。通常運用は実績の多い固定3幅を基準とする。固定3幅でも長い待ちがあり、固定4幅もサスペンド抑止下で複数回完走しているため、幅による安定性の差は未確定。
 
 - 4幅のGPU間転送計測を補い、Shared Expert先行実行、SSM履歴融合、3候補用 `device_pending`、gfx906 IQ3_XXSの1行起動を既定OFFのオプションとして追加。Lunaの全ON・ログレベル4確認は5問完走。生成640 IDとMTP採用388/726が保存済み固定4幅と一致し、全経路が発動。生成33.81 tok/s、本体検証66.73 ms/回。ログレベル3で採った参照37.27 tok/s、60.03 msとの差は項目別に帰属できない。 [固定4幅の実装と計測](../rocm/10-decode-pipeline.md#固定4幅に残る実装)
