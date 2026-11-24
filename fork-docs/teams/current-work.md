@@ -4,6 +4,8 @@
 
 開始・再開・コンテキスト圧縮後に読む。作業中の判断が変わったら該当箇所を更新する。詳細な作業履歴は [coordinator-memory.md](coordinator-memory.md)、技術調査と検証待ちは [research-notes.md](research-notes.md)、再現用の設定は [runtime-flags.md](runtime-flags.md) に残す。
 
+
+- 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
 - 次層Expert先読みON/OFFを固定3幅の5問で計6回実施。応答中スワップアウト0の合算はOFF 35.88（2回）、ON 38.18 tok/s（3回）。最後の組は38.55→39.29 tok/s。OFFの第5問でも182.32 MiBの退避が発生。Astraはヒープの正味退避増加、固定領域のTHP変化、既存サンプラーの一時複製を確認した。回収の発行元とヒープ内のオブジェクトは未特定。[実測と既存経路](../rocm/09-single-bank-mtp3.md#スワップを監視したonoff比較)
