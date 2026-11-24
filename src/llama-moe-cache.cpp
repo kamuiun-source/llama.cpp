@@ -2392,7 +2392,7 @@ struct llama_moe_cache::impl {
             next_prefetch_score_mode = 2;
         }
         const char * hit_wait = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT");
-        if (hit_wait && std::strcmp(hit_wait, "1") == 0) {
+        if (!hit_wait || std::strcmp(hit_wait, "1") == 0) {
             for (auto & event : next_prefetch_events) {
                 event.reset(ggml_backend_event_new(placement->target));
                 if (!event) {
@@ -2413,20 +2413,19 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: hit_wait=1\n");
         }
         const char * after_submit = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT");
-        if (after_submit && std::strcmp(after_submit, "1") == 0) {
+        if (!after_submit || std::strcmp(after_submit, "1") == 0) {
             next_prefetch_after_submit = next_prefetch_hit_wait;
-            if (!next_prefetch_after_submit) {
+            if (after_submit && !next_prefetch_after_submit) {
                 LLAMA_LOG_WARN("packed expert HIP next Router prefetch: after-submit requires hit wait, using immediate launch\n");
             }
         }
-        const char * demand_priority = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_DEMAND_PRIORITY");
-        if (demand_priority && std::strcmp(demand_priority, "1") == 0) {
+        if (next_prefetch_after_submit) {
             auto * reg = ggml_backend_dev_backend_reg(placement->target);
-            next_prefetch_event_ready = reinterpret_cast<decltype(next_prefetch_event_ready)>(
+            next_prefetch_event_ready = !reg ? nullptr : reinterpret_cast<decltype(next_prefetch_event_ready)>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_event_ready"));
-            next_prefetch_demand_priority = next_prefetch_after_submit && next_prefetch_event_ready;
+            next_prefetch_demand_priority = next_prefetch_event_ready != nullptr;
             if (!next_prefetch_demand_priority) {
-                LLAMA_LOG_WARN("packed expert HIP next Router prefetch: demand priority requires after-submit and event queries\n");
+                LLAMA_LOG_WARN("packed expert HIP next Router prefetch: event queries unavailable, submitting all speculative transfers after split submit\n");
             }
         }
     }
