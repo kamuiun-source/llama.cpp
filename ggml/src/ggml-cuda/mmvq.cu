@@ -4,6 +4,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1307,6 +1308,23 @@ static void mul_mat_vec_q_switch_fusion(
 }
 
 #ifdef GGML_USE_HIP
+// Pack both modes into one atomic so a launch cannot see a partially applied pair.
+static constexpr int gfx906_lds_mode_base = 5;
+static std::atomic<int> gfx906_lds_modes{-1};
+
+bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs) {
+    const auto valid_mode = [](int mode) { return mode == 0 || mode == 2 || mode == 4; };
+    if (!valid_mode(iq2_s) || !valid_mode(iq3_xxs)) {
+        return false;
+    }
+    gfx906_lds_modes.store(iq2_s * gfx906_lds_mode_base + iq3_xxs, std::memory_order_relaxed);
+    return true;
+}
+
+int ggml_hip_gfx906_lds_modes() {
+    return gfx906_lds_modes.load(std::memory_order_relaxed);
+}
+
 static bool ggml_hip_gfx906_iq_sign_decode() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_HIP_GFX906_IQ_SIGN_DECODE");
@@ -1352,6 +1370,13 @@ static void mul_mat_vec_q_moe_launch(
             return;
         }
     }
+    int live_lds_mode = -1;
+    if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
+        const int modes = ggml_hip_gfx906_lds_modes();
+        if (modes >= 0) {
+            live_lds_mode = type == GGML_TYPE_IQ2_S ? modes / gfx906_lds_mode_base : modes % gfx906_lds_mode_base;
+        }
+    }
     if constexpr (type == GGML_TYPE_IQ3_XXS) {
         static const int swiglu_rows = [] {
             const char * value = std::getenv("GGML_HIP_GFX906_MOE_SWIGLU_ROWS");
@@ -1369,7 +1394,8 @@ static void mul_mat_vec_q_moe_launch(
                 ncols_dst >= 2 && ncols_dst <= 4 && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
                 !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
                 !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
-                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20 &&
+                (ncols_dst == 4 || live_lds_mode < 0 || !ggml_hip_gfx906_iq_sign_decode())) {
             const auto launch = [&](auto rows) {
                 constexpr int rows_per_block = decltype(rows)::value;
                 const dim3 block_nums(nrows_x / rows_per_block, nchannels_dst);
@@ -1452,14 +1478,16 @@ static void mul_mat_vec_q_moe_launch(
                     const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_NO_LDS_ROW_GROUPS");
                     return value && std::strcmp(value, "1") == 0;
                 }();
-                use_no_lds_row_groups = no_lds_row_groups && ncols_dst == 3 && nrows_x % (2*rows_per_block) == 0;
+                use_no_lds_row_groups = live_lds_mode < 0 && no_lds_row_groups && ncols_dst == 3 &&
+                    nrows_x % (2*rows_per_block) == 0;
             }
             static const bool lds_prefetch = [] {
                 const char * value = std::getenv(type == GGML_TYPE_IQ2_S ?
                     "GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH" : "GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
                 return value && std::strcmp(value, "1") == 0;
             }();
-            const bool use_lds = lds_prefetch && stride_col_y == iq_lds_activation_blocks &&
+            const bool use_lds = (live_lds_mode < 0 ? lds_prefetch : live_lds_mode != 0) &&
+                stride_col_y == iq_lds_activation_blocks &&
                 (type == GGML_TYPE_IQ3_XXS || ncols_dst == 3);
             if (use_no_lds_row_groups) {
                 if constexpr (type == GGML_TYPE_IQ2_S) {
@@ -1473,7 +1501,7 @@ static void mul_mat_vec_q_moe_launch(
                         "GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS" : "GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
                     return value && std::strcmp(value, "1") == 0;
                 }();
-                if (lds_row_groups && nrows_x % (2*rows_per_block) == 0) {
+                if ((live_lds_mode < 0 ? lds_row_groups : live_lds_mode == 4) && nrows_x % (2*rows_per_block) == 0) {
                     launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
                 } else {
                     launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});

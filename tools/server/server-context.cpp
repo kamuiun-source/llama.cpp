@@ -39,6 +39,7 @@
 #include <optional>
 #include <filesystem>
 #include <random>
+#include <string_view>
 #include <utility>
 #include <fstream>
 
@@ -1837,6 +1838,9 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    std::array<int, 2> gfx906_lds_modes = {-1, -1};
+    bool gfx906_lds_config_invalid = false;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3852,6 +3856,70 @@ private:
         return n_read;
     }
 
+    void refresh_gfx906_lds_modes() {
+        static const char * path = std::getenv("LLAMA_HIP_GFX906_LDS_MODE_FILE");
+        if (!path || !*path || std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
+            return;
+        }
+
+        using set_modes_t = bool (*)(int, int);
+        static const auto set_modes = []() -> set_modes_t {
+            const auto reg = ggml_backend_reg_by_name("ROCm");
+            return reg ? reinterpret_cast<set_modes_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_set_gfx906_lds_modes")) : nullptr;
+        }();
+        if (!set_modes) {
+            return;
+        }
+
+        std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
+        char buffer[64];
+        input.read(buffer, sizeof(buffer));
+        std::string_view remaining(buffer, input.gcount());
+        std::array<int, 2> modes = {-1, -1};
+        bool valid = input.eof() && !input.bad();
+        while (valid && !remaining.empty()) {
+            const auto newline = remaining.find('\n');
+            auto line = remaining.substr(0, newline);
+            remaining = newline == std::string_view::npos ? std::string_view{} : remaining.substr(newline + 1);
+            if (!line.empty() && line.back() == '\r') {
+                line.remove_suffix(1);
+            }
+            const auto eq = line.find('=');
+            const auto key = line.substr(0, eq);
+            const int index = key == "IQ2_S" ? 0 : key == "IQ3_XXS" ? 1 : -1;
+            if (index < 0 || eq == std::string_view::npos || modes[index] >= 0) {
+                valid = false;
+                break;
+            }
+            const auto value = line.substr(eq + 1);
+            modes[index] = value == "off" ? 0 : value == "2" ? 2 : value == "4" ? 4 : -1;
+            valid = modes[index] >= 0;
+        }
+
+        if (!valid || modes[0] < 0 || modes[1] < 0) {
+            if (!gfx906_lds_config_invalid) {
+                SRV_WRN("invalid gfx906 live LDS mode file: %s\n", path);
+                gfx906_lds_config_invalid = true;
+            }
+            return;
+        }
+        gfx906_lds_config_invalid = false;
+        if (modes == gfx906_lds_modes) {
+            return;
+        }
+
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft && ctx_dft != ctx_tgt) {
+            llama_synchronize(ctx_dft);
+        }
+        if (set_modes(modes[0], modes[1])) {
+            gfx906_lds_modes = modes;
+            const auto mode_name = [](int mode) { return mode == 0 ? "off" : mode == 2 ? "2" : "4"; };
+            SRV_INF("gfx906 live LDS modes applied: IQ2_S=%s IQ3_XXS=%s\n", mode_name(modes[0]), mode_name(modes[1]));
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3905,6 +3973,7 @@ private:
                         break;
                     }
 
+                    refresh_gfx906_lds_modes();
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();

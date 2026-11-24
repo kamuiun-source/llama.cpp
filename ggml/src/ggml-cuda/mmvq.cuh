@@ -5,6 +5,9 @@
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
 #ifdef GGML_USE_HIP
+bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs);
+int ggml_hip_gfx906_lds_modes();
+
 inline bool ggml_cuda_is_compact_moe_lookup(const ggml_tensor * tensor) {
     return tensor && tensor->op == GGML_OP_GET_ROWS && std::strcmp(tensor->name, "ffn_moe_mtp_compact_slots") == 0;
 }

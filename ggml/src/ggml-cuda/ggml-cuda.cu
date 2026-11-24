@@ -6100,10 +6100,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
+#ifdef GGML_USE_HIP
+    const int lds_modes = ggml_hip_gfx906_lds_modes();
+    if (lds_modes >= 0 && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+        const auto it = cuda_ctx->cuda_graphs.find(graph_key);
+        if (it != cuda_ctx->cuda_graphs.end() && it->second->gfx906_lds_modes != lds_modes) {
+            // Captured launches contain the kernel selected under the previous mode.
+            cuda_ctx->cuda_graphs.erase(it);
+        }
+    }
+#endif
 
     const bool graphs_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
     if (!dynamic_moe_routes && graphs_enabled) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+#ifdef GGML_USE_HIP
+        graph->gfx906_lds_modes = lds_modes;
+#endif
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
@@ -7618,6 +7631,11 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
+        return (void *) ggml_hip_gfx906_set_lds_modes;
+    }
+#endif
     if (strcmp(name, "ggml_backend_cuda_make_ssm_conv_history") == 0) {
         return (void *) ggml_backend_cuda_make_ssm_conv_history;
     }
