@@ -9,6 +9,9 @@
 ## 現在の状態
 
 
+- ProMoE型の実ミス優先は採用。次層先読み `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH=1` に組み込み、専用フラグを削除した。旧ヒット待ちと後発行を未設定にした5問で経路の作動と出力一致を確認。[採用後の検証](../rocm/09-single-bank-mtp3.md#promoe型の実ミス優先)
+
+
 - ProMoE型の実ミス優先を同じバイナリ・固定5問で追加OFF→ON→ON→OFF。追加2回ずつで39.86→40.90 tok/s、初回込み各3回は39.96→40.74 tok/s、総H2D平均72.17→65.71 GiB。全6回の出力とMTP採用一致、応答中スワップアウト0。既定OFFのまま。[再計測](../rocm/09-single-bank-mtp3.md#promoe型の実ミス優先)
 
 

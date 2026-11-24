@@ -31,10 +31,11 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 ## ROCmの次層Expert先読み
 
-| 設定 | 試作時の値 | 動作 |
+| 設定 | 値 | 動作 |
 | --- | --- | --- |
-| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH` | `1` | 固定3幅で、MI50の共有8枠へ次層の候補を先読みする。 |
-| `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT` | `1` | 必要な先読みまでをイベントで待ち、ヒットを通常の仮置き枠へD2Dする。 |
-| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | `0`（既定） / `1`（試作） | 上の2つが有効で、予測とExpertが異なるバックエンドの場合に、今のExpert分割を投入してから次層の先読みを発行する。 |
-| `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。ともに固定5問で比較済み。 |
-| `LLAMA_EXPERT_HIP_NEXT_ROUTER_DEMAND_PRIORITY` | `0`（既定） / `1`（比較用） | ヒット待ちと後発行が有効なとき、先読みを2件ずつ進め、正規Router確定で未発行の候補を打ち切る。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH` | `1` | 固定3幅で、MI50の共有8枠へ次層の候補を先読みする。標準でヒット待ち・現在層の投入後発行・実ミス優先を有効にする。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT` | 未設定（通常） / `0`（比較用） | イベント待ちを切り分ける旧比較設定。通常起動で設定する必要はない。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | 未設定（通常） / `0`（比較用） | 現在層の投入後発行を切り分ける旧比較設定。通常起動で設定する必要はない。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。 |
+
+先読みの従来方式と採用方式の比較は、旧フラグのあったビルドで取得した。非同期のcompact prefillと非同期昇格は採用時点の先読みと併用できず、先読み検証では直列設定を使った。[計測と起動条件](../rocm/09-single-bank-mtp3.md#promoe型の実ミス優先)
