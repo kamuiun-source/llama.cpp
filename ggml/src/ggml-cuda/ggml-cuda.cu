@@ -6083,6 +6083,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+static bool ggml_backend_hip_graph_mapped_return(ggml_backend_t backend, ggml_cgraph * graph, uint64_t uid,
+                                                void * mapped, enum ggml_status * status) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+
+    auto * out = graph->nodes[graph->n_nodes - 1];
+    // Capture/RAM and capture/VRAM must never share the UID fast path. Keep the tensor identity for fusion.
+    auto mapped_graph = *graph;
+    mapped_graph.uid = uid;
+    struct restore_output {
+        ggml_tensor * out;
+        void * data;
+        ~restore_output() { out->data = data; }
+    } restore{out, out->data};
+    out->data = mapped;
+    *status = ggml_backend_cuda_graph_compute(backend, &mapped_graph);
+    return true;
+}
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static enum ggml_status ggml_backend_cuda_profile_compute(ggml_backend_t backend, ggml_cgraph * cgraph,
                                                            ggml_backend_cuda_profile_callback callback, void * user_data) {
@@ -6626,13 +6649,13 @@ struct ggml_backend_cuda_device_context {
 };
 
 #ifndef GGML_USE_MUSA
-static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
+static bool ggml_backend_cuda_register_writable_host_flags(ggml_backend_dev_t dev, void * buffer, size_t size, unsigned flags) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return false;
     }
     auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
     ggml_cuda_set_device(ctx->device);
-    const auto err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+    const auto err = cudaHostRegister(buffer, size, flags);
     if (err != cudaSuccess) {
         GGML_LOG_WARN("%s: %s writable host registration failed: %s\n",
                 __func__, ggml_backend_dev_name(dev), cudaGetErrorString(err));
@@ -6641,6 +6664,29 @@ static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, voi
     }
     return true;
 }
+
+static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
+    return ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, cudaHostRegisterPortable);
+}
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+static bool ggml_backend_hip_register_mapped_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_VEGA20 &&
+            ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, hipHostRegisterPortable | hipHostRegisterMapped);
+}
+
+static void * ggml_backend_hip_get_host_mapping(ggml_backend_dev_t dev, void * buffer) {
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    ggml_cuda_set_device(ctx->device);
+    void * mapped = nullptr;
+    if (hipHostGetDevicePointer(&mapped, buffer, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    return mapped;
+}
+#endif
 
 static void ggml_backend_cuda_unregister_writable_host(ggml_backend_dev_t dev, void * buffer) {
     auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
@@ -7570,6 +7616,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_writable_host") == 0) {
         return (void *)ggml_backend_cuda_unregister_writable_host;
+    }
+#endif
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (strcmp(name, "ggml_backend_hip_register_mapped_host") == 0) {
+        return (void *)ggml_backend_hip_register_mapped_host;
+    }
+    if (strcmp(name, "ggml_backend_hip_get_host_mapping") == 0) {
+        return (void *)ggml_backend_hip_get_host_mapping;
+    }
+    if (strcmp(name, "ggml_backend_hip_graph_mapped_return") == 0) {
+        return (void *)ggml_backend_hip_graph_mapped_return;
     }
 #endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
