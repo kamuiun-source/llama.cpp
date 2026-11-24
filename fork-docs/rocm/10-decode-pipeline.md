@@ -447,6 +447,31 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 
 ## Castagna Veloceの移植試作
 
+### 移植ブランチの計測索引
+
+2026-11-24に `codex/rocm-castagna-port` へ戻った時点の記録。実行時に使う設定は[固定3幅の起動フラグ一覧](#固定3幅の起動フラグ一覧)。各計測は幅、会話履歴、プロファイラー、プロンプトのキャッシュ設定が異なるため、生成速度は各節の対照と比較する。
+
+| 測定 | 結果と参照先 |
+| --- | --- |
+| 採用設定と全移植ON | 通常起動34.54、全項目ON 32.48 tok/s。全項目ONはドラフトを短縮し、MTP採用と出力が一部変化。[固定3幅の起動フラグと全ON試験](#固定3幅の起動フラグ一覧) |
+| 符号復号とIQ3_XXS LDS先読み | 合成入力の幅2・3で出力一致。[実幅2の単体確認](#実幅2での適用範囲)、[固定2幅・固定3幅・4K・8K](#固定2幅の実モデル比較)、[通常5問・各5回](#いつもの5問での詳細計測各5回)、[第4問の層別トレース](#第4問の層別トレース)、[別の5問](#別の5問での追加計測) |
+| IQ3_XXSの2行・4行 | 4行は単体で約9〜10%短縮。実モデルの8Kキャッシュ再実行は試行間で逆転し、4行の通常5問20回は合算39.44 tok/s。[単体・8K初回・キャッシュ再実行・20回の内訳](#固定3幅のldsを出力行グループ間で再利用) |
+| IQ2_Sの横展開とスワップ | スワップ再現時はヒープの退避増加を確認。固定Expert原本は退避0。LDSなし・あり2行・あり4行の合成入力は出力一致。LDSなしの従来2行と試作4行、LDSありの両行数、占有率とLDS使用量の比較を記録。[IQ2_Sの実モデル・単体・スワップ調査](#固定3幅のiq2_sへの横展開) |
+| 量子型別rocprof | 対象型の融合カーネル中央値は2行→4行でIQ2_S **5.727→4.895 ms**、IQ3_XXS **3.059→2.766 ms**。実モデル全体の速度は同じ順にならない回もある。[型別の内訳](#rocprofでiq3_xxsとiq2_sを量子型別に計測)、[各型の4条件比較](#iq2_sまたはiq3_xxsだけ先読みを有効にした4条件比較) |
+| RAMキャッシュ無効・LDSのライブ切り替え | `--cache-ram 0` の対照、同一PIDでの固定モード再試行、ウォームアップ後の4条件×2巡を記録。2行／4行の生成合算はIQ2_S 43.26／43.60、IQ3_XXS 47.83／45.54 tok/s。[RAMキャッシュ比較](#--cache-ram-0-で固定5問を再計測)、[ライブ切り替えの条件と対照](#サーバー起動中のlds切り替え)、[2巡の各処理時間](#ウォームアップを揃えた2巡のライブ切り替え計測) |
+| ドラフトと各GPUへの移植 | [ドラフトグラフ再利用](#mtpドラフトのグラフ再利用)、[語彙制限と固定履歴の追加測定](#ドラフト語彙の先頭範囲)、[MI50 HIP Graphs](#gfx906のhip-graphsを個別に切り替える)、[RTX concat](#短い行の非連続concat)、[SSM softplus](#ssmゲートのsoftplusと係数乗算の融合)、[GDN](#gdn出力のrms正規化とsigmoidゲートの融合) |
+| スワップを照合した9項目の再測定 | 同一ビルドで21回・105応答を完走。基準の揺れ、concat・SSM・GDNの再試行、ドラフトの採用数、各試行の処理時間とcgroupのスワップを保存。[全条件と再試行](#castagna移植のスワップ再検証) |
+
+実行ファイルとログの照合先。生ログ・応答別データはGit外に保存する。
+
+| 記録 | 保存先 |
+| --- | --- |
+| LDSライブ切り替え2巡、各条件の段階別時間 | `/home/t-saka/rocm-live-lds-warmup-ab-20261124/warmup-stage-breakdown.json`。同ディレクトリの `session-batch-01/` に全応答とテレメトリ。 |
+| 移植9項目の初回・再試行 | `/home/t-saka/rocm-transplant-swap-audit-20261124/` の `session-batch-01/stage-comparison.json` と `clean-swap-retry/session-batch-01/stage-comparison.json`。同じ場所に出力ID、MTP、RAM、スワップ、I/Oのログ。 |
+| Expert並行転送のABBA再計測 | 別ブランチ `codex/rocm-expert-single-kernel-overlap`。生成OFF **40.77**、ON **40.14 tok/s**、本体検証 **50.42→51.36 ms/回**。全4試行でMTP 358/549と出力一致、スワップアウト・500 ms以上の出力停止・DMAタイムアウトは0。最適化は保留、通常設定はOFF。[別ブランチの記録](https://github.com/kamuiun-source/llama.cpp/blob/a958b3f661ec052e1f6ed68e3c185bff05aa4684/fork-docs/rocm/09-single-bank-mtp3.md)。生ログと集計は `/home/t-saka/rocm-expert-single-kernel-overlap-abba-20261124/session-batch-01/`。 |
+| 移植ブランチに戻した後のビルド | `8ce1b6932` をDockerで増分ビルド。サーバーは `0.9.0-dev (build 12407, commit 8ce1b6932)`。CLIでRTX 4070 Ti（CUDA0）とMI50（ROCm0）を確認。ログは `/home/t-saka/rocm-castagna-rebuild-20261124/` の `postcommit-*`。 |
+
+
 ### 固定3幅の起動フラグ一覧
 
 `codex/rocm-castagna-port` のDocker起動時に `-e 変数名=値` で渡す。値を変えるときは新しい環境変数で `llama-server` を再起動する。Expert直接DMAなどの共通設定は、上の「単一バンク・固定3幅の採用設定」を使う。LinuxではExpert直接DMA時にRAM原本を自動でページ固定する。Dockerを直接起動するときは `--ulimit memlock=22548578304:22548578304` を加える。
