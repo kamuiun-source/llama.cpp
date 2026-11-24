@@ -2104,7 +2104,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     gparams.trace_next_router = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_expert_used() == 10 &&
             model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed && target_mtp_verify_width == 3 &&
             !cparams.warmup && moe_cache && (moe_cache->next_router_trace_active() || moe_cache->next_router_prefetch_enabled());
-    gparams.next_router_scores = gparams.trace_next_router && moe_cache->next_router_score_filter_enabled();
+    gparams.next_router_score_mode = gparams.trace_next_router ? moe_cache->next_router_score_mode() : 0;
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);

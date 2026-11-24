@@ -34,7 +34,7 @@ public:
     bool next_router_trace_active() const;
     void trace_next_router(int32_t il, const ggml_tensor * ids);
     bool next_router_prefetch_enabled() const;
-    bool next_router_score_filter_enabled() const;
+    int next_router_score_mode() const;
     void begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions, const std::vector<ggml_tensor *> & scores);
     void end_next_router_prefetch();
     bool next_router_profile_enabled() const;
