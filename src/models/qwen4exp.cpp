@@ -554,6 +554,10 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
             ggml_set_output(ids);
             ggml_build_forward_expand(gf, ids);
             res->t_next_router.push_back(ids);
+            if (params.next_router_scores) {
+                ggml_set_output(logits);
+                res->t_next_router_scores.push_back(logits);
+            }
         }
 
         cur = build_layer_ffn(cur, il);

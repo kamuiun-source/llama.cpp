@@ -592,6 +592,13 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr next_prefetch_buffer;
     ggml_tensor * next_prefetch_bank = nullptr;
     const std::vector<ggml_tensor *> * next_prefetch_predictions = nullptr;
+    const std::vector<ggml_tensor *> * next_prefetch_scores = nullptr;
+    bool next_prefetch_score_filter = false;
+    size_t next_prefetch_score_eligible = 0;
+    size_t next_prefetch_score_rejected = 0;
+    size_t next_prefetch_score_empty = 0;
+    size_t next_prefetch_score_readback_fallback = 0;
+    size_t next_prefetch_score_row_fallback = 0;
     std::array<int32_t, next_prefetch_slots> next_prefetch_ids{};
     std::array<ggml_backend_event_ptr, next_prefetch_slots> next_prefetch_events;
     std::array<int32_t, next_prefetch_slots> next_prefetch_source_slots{};
@@ -2355,6 +2362,8 @@ struct llama_moe_cache::impl {
         if (!next_prefetch_buffer) {
             throw std::runtime_error("could not allocate HIP next Router prefetch bank");
         }
+        const char * score_filter = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER");
+        next_prefetch_score_filter = score_filter && std::strcmp(score_filter, "1") == 0;
         const char * hit_wait = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT");
         if (hit_wait && std::strcmp(hit_wait, "1") == 0) {
             for (auto & event : next_prefetch_events) {
@@ -2370,6 +2379,9 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("packed expert HIP next Router prefetch: slots=%d bank_bytes=%zu\n",
                 next_prefetch_slots, ggml_backend_buffer_get_size(next_prefetch_buffer.get()));
+        if (next_prefetch_score_filter) {
+            LLAMA_LOG_INFO("packed expert HIP next Router prefetch: score_filter=1\n");
+        }
         if (next_prefetch_hit_wait) {
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: hit_wait=1\n");
         }
@@ -2430,6 +2442,55 @@ struct llama_moe_cache::impl {
         }
     }
 
+    static constexpr int next_prefetch_tokens = 3;
+    static constexpr int next_prefetch_ranks = 10;
+    static constexpr int next_prefetch_experts = llama_expert_profile::n_experts;
+    using next_prefetch_routes = std::array<int32_t, next_prefetch_tokens * next_prefetch_ranks>;
+    using next_prefetch_logits = std::array<float, next_prefetch_tokens * next_prefetch_experts>;
+    using next_prefetch_mask = std::array<bool, next_prefetch_experts>;
+
+    void filter_next_prefetch(const next_prefetch_routes & predicted, const next_prefetch_logits & logits,
+            int32_t layer, next_prefetch_mask & accepted) {
+        accepted.fill(false);
+        next_prefetch_mask seen{};
+        for (int token = 0; token < next_prefetch_tokens; ++token) {
+            const auto * row = logits.data() + token * next_prefetch_experts;
+            const auto * ids = predicted.data() + token * next_prefetch_ranks;
+            bool valid = true;
+            for (int rank = 0; rank < next_prefetch_ranks; ++rank) {
+                GGML_ASSERT(ids[rank] >= 0 && ids[rank] < next_prefetch_experts);
+                valid &= std::isfinite(row[ids[rank]]);
+            }
+            const float cutoff = row[ids[next_prefetch_ranks - 1]];
+            const float range = row[ids[0]] - cutoff;
+            valid &= std::isfinite(range) && range > 1e-6f;
+            const float threshold = cutoff + 0.10f * range;
+            next_prefetch_score_row_fallback += !valid;
+            for (int rank = 0; rank < next_prefetch_ranks; ++rank) {
+                const int expert = ids[rank];
+                seen[expert] = true;
+                accepted[expert] |= !valid || row[expert] >= threshold;
+            }
+        }
+
+        const auto & map = placement->maps[layer];
+        const auto & scratch = layers[layer].packed_scratch;
+        size_t eligible = 0;
+        for (int32_t expert : predicted) {
+            if (!seen[expert]) {
+                continue;
+            }
+            seen[expert] = false;
+            if (map.resident[expert] < 0 && map.host[expert] >= 0 &&
+                    std::find(scratch.begin(), scratch.end(), expert) == scratch.end()) {
+                eligible += accepted[expert];
+                next_prefetch_score_rejected += !accepted[expert];
+            }
+        }
+        next_prefetch_score_eligible += eligible;
+        next_prefetch_score_empty += eligible == 0;
+    }
+
     void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il) {
         if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
             return;
@@ -2442,12 +2503,23 @@ struct llama_moe_cache::impl {
         auto * prediction = (*next_prefetch_predictions)[il];
         auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
         GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
-        constexpr int n_tokens = 3;
-        constexpr int n_used = 10;
-        std::array<int32_t, n_tokens * n_used> predicted;
+        next_prefetch_routes predicted;
+        next_prefetch_logits logits;
+        bool read_scores = false;
         GGML_ASSERT(ggml_nbytes(prediction) == sizeof(predicted));
         const int64_t read_start = next_profile_start ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, sizeof(predicted));
+        if (next_prefetch_scores) {
+            auto * scores = (*next_prefetch_scores)[il];
+            read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
+                    scores->ne[0] == next_prefetch_experts && scores->ne[1] == next_prefetch_tokens &&
+                    ggml_nbytes(scores) == sizeof(logits) && ggml_backend_sched_get_tensor_backend(sched, scores) == producer;
+            if (read_scores) {
+                ggml_backend_tensor_get_async(producer, scores, logits.data(), 0, sizeof(logits));
+            } else {
+                ++next_prefetch_score_readback_fallback;
+            }
+        }
         const int64_t wait_start = read_start ? ggml_time_us() : 0;
         ggml_backend_synchronize(producer);
         if (read_start) {
@@ -2456,14 +2528,21 @@ struct llama_moe_cache::impl {
             next_profile_read_wait_us += ggml_time_us() - wait_start;
         }
 
+        next_prefetch_mask accepted;
+        if (read_scores) {
+            filter_next_prefetch(predicted, logits, target, accepted);
+        }
         const auto & map = placement->maps[target];
         const auto & scratch = layers[target].packed_scratch;
         const auto & tuple = placement->tuples[target];
         const auto * host = static_cast<const uint8_t *>(tuple.host->data);
-        for (int rank = 0; rank < n_used; ++rank) {
-            for (int token = 0; token < n_tokens; ++token) {
-                const int32_t expert = predicted[token * n_used + rank];
+        for (int rank = 0; rank < next_prefetch_ranks; ++rank) {
+            for (int token = 0; token < next_prefetch_tokens; ++token) {
+                const int32_t expert = predicted[token * next_prefetch_ranks + rank];
                 GGML_ASSERT(expert >= 0 && size_t(expert) < map.resident.size());
+                if (read_scores && !accepted[expert]) {
+                    continue;
+                }
                 const int32_t host_slot = map.host[expert];
                 const auto end = next_prefetch_ids.begin() + next_prefetch_count;
                 if (map.resident[expert] >= 0 || host_slot < 0 || std::find(scratch.begin(), scratch.end(), expert) != scratch.end() ||
@@ -3768,6 +3847,11 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("packed expert HIP next Router after-submit: enabled=%d scheduled=%zu executed=%zu fallback=%zu canceled=%zu"
                     " launch_cpu_wall_us=%" PRId64 "\n", next_prefetch_after_submit, next_prefetch_submit_scheduled,
                     next_prefetch_submit_executed, next_prefetch_submit_fallback, next_prefetch_submit_canceled, next_prefetch_submit_cpu_us);
+            if (next_prefetch_score_filter) {
+                LLAMA_LOG_INFO("packed expert HIP next Router score filter: eligible=%zu rejected=%zu empty_layers=%zu"
+                        " readback_fallbacks=%zu row_fallbacks=%zu\n", next_prefetch_score_eligible, next_prefetch_score_rejected,
+                        next_prefetch_score_empty, next_prefetch_score_readback_fallback, next_prefetch_score_row_fallback);
+            }
         }
         for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
             if (!layers[il].slot_map) {
@@ -4086,10 +4170,16 @@ bool llama_moe_cache::next_router_prefetch_enabled() const {
     return pimpl->next_prefetch_bank != nullptr;
 }
 
-void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions) {
+bool llama_moe_cache::next_router_score_filter_enabled() const {
+    return pimpl->next_prefetch_score_filter;
+}
+
+void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions, const std::vector<ggml_tensor *> & scores) {
     auto & self = *pimpl;
     GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
+    GGML_ASSERT(!self.next_prefetch_score_filter || scores.size() == predictions.size());
+    self.next_prefetch_scores = self.next_prefetch_score_filter ? &scores : nullptr;
 }
 
 void llama_moe_cache::end_next_router_prefetch() {
@@ -4099,6 +4189,7 @@ void llama_moe_cache::end_next_router_prefetch() {
     }
     pimpl->finish_next_prefetch();
     pimpl->next_prefetch_predictions = nullptr;
+    pimpl->next_prefetch_scores = nullptr;
 }
 
 bool llama_moe_cache::next_router_profile_enabled() const {
