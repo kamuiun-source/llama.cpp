@@ -1281,8 +1281,7 @@ struct llm_graph_context {
                     bool   cold = false,
                  int32_t   prefill_wave = -1,
              ggml_tensor * prefill_ids = nullptr,
-                bool   mtp_verify_three = false,
-         ggml_tensor * full_map = nullptr) const;
+                bool   mtp_verify_three = false) const;
 
     //
     // inputs

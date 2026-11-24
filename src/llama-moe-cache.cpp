@@ -379,8 +379,6 @@ struct llama_moe_cache::impl {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         ggml_tensor * cold_slot_map = nullptr;
-        ggml_tensor * hip_mtp_hot_map = nullptr;
-        ggml_tensor * hip_mtp_full_map = nullptr;
         ggml_tensor * slot_map_cpu = nullptr; // looked up in place of slot_map by the graphs with a CPU part, if cpu_share > 0, its data is not used
         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
@@ -435,11 +433,6 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> packed_cold_scratch;
     std::array<int32_t, llama_expert_profile::n_experts> packed_cold_slots{};
     int32_t pending_layer = -1;
-    int32_t pending_mtp_promote = -1;
-    int32_t pending_mtp_evict = -1;
-    uint32_t pending_mtp_miss_mask = 0;
-    int32_t pending_mtp_full_layer = -1;
-    std::array<int32_t, llama_expert_profile::n_experts> pending_mtp_full_slots{};
     size_t pending_permanent_hits = 0;
     size_t pending_scratch_hits = 0;
     size_t pending_request_misses = 0;
@@ -497,10 +490,6 @@ struct llama_moe_cache::impl {
     bool defer_slot_map_requested = false;
     using submit_expert_upload_t = bool (*)(ggml_backend_t);
     submit_expert_upload_t submit_expert_upload = nullptr;
-    using stage_hip_expert_overlap_t = bool (*)(ggml_backend_t, const ggml_cgraph *, const ggml_tensor *,
-            const ggml_tensor *, const void * const *, const int *, const int *, unsigned, size_t);
-    stage_hip_expert_overlap_t stage_hip_expert_overlap = nullptr;
-    size_t hip_expert_overlap_staged[4] = {};
     using overlap_expert_upload_t = bool (*)(ggml_backend_t, const ggml_cgraph *, ggml_tensor *, const int32_t *,
             const int32_t *, const uint32_t *, ggml_tensor * const *, const void *, const size_t *, const size_t *, const size_t *, size_t);
     overlap_expert_upload_t overlap_expert_upload = nullptr;
@@ -536,15 +525,6 @@ struct llama_moe_cache::impl {
     bool overlap_upload_requested = false;
     size_t packed_overlap_uploads = 0;
     size_t packed_overlap_upload_bytes = 0;
-    size_t packed_mtp_hot_routes = 0;
-    size_t packed_mtp_miss_routes = 0;
-    size_t packed_mtp_empty_groups = 0;
-    size_t packed_mtp_gate_up_all_hit = 0;
-    size_t packed_mtp_gate_up_all_miss = 0;
-    size_t packed_mtp_gate_up_mixed = 0;
-    uint64_t packed_mtp_gate_up_fused_hits = 0;
-    uint64_t packed_mtp_gate_up_shared_dispatches = 0;
-    uint64_t packed_mtp_gate_up_q8_1_dispatches = 0;
     bool defer_upload_requested = false;
     size_t packed_deferred_uploads = 0;
     size_t packed_synchronous_uploads = 0;
@@ -827,8 +807,7 @@ struct llama_moe_cache::impl {
                     placement->max_ubatch != 2 || n_expert_used != 10)) {
                 throw std::runtime_error("3-position MTP requires packed Expert capacity 300+20 and top-10 routing");
             }
-            const int32_t map_count = 1 + placement->overlap + 2 * placement->hip_mtp_overlap +
-                    placement->hip_mtp_gate_up_overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
+            const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
             if (!ctx_host) {
@@ -854,17 +833,7 @@ struct llama_moe_cache::impl {
                         layer_of.emplace(map, std::make_pair(static_cast<int32_t>(il), false));
                     }
                 }
-                if (placement->hip_mtp_overlap) {
-                    l.hip_mtp_hot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
-                    ggml_format_name(l.hip_mtp_hot_map, "moe_cache.packed_mtp_hot-%zu", il);
-                    layer_of.emplace(l.hip_mtp_hot_map, std::make_pair(static_cast<int32_t>(il), false));
-                }
-                if (placement->hip_mtp_gate_up_overlap) {
-                    l.hip_mtp_full_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
-                    ggml_format_name(l.hip_mtp_full_map, "moe_cache.packed_mtp_full-%zu", il);
-                    layer_of.emplace(l.hip_mtp_full_map, std::make_pair(static_cast<int32_t>(il), false));
-                }
-                if (placement->overlap || placement->hip_mtp_overlap) {
+                if (placement->overlap) {
                     l.cold_slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
                     ggml_format_name(l.cold_slot_map, "moe_cache.packed_cold-%zu", il);
                     layer_of.emplace(l.cold_slot_map, std::make_pair(static_cast<int32_t>(il), true));
@@ -914,14 +883,6 @@ struct llama_moe_cache::impl {
             const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
             const char * target_name = target_reg ? ggml_backend_reg_name(target_reg) : "";
             const auto reg = std::strcmp(target_name, "Vulkan") == 0 ? target_reg : nullptr;
-#ifdef __linux__
-            const char * single_kernel_overlap = std::getenv("LLAMA_EXPERT_HIP_MTP3_SINGLE_KERNEL_OVERLAP");
-            if (placement->hip_tuple_dma && std::strcmp(target_name, "ROCm") == 0 &&
-                    single_kernel_overlap && std::strcmp(single_kernel_overlap, "1") == 0) {
-                stage_hip_expert_overlap = reinterpret_cast<stage_hip_expert_overlap_t>(
-                        ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_hip_stage_expert_overlap_v2"));
-            }
-#endif
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
             const char * telemetry = std::getenv("LLAMA_DECODE_TELEMETRY");
             packed_miss_histogram = telemetry && std::strcmp(telemetry, "1") == 0 &&
@@ -980,7 +941,7 @@ struct llama_moe_cache::impl {
             const char * hip_pinned = std::getenv("LLAMA_EXPERT_HIP_PINNED_UPLOAD");
             const bool hip_overlap = placement->hip_overlap != llama_expert_placement::hip_overlap_mode::off;
             const bool hip_prefill = placement->hip_prefill != llama_expert_placement::hip_overlap_mode::off;
-            const bool hip_upload_requested = hip_overlap || hip_prefill || placement->hip_mtp_overlap ||
+            const bool hip_upload_requested = hip_overlap || hip_prefill ||
                     (std::strcmp(target_name, "ROCm") == 0 && hip_pinned && std::strcmp(hip_pinned, "1") == 0);
             if (hip_upload_requested && !placement->hip_tuple_dma) {
                 const auto buft = ggml_backend_dev_host_buffer_type(placement->target);
@@ -994,7 +955,7 @@ struct llama_moe_cache::impl {
                     packed_staging = std::move(buffer);
                     LLAMA_LOG_INFO("packed expert HIP pinned upload: %zu bytes of staging on %s\n",
                             ggml_backend_buffer_get_size(packed_staging.get()), ggml_backend_dev_name(placement->target));
-                } else if (hip_overlap || placement->hip_mtp_overlap) {
+                } else if (hip_overlap) {
                     throw std::runtime_error("HIP expert overlap requires pinned host staging");
                 } else if (hip_prefill) {
                     throw std::runtime_error("HIP expert prefill requires pinned host staging");
@@ -1002,14 +963,11 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_WARN("packed expert HIP pinned upload unavailable, using serial uploads\n");
                 }
             }
-            if (placement->hip_mtp_overlap) {
-                LLAMA_LOG_INFO("packed expert HIP MTP3: single-bank upload overlap enabled\n");
-            }
             if (packed_staging || placement->hip_mtp_direct_ram || placement->hip_tuple_dma) {
                 fills.reserve(placement->n_slots);
             }
             if (packed_staging || placement->hip_tuple_dma) {
-                if (hip_overlap || hip_prefill || placement->hip_mtp_overlap) {
+                if (hip_overlap || hip_prefill) {
                     hip_upload_backend.reset(ggml_backend_dev_init(placement->target, nullptr));
                     if (!hip_upload_backend) {
                         throw std::runtime_error("could not initialize the HIP expert upload backend");
@@ -1019,7 +977,7 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_INFO("packed expert HIP compact prefill: cold uploads %s\n",
                             placement->hip_prefill == llama_expert_placement::hip_overlap_mode::async ? "overlapped" : "serialized");
                 }
-                if (placement->overlap || placement->hip_mtp_overlap) {
+                if (placement->overlap) {
                     packed_cold_scratch.reserve(placement->n_slots);
                 }
                 if (placement->overlap) {
@@ -1051,7 +1009,7 @@ struct llama_moe_cache::impl {
                         ggml_backend_dev_name(placement->target));
             }
             if (placement->hip_mtp_verify_three && placement->dynamic_resident && !placement->overlap &&
-                    !placement->hip_mtp_overlap && !placement->hip_mtp_direct_ram) {
+                    !placement->hip_mtp_direct_ram) {
                 const auto buft = ggml_backend_dev_host_buffer_type(placement->target);
                 const auto allocate_pinned = [&](const char * env, size_t bytes) -> ggml_backend_buffer_ptr {
                     const char * value = std::getenv(env);
@@ -1097,23 +1055,21 @@ struct llama_moe_cache::impl {
             const char * next_profile = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE");
             next_profile_enabled = next_profile && std::strcmp(next_profile, "1") == 0 &&
                     model.arch == LLM_ARCH_QWEN4EXP && placement->hip_tuple_dma && placement->hip_mtp_verify_three &&
-                    !placement->hip_mtp_overlap && !placement->overlap;
+                    !placement->overlap;
             const char * next_prefetch = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH");
             if (next_prefetch && std::strcmp(next_prefetch, "1") == 0) {
-                const char * single_kernel = std::getenv("LLAMA_EXPERT_HIP_MTP3_SINGLE_KERNEL_OVERLAP");
                 if (std::strcmp(target_name, "ROCm") != 0 || model.arch != LLM_ARCH_QWEN4EXP ||
                         model.hparams.n_expert_used() != 10 || model.hparams.n_expert_groups > 1 ||
                         !placement->hip_tuple_dma || !placement->hip_mtp_verify_three || placement->hip_mtp_verify_four ||
-                        !placement->dynamic_resident || placement->overlap || placement->hip_mtp_overlap ||
-                        (single_kernel && std::strcmp(single_kernel, "1") == 0)) {
-                    throw std::runtime_error("HIP next Router prefetch requires Qwen4EXP packed MTP3 tuple DMA with dynamic residency. Disable split and single-kernel Expert overlap.");
+                        !placement->dynamic_resident || placement->overlap) {
+                    throw std::runtime_error("HIP next Router prefetch requires Qwen4EXP packed MTP3 tuple DMA with dynamic residency. Disable split Expert overlap.");
                 }
                 init_next_prefetch();
             }
             const char * rtx_slots_env = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
             if (rtx_slots_env && std::strcmp(rtx_slots_env, "0") != 0) {
-                if (placement->hip_mtp_overlap || placement->hip_mtp_direct_ram || placement->hip_tuple_dma) {
-                    throw std::runtime_error("HIP MTP3 expert overlap, direct RAM and tuple DMA require RTX cold assist off");
+                if (placement->hip_mtp_direct_ram || placement->hip_tuple_dma) {
+                    throw std::runtime_error("HIP MTP3 direct RAM and tuple DMA require RTX cold assist off");
                 }
                 char * end = nullptr;
                 const long slots = std::strtol(rtx_slots_env, &end, 10);
@@ -1137,7 +1093,7 @@ struct llama_moe_cache::impl {
             }
             if (const char * path = std::getenv("LLAMA_EXPERT_GENERATION_TRACE"); path && *path) {
                 if (std::strcmp(target_name, "ROCm") != 0 || !placement->dynamic_resident ||
-                        placement->overlap || placement->hip_mtp_overlap || rtx_expert) {
+                        placement->overlap || rtx_expert) {
                     throw std::runtime_error("generation trace requires ROCm single-bank dynamic Expert placement with upload overlap and RTX assist off");
                 }
                 generation_trace.reset(fopen(path, "wb"));
@@ -1477,7 +1433,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part, bool mtp_three) const {
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
@@ -1486,7 +1442,7 @@ struct llama_moe_cache::impl {
             const int32_t max_tokens = placement->hip_mtp_verify_four ? 4 :
                     placement->hip_mtp_verify_three ? 3 : placement->max_ubatch;
             return n_tokens > 0 && n_tokens <= max_tokens && n_expert_used > 0 &&
-                    n_expert_used <= placement->n_slots / n_tokens ? (mtp_three && l.hip_mtp_hot_map ? l.hip_mtp_hot_map : l.slot_map) : nullptr;
+                    n_expert_used <= placement->n_slots / n_tokens ? l.slot_map : nullptr;
         }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
@@ -1519,7 +1475,7 @@ struct llama_moe_cache::impl {
 
     ggml_tensor * get_experts(const ggml_tensor * w, bool cold) const {
         const auto it = bindings.find(w);
-        return it != bindings.end() ? (cold && !(placement && placement->hip_mtp_overlap) ? it->second.cold : it->second.cached) : nullptr;
+        return it != bindings.end() ? (cold ? it->second.cold : it->second.cached) : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -2054,7 +2010,6 @@ struct llama_moe_cache::impl {
         finish_hip_mtp_promotion();
         const int32_t il = l.compact_layer;
         const auto backend = devices[groups[l.ig].id].backend;
-        abandon_hip_mtp_upload();
         const bool hip_prefill = placement->hip_prefill != llama_expert_placement::hip_overlap_mode::off;
         const int64_t ranks = dst->ne[1];
         std::vector<int32_t> selected(ranks * dst->ne[2]);
@@ -2345,24 +2300,14 @@ struct llama_moe_cache::impl {
         hip_pending_promotion.n_planes = 0;
     }
 
-    void abandon_hip_mtp_upload() {
-        pending_mtp_full_layer = -1;
-        if (placement && placement->hip_mtp_overlap && pending_layer >= 0) {
-            wait_hip_cold_upload();
-            pending_layer = -1;
-        }
-    }
 
     void wait_hip_cold_upload() {
-        if (hip_upload_backend && (placement->hip_mtp_overlap || placement->hip_overlap == llama_expert_placement::hip_overlap_mode::async) &&
+        if (hip_upload_backend && placement->hip_overlap == llama_expert_placement::hip_overlap_mode::async &&
                 pending_layer >= 0 && (pending_upload_bytes != 0 || hip_pending_promotion.n_planes != 0)) {
             const int64_t start = ggml_time_us();
             ggml_backend_synchronize(hip_upload_backend.get());
             const uint64_t us = ggml_time_us() - start;
             packed_wait_us += us;
-            if (profile_packed_ram_copy && placement->hip_mtp_gate_up_overlap) {
-                packed_staging_totals.upload_wait_us += us;
-            }
         }
     }
 
@@ -2815,51 +2760,12 @@ struct llama_moe_cache::impl {
         next_prefetch_d2d_bytes += tuple.stride;
     }
 
-    size_t stage_hip_single_kernel_upload(ggml_backend_t backend, const ggml_cgraph * graph, const ggml_tensor * lookup,
-            const layer & l, int32_t il, int32_t promote_index, int32_t evict) {
-        constexpr size_t max_uploads = 4;
-        if (fills.empty() || fills.size() > max_uploads) {
-            return 0;
-        }
-        const auto & tuple = placement->tuples[il];
-        const auto & map = placement->maps[il];
-        std::array<const void *, max_uploads> sources;
-        std::array<int, max_uploads> slots, experts;
-        const auto promotion = evict >= 0 ? prepare_packed_promotion(l, il, promote_index, evict) : packed_promotion{};
-        for (size_t i = 0; i < fills.size(); ++i) {
-            const auto & fill = fills[i];
-            const int host_slot = map.host[fill.expert];
-            const int slot = packed_slot(l, fill.slot);
-            if (host_slot < 0 || size_t(host_slot) >= ggml_nbytes(tuple.host) / tuple.stride) {
-                return 0;
-            }
-            // A concurrent promotion may only read and replace storage outside the DMA regions.
-            if (evict >= 0 && (host_slot == promotion.host_slot || slot == promotion.old_gpu_slot ||
-                    slot == promotion.new_gpu_slot)) {
-                return 0;
-            }
-            sources[i] = static_cast<const uint8_t *>(tuple.host->data) + host_slot * tuple.stride;
-            slots[i] = slot;
-            experts[i] = fill.expert;
-        }
-        telemetry_scope scope(set_telemetry_cause, "expert_upload");
-        if (!stage_hip_expert_overlap(backend, graph, lookup, tuple.device, sources.data(), slots.data(), experts.data(), fills.size(),
-                tuple.stride)) {
-            return 0;
-        }
-        const size_t bytes = fills.size() * tuple.stride;
-        tuple_h2d_count += fills.size();
-        tuple_h2d_payload_bytes += fills.size() * tuple.payload_bytes;
-        tuple_h2d_bytes += bytes;
-        ++hip_expert_overlap_staged[fills.size() - 1];
-        return bytes;
-    }
 
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false,
                          llama_expert_staging_telemetry * callback_totals = nullptr) {
         const bool tuple_dma = placement->hip_tuple_dma;
-        GGML_ASSERT(!hip_async || ((cold || placement->hip_mtp_overlap || tuple_dma) && !submitted));
+        GGML_ASSERT(!hip_async || ((cold || tuple_dma) && !submitted));
         GGML_ASSERT(!hip_direct || (!cold && !hip_async && !submitted && !retry_bytes));
         GGML_ASSERT(!tuple_dma || (!cold && !submitted && !retry_bytes && !hip_direct));
         telemetry_scope scope(set_telemetry_cause, "expert_upload");
@@ -3213,14 +3119,6 @@ struct llama_moe_cache::impl {
         // The scheduler's destination wait must commit the preceding promotion.
         GGML_ASSERT(!pending_writeback);
 
-        if (src == l.hip_mtp_full_map) {
-            GGML_ASSERT(pending_mtp_full_layer == il && pending_layer == -1);
-            telemetry_scope scope(set_telemetry_cause, "slot_map");
-            ggml_backend_tensor_set(dst, pending_mtp_full_slots.data(), 0, ggml_nbytes(dst));
-            pending_mtp_full_layer = -1;
-            return true;
-        }
-
         auto find_lookup = [&]() -> ggml_tensor * {
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto * node = ggml_graph_node(graph, i);
@@ -3231,7 +3129,7 @@ struct llama_moe_cache::impl {
             return nullptr;
         };
 
-        if (placement && (placement->overlap || placement->hip_mtp_overlap) && has_cpu) {
+        if (placement && placement->overlap && has_cpu) {
             // The hot split does not read the slots being uploaded.
             GGML_ASSERT(pending_layer == il);
             if (hip_upload_backend) {
@@ -3265,40 +3163,6 @@ struct llama_moe_cache::impl {
                 }
                 commit_hip_promotion(l);
             }
-            if (placement->hip_mtp_overlap) {
-                if (placement->hip_mtp_compact) {
-                    auto * lookup = find_lookup();
-                    GGML_ASSERT(lookup);
-                    lookup->op_params[0] = pending_mtp_miss_mask;
-                    packed_mtp_hot_routes += pending_permanent_hits + pending_scratch_hits;
-                    packed_mtp_miss_routes += pending_request_misses;
-                    packed_mtp_empty_groups += pending_mtp_miss_mask == 0 || pending_mtp_miss_mask == ((uint32_t{1} << 30) - 1);
-                }
-                if (placement->hip_mtp_gate_up_overlap) {
-                    const bool all_hit = pending_mtp_miss_mask == 0;
-                    const bool all_miss = pending_mtp_miss_mask == ((uint32_t{1} << 30) - 1);
-                    packed_mtp_gate_up_all_hit += all_hit;
-                    packed_mtp_gate_up_all_miss += all_miss;
-                    packed_mtp_gate_up_mixed += !all_hit && !all_miss;
-                    pending_mtp_full_layer = il;
-                }
-                if (pending_mtp_evict >= 0) {
-                    promote_packed(l, il, pending_mtp_promote, pending_mtp_evict);
-                }
-                packed_overlap_uploads += pending_upload_bytes != 0;
-                packed_overlap_upload_bytes += pending_upload_bytes;
-                ggml_backend_sched_trace_expert_misses(sched, il, 3, fills.size(), pending_upload_bytes);
-                if (packed_miss_histogram) {
-                    packed_transfer_totals.requests += pending_permanent_hits + pending_scratch_hits + pending_request_misses;
-                    packed_transfer_totals.misses += pending_request_misses;
-                    GGML_ASSERT(fills.size() < packed_miss_counts.size());
-                    ++packed_miss_counts[fills.size()];
-                    packed_miss_bytes += pending_upload_bytes;
-                    if (fills.size() >= 3) {
-                        packed_miss_bytes_3plus += pending_upload_bytes;
-                    }
-                }
-            }
             stats_small.hits += pending_permanent_hits + pending_scratch_hits;
             packed_scratch_hits += pending_scratch_hits;
             packed_request_misses += pending_request_misses;
@@ -3309,11 +3173,6 @@ struct llama_moe_cache::impl {
             return true;
         }
 
-        abandon_hip_mtp_upload();
-        const bool hip_mtp_hot = placement && src == l.hip_mtp_hot_map;
-        if (hip_mtp_hot && (!sched || ggml_backend_sched_get_n_copies(sched) != 1)) {
-            throw std::runtime_error("HIP MTP3 expert overlap requires a single-copy scheduler");
-        }
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -3336,7 +3195,7 @@ struct llama_moe_cache::impl {
 
         const size_t ids_bytes = ggml_nbytes(sel);
         const bool fine_profile = callback_start && placement && placement->hip_mtp_verify_three &&
-                !placement->overlap && !placement->hip_mtp_overlap &&
+                !placement->overlap &&
                 (packed_staging || placement->hip_tuple_dma) && src == l.slot_map &&
                 ggml_nelements(sel) == 30;
         auto & callback_totals = next_profile_start ? next_profile_callback : packed_staging_totals;
@@ -3568,10 +3427,7 @@ struct llama_moe_cache::impl {
                 }
             }
             int32_t promote_index = -1;
-            if (hip_mtp_hot) {
-                packed_cold_scratch = l.packed_scratch;
-            }
-            auto & scratch = placement->overlap || hip_mtp_hot ? packed_cold_scratch : l.packed_scratch;
+            auto & scratch = placement->overlap ? packed_cold_scratch : l.packed_scratch;
             // Mark all selected scratch residents before choosing any slot to replace.
             for (size_t i = 0; i < scratch.size(); ++i) {
                 const int32_t expert = scratch[i];
@@ -3671,49 +3527,6 @@ struct llama_moe_cache::impl {
                 *victim = expert;
                 slots[expert] = slot;
             }
-            if (hip_mtp_hot) {
-                GGML_ASSERT(ids.size() == 30 && n_used == 10);
-                const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
-                auto hot_slots = slots;
-                packed_cold_slots.fill(zero_slot);
-                for (const auto & fill : fills) {
-                    packed_cold_slots[fill.expert] = slots[fill.expert];
-                    hot_slots[fill.expert] = zero_slot;
-                    l.packed_scratch[fill.slot] = -1;
-                }
-                if (placement->hip_mtp_compact) {
-                    uint32_t hot_mask = 0;
-                    for (size_t rank = 0; rank < ids.size(); ++rank) {
-                        if (hot_slots[ids[rank]] != zero_slot) {
-                            hot_mask |= uint32_t{1} << rank;
-                        }
-                    }
-                    lookup->op_params[0] = hot_mask;
-                    pending_mtp_miss_mask = ((uint32_t{1} << 30) - 1) ^ hot_mask;
-                }
-                if (placement->hip_mtp_gate_up_overlap) {
-                    pending_mtp_full_slots = slots;
-                }
-                {
-                    telemetry_scope scope(set_telemetry_cause, "slot_map");
-                    ggml_backend_tensor_set(dst, hot_slots.data(), 0, ggml_nbytes(dst));
-                }
-                pending_permanent_hits = hits;
-                pending_scratch_hits = scratch_hits;
-                pending_request_misses = request_misses;
-                pending_mtp_promote = promote_index;
-                pending_mtp_evict = promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
-                pending_upload_bytes = 0;
-                if (!fills.empty()) {
-                    // Both the selected scratch hits and the zero slot stay outside the upload destinations.
-                    const int64_t upload_start = ggml_time_us();
-                    pending_upload_bytes = upload_packed(hip_upload_backend.get(), l, il, false, nullptr, 0, true);
-                    packed_wait_us += ggml_time_us() - upload_start;
-                    ++packed_wait_count;
-                }
-                pending_layer = il;
-                return true;
-            }
             if (placement->overlap) {
                 // RAM experts use their cold slot and the zero slot in the resident bank.
                 auto resident_slots = map.resident;
@@ -3799,8 +3612,6 @@ struct llama_moe_cache::impl {
             };
             bool upload_submitted = false;
             bool overlap_submitted = false;
-            bool hip_single_kernel_submitted = false;
-            bool slot_map_written = false;
             const bool can_overlap = !hip_direct && (!use_waves || overlap_three_fit) && overlap_expert_upload &&
                     !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
@@ -3815,16 +3626,7 @@ struct llama_moe_cache::impl {
                         overlap_submitted = overlap_packed_upload(backend, graph, dst, l, il, n_used, slots, promote_index, evict, bytes, overlap_copied_bytes);
                         mtp_overlap_submitted += overlap_three_fit && overlap_submitted;
                     }
-                    if (stage_hip_expert_overlap && fixed_three && !early && !profile && !use_waves && !rtx_expert &&
-                            !fills.empty() && fills.size() <= std::size(hip_expert_overlap_staged) && sched && ggml_backend_sched_get_n_copies(sched) == 1 &&
-                            std::strcmp(lookup->name, "ffn_moe_mtp_single_kernel_overlap") == 0) {
-                        // The slot-map H2D must be submitted ahead of the large tuple copies.
-                        write_slot_map();
-                        slot_map_written = true;
-                        bytes = stage_hip_single_kernel_upload(backend, graph, lookup, l, il, promote_index, evict);
-                        hip_single_kernel_submitted = bytes != 0;
-                    }
-                    if (!hip_single_kernel_submitted && !overlap_submitted && !fills.empty()) {
+                    if (!overlap_submitted && !fills.empty()) {
                         bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr,
                                 overlap_copied_bytes, false, hip_direct, fine_profile ? &callback_totals : nullptr);
                     }
@@ -3835,7 +3637,7 @@ struct llama_moe_cache::impl {
                     throw;
                 }
             }
-            if (n_uploads > 0 && !hip_single_kernel_submitted && !upload_submitted && !overlap_submitted) {
+            if (n_uploads > 0 && !upload_submitted && !overlap_submitted) {
                 if (!batch) {
                     telemetry_scope scope(set_telemetry_cause, "expert_upload");
                     ggml_backend_synchronize(backend);
@@ -3880,7 +3682,7 @@ struct llama_moe_cache::impl {
                 packed_overlap_uploads += bytes != 0;
                 packed_overlap_upload_bytes += bytes;
                 ++packed_deferred_maps;
-            } else if (!slot_map_written && defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
+            } else if (defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
                 ++packed_deferred_maps;
                 if (upload_submitted) {
                     ++packed_deferred_uploads;
@@ -3894,11 +3696,9 @@ struct llama_moe_cache::impl {
                     ++packed_wait_count;
                     upload_submitted = false;
                 }
-                if (!slot_map_written) {
-                    write_slot_map();
-                }
+                write_slot_map();
             }
-            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !hip_single_kernel_submitted && !upload_submitted && !overlap_submitted;
+            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !upload_submitted && !overlap_submitted;
             stats_small.hits += hits + scratch_hits;
             packed_scratch_hits += scratch_hits;
             stats_small.misses += n_uploads;
@@ -4135,11 +3935,6 @@ struct llama_moe_cache::impl {
                         hip_mtp_promotion_submits, hip_mtp_promotion_commits, hip_mtp_promotion_bytes,
                         hip_mtp_promotion_wait_us / 1000.0, hip_mtp_pending_move.n_planes != 0);
             }
-            if (stage_hip_expert_overlap) {
-                LLAMA_LOG_INFO("packed expert HIP MTP3 single-kernel overlap staged: cold1=%zu cold2=%zu cold3=%zu cold4=%zu\n",
-                        hip_expert_overlap_staged[0], hip_expert_overlap_staged[1],
-                        hip_expert_overlap_staged[2], hip_expert_overlap_staged[3]);
-            }
             if (placement->hip_tuple_dma) {
                 LLAMA_LOG_INFO("packed HIP Expert tuple DMA: h2d=%zu h2d_payload_bytes=%zu h2d_bytes=%zu compact_h2d=%zu"
                         " d2h=%zu d2h_payload_bytes=%zu d2h_bytes=%zu\n",
@@ -4166,34 +3961,6 @@ struct llama_moe_cache::impl {
             if (overlap_upload_requested) {
                 LLAMA_LOG_INFO("packed expert Vulkan upload overlap: submitted=%zu bytes=%zu\n",
                         packed_overlap_uploads, packed_overlap_upload_bytes);
-            }
-            if (placement->hip_mtp_overlap) {
-                LLAMA_LOG_INFO("packed expert HIP MTP3 upload overlap: submitted=%zu bytes=%zu\n",
-                        packed_overlap_uploads, packed_overlap_upload_bytes);
-            }
-            if (placement->hip_mtp_compact) {
-                LLAMA_LOG_INFO("packed expert HIP MTP3 active routes: hot=%zu miss=%zu empty_groups=%zu\n",
-                        packed_mtp_hot_routes, packed_mtp_miss_routes, packed_mtp_empty_groups);
-            }
-            if (placement->hip_mtp_gate_up_overlap) {
-                LLAMA_LOG_INFO("packed expert HIP MTP3 gate/up overlap: all_hit_layers=%zu all_miss_layers=%zu mixed_layers=%zu"
-                        " swiglu_per_layer=1 down_per_layer=1\n",
-                        packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed);
-                if (placement->hip_mtp_gate_up_fuse_hits) {
-                    LLAMA_LOG_INFO("packed expert HIP MTP3 gate/up overlap: fused_hit_dispatches=%" PRIu64 "\n",
-                            packed_mtp_gate_up_fused_hits);
-                }
-                if (placement->hip_mtp_gate_up_shared_output) {
-                    LLAMA_LOG_INFO("packed expert HIP MTP3 shared gate/up output: all_hit_layers=%zu"
-                            " all_miss_layers=%zu mixed_layers=%zu projection_dispatches=%" PRIu64 "\n",
-                            packed_mtp_gate_up_all_hit, packed_mtp_gate_up_all_miss, packed_mtp_gate_up_mixed,
-                            packed_mtp_gate_up_shared_dispatches);
-                }
-                if (placement->hip_mtp_gate_up_reuse_q8_1) {
-                    LLAMA_LOG_INFO("packed expert HIP MTP3 shared gate/up Q8_1: quantize_dispatches=%" PRIu64
-                            " projection_consumers=%" PRIu64 "\n",
-                            packed_mtp_gate_up_q8_1_dispatches, packed_mtp_gate_up_shared_dispatches);
-                }
             }
             if (overlap_upload_requested) {
                 LLAMA_LOG_INFO("packed expert Vulkan promotion overlap: committed=%zu writeback_bytes=%zu\n",
@@ -4475,8 +4242,8 @@ llama_expert_round_stats llama_moe_cache::round_stats() const {
     };
 }
 
-ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part, bool mtp_three) const {
-    return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part, mtp_three);
+ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
+    return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part);
 }
 
 bool llama_moe_cache::compact_prefill(int64_t n_tokens) const {
@@ -4537,34 +4304,17 @@ llama_rtx_expert * llama_moe_cache::get_rtx_expert() const {
     return pimpl->rtx_expert.get();
 }
 
-ggml_tensor * llama_moe_cache::get_cold_slot_map(int32_t il, bool mtp_three) const {
-    if (!requires_slots(il) || (pimpl->placement->hip_mtp_overlap && !mtp_three)) {
+ggml_tensor * llama_moe_cache::get_cold_slot_map(int32_t il) const {
+    if (!requires_slots(il)) {
         return nullptr;
     }
     return pimpl->layers[il].cold_slot_map;
 }
 
-bool llama_moe_cache::uses_hip_mtp_compact() const {
-    return pimpl->placement && pimpl->placement->hip_mtp_compact;
-}
 
-ggml_tensor * llama_moe_cache::get_hip_mtp_gate_up_full_map(int32_t il) const {
-    return requires_slots(il) ? pimpl->layers[il].hip_mtp_full_map : nullptr;
-}
 
-uint64_t * llama_moe_cache::get_hip_mtp_fused_hit_count() const {
-    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_fuse_hits ? &pimpl->packed_mtp_gate_up_fused_hits : nullptr;
-}
 
-uint64_t * llama_moe_cache::get_hip_mtp_shared_output_count() const {
-    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_shared_output ?
-            &pimpl->packed_mtp_gate_up_shared_dispatches : nullptr;
-}
 
-uint64_t * llama_moe_cache::get_hip_mtp_q8_1_count() const {
-    return pimpl->placement && pimpl->placement->hip_mtp_gate_up_reuse_q8_1 ?
-            &pimpl->packed_mtp_gate_up_q8_1_dispatches : nullptr;
-}
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
     return pimpl->get_cpu_map(il, n_tokens);

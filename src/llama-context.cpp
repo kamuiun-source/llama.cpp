@@ -2081,7 +2081,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }();
     const auto * placement = model.expert_placement.get();
     const bool hip_shared_three = hip_handoff && placement && placement->hip_mtp_verify_three &&
-            placement->dynamic_resident && !placement->overlap && !placement->hip_mtp_overlap && !placement->hip_mtp_direct_ram;
+            placement->dynamic_resident && !placement->overlap && !placement->hip_mtp_direct_ram;
     struct scheduler_verify_three_scope {
         ggml_backend_sched_t sched;
         bool previous;

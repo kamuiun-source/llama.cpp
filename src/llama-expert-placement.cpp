@@ -108,24 +108,6 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
                 std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(target)), "ROCm") == 0;
         return value && ((std::strcmp(value, "1") == 0 && (hip_overlap != hip_overlap_mode::off || hip_dynamic)) ||
                 (std::strcmp(value, "auto") == 0 && hip_dynamic));
-    }()), hip_mtp_gate_up_overlap([] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_OVERLAP");
-        return value && std::strcmp(value, "1") == 0;
-    }()), hip_mtp_gate_up_fuse_hits([] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_FUSE_HITS");
-        return value && std::strcmp(value, "1") == 0;
-    }()), hip_mtp_gate_up_shared_output([] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_SHARED_OUTPUT");
-        return value && std::strcmp(value, "1") == 0;
-    }()), hip_mtp_gate_up_reuse_q8_1([] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_GATE_UP_REUSE_Q8_1");
-        return value && std::strcmp(value, "1") == 0;
-    }()), hip_mtp_compact(hip_mtp_gate_up_overlap || [&] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_COMPACT");
-        return hip_mtp_verify_three && dynamic_resident && value && std::strcmp(value, "1") == 0;
-    }()), hip_mtp_overlap(hip_mtp_compact || [&] {
-        const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_OVERLAP");
-        return hip_mtp_verify_three && dynamic_resident && value && std::strcmp(value, "1") == 0;
     }()), hip_mtp_direct_ram([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM");
         return value && std::strcmp(value, "1") == 0;
@@ -161,22 +143,10 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     if (hip_mtp_verify_three && (max_ubatch != 2 || n_expert_used != 10)) {
         throw std::runtime_error("HIP 3-position MTP requires two-token microbatches and top-10 routing");
     }
-    if (hip_mtp_gate_up_overlap && (!hip_mtp_verify_three || !dynamic_resident || overlap)) {
-        throw std::runtime_error("HIP gate/up overlap requires single-bank dynamic residency and fixed three-position MTP");
+    if (hip_mtp_direct_ram && (!hip_mtp_verify_three || !dynamic_resident || overlap)) {
+        throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP");
     }
-    if (hip_mtp_gate_up_fuse_hits && !hip_mtp_gate_up_overlap) {
-        throw std::runtime_error("HIP MTP3 fused hits require HIP MTP3 gate/up overlap");
-    }
-    if (hip_mtp_gate_up_shared_output && (!hip_mtp_gate_up_overlap || hip_mtp_gate_up_fuse_hits)) {
-        throw std::runtime_error("HIP MTP3 shared gate/up output requires gate/up overlap with fused hits off");
-    }
-    if (hip_mtp_gate_up_reuse_q8_1 && !hip_mtp_gate_up_shared_output) {
-        throw std::runtime_error("HIP MTP3 Q8_1 reuse requires shared gate/up output");
-    }
-    if (hip_mtp_direct_ram && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap)) {
-        throw std::runtime_error("direct HIP Expert RAM requires single-bank dynamic residency and fixed three-position MTP with upload overlap off");
-    }
-    if (hip_tuple_dma && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_overlap || hip_mtp_direct_ram)) {
+    if (hip_tuple_dma && (!hip_mtp_verify_three || !dynamic_resident || overlap || hip_mtp_direct_ram)) {
         throw std::runtime_error("HIP Expert tuple DMA requires single-bank dynamic residency and three-position MTP support");
     }
     if (hip_overlap_promotion && hip_overlap == hip_overlap_mode::off) {
@@ -241,7 +211,7 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
     auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1],
-            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots + int(hip_mtp_overlap)));
+            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots));
     auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
@@ -565,8 +535,6 @@ bool llama_expert_placement::load(llama_model_loader & loader, const llama_model
             // Each half of the graph uses a zero expert for the other half's IDs.
             ggml_backend_tensor_memset(w.bank, 0, resident.size(), stride);
             ggml_backend_tensor_memset(w.cold, 0, n_slots * stride, stride);
-        } else if (hip_mtp_overlap) {
-            ggml_backend_tensor_memset(w.bank, 0, (n_resident + n_slots) * stride, stride);
         }
         resident_bytes += resident.size();
         ram_bytes += ggml_nbytes(w.host);

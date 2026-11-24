@@ -99,10 +99,6 @@
 #include <string_view>
 #include <vector>
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-#include <time.h>
-#endif
-
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -939,265 +935,10 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-static bool ggml_hip_expert_timeline_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_HIP_MTP3_EXPERT_TIMELINE");
-    return enabled;
-}
-
-static bool ggml_hip_expert_stream_wait_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_HIP_MTP3_EXPERT_STREAM_EVENT_WAIT");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-bool ggml_hip_expert_stream_wait_after_q8_enabled() {
-    static const bool enabled = ggml_hip_expert_stream_wait_enabled() && [] {
-        const char * value = std::getenv("GGML_HIP_MTP3_EXPERT_STREAM_EVENT_WAIT_AFTER_Q8");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-static std::atomic<uint64_t> ggml_hip_expert_stream_wait_counts[2][ggml_hip_expert_overlap::max_uploads] = {};
-
-static uint64_t ggml_hip_expert_boottime_ns() {
-    struct timespec time;
-    if (clock_gettime(CLOCK_BOOTTIME, &time) != 0) {
-        return 0;
-    }
-    return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
-}
-
-static void ggml_hip_expert_log_timeline(const ggml_hip_expert_overlap & plan, unsigned sequence,
-                                       const char * phase, uint64_t start_ns, uint64_t end_ns,
-                                       const char * bank_name = "-") {
-    GGML_LOG_INFO("hip_mtp3_expert_timeline phase=%s plan=%p sequence=%u bank=%s events=%u boottime_start_ns=%" PRIu64
-                  " boottime_end_ns=%" PRIu64 "\n",
-            phase, static_cast<const void *>(&plan), sequence, bank_name, plan.cold.count, start_ns, end_ns);
-}
-
-void ggml_hip_expert_wait_on_stream(ggml_hip_expert_overlap & plan, hipStream_t stream, bool after_q8) {
-    const bool timeline = ggml_hip_expert_timeline_enabled();
-    const uint64_t begin = timeline ? ggml_hip_expert_boottime_ns() : 0;
-    // The final event follows every tuple copy. The single-copy scheduler waits for this compute stream before reusing slots.
-    CUDA_CHECK(hipStreamWaitEvent(stream, plan.events[plan.cold.count - 1], 0));
-    if (timeline) {
-        ggml_hip_expert_log_timeline(plan, plan.base, "stream_wait_enqueue", begin, ggml_hip_expert_boottime_ns(),
-                                     plan.bank_name);
-    }
-    auto & count = ggml_hip_expert_stream_wait_counts[after_q8][plan.cold.count - 1];
-    if (count.fetch_add(1, std::memory_order_relaxed) == 0) {
-        GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU stream-event wait: MTP positions=3 cold_uploads=%u wait_position=%s\n",
-                plan.cold.count, after_q8 ? "after_q8" : "before_q8");
-    }
-    plan.base += plan.cold.count;
-    plan.graph = nullptr;
-}
-
-ggml_hip_expert_overlap::gpu_sample * ggml_hip_expert_overlap::begin_gpu_sample() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_HIP_MTP3_EXPERT_GPU_TIMELINE");
-    if (!enabled) {
-        return nullptr;
-    }
-    collect_gpu_samples();
-    if (samples_pending) {
-        GGML_LOG_INFO("hip_mtp3_expert_gpu_timeline_skip plan=%p sequence=%u reason=previous_sample_pending\n",
-                static_cast<const void *>(this), base);
-        return nullptr;
-    }
-    if (!gpu_samples) {
-        constexpr size_t bytes = groups * rows_per_group * sizeof(gpu_sample);
-        CUDA_CHECK(hipMalloc(&gpu_samples, bytes));
-        CUDA_CHECK(hipHostMalloc(&host_samples, bytes));
-        CUDA_CHECK(hipEventCreateWithFlags(&samples_done, hipEventDisableTiming));
-    }
-    sample_sequence = base;
-    sample_cold = cold;
-    std::copy_n(experts, cold.count, sample_experts);
-    std::memcpy(sample_bank_name, bank_name, sizeof(bank_name));
-    return gpu_samples;
-}
-
-void ggml_hip_expert_overlap::submit_gpu_sample(hipStream_t stream) {
-    constexpr size_t bytes = groups * rows_per_group * sizeof(gpu_sample);
-    CUDA_CHECK(hipMemcpyAsync(host_samples, gpu_samples, bytes, hipMemcpyDeviceToHost, stream));
-    CUDA_CHECK(hipEventRecord(samples_done, stream));
-    samples_pending = true;
-}
-
-void ggml_hip_expert_overlap::collect_gpu_samples() {
-    if (!samples_pending) {
-        return;
-    }
-    const hipError_t status = hipEventQuery(samples_done);
-    if (status == hipErrorNotReady) {
-        return;
-    }
-    CUDA_CHECK(status);
-    constexpr int waves = groups * rows_per_group;
-    const auto * first = std::min_element(host_samples, host_samples + waves,
-            [](const gpu_sample & a, const gpu_sample & b) { return a.entered < b.entered; });
-    const uint64_t origin = first->entered;
-    for (unsigned phase = 0; phase < sample_cold.count; ++phase) {
-        int last_wait_start = 0, last_ready = 0, last_done = 0, longest_wait = 0, longest_compute = 0;
-        for (int wave = 1; wave < waves; ++wave) {
-            const auto & sample = host_samples[wave].phase[phase];
-            const auto & wait = host_samples[longest_wait].phase[phase];
-            const auto & compute = host_samples[longest_compute].phase[phase];
-            if (sample.wait_start > host_samples[last_wait_start].phase[phase].wait_start) {
-                last_wait_start = wave;
-            }
-            if (sample.ready > host_samples[last_ready].phase[phase].ready) {
-                last_ready = wave;
-            }
-            if (sample.done > host_samples[last_done].phase[phase].done) {
-                last_done = wave;
-            }
-            if (sample.ready - sample.wait_start > wait.ready - wait.wait_start) {
-                longest_wait = wave;
-            }
-            if (sample.done - sample.ready > compute.done - compute.ready) {
-                longest_compute = wave;
-            }
-        }
-        const auto & wait = host_samples[longest_wait].phase[phase];
-        const auto & compute = host_samples[longest_compute].phase[phase];
-        const auto & ready_tail = host_samples[last_ready].phase[phase];
-        const auto & done_tail = host_samples[last_done].phase[phase];
-        GGML_LOG_INFO("hip_mtp3_expert_gpu_timeline plan=%p sequence=%u bank=%s phase=%u expert=%d slot=%d"
-                " groups=%d waves_per_group=%d wall_clock_khz=%" PRIu64 " first_entry_tick=%" PRIu64
-                " last_wait_start_offset_ticks=%" PRIu64 " last_wait_start_group=%d last_wait_start_wave=%d"
-                " last_ready_offset_ticks=%" PRIu64 " last_ready_group=%d last_ready_wave=%d last_ready_wait_ticks=%" PRIu64
-                " last_done_offset_ticks=%" PRIu64 " last_done_group=%d last_done_wave=%d last_done_post_ready_ticks=%" PRIu64
-                " max_wait_ticks=%" PRIu64 " max_wait_group=%d max_wait_wave=%d"
-                " max_post_ready_ticks=%" PRIu64 " max_post_ready_group=%d max_post_ready_wave=%d\n",
-                static_cast<const void *>(this), sample_sequence, sample_bank_name, phase + 1,
-                sample_experts[phase], sample_cold.ids[phase], groups, rows_per_group,
-                timeout_ticks / wait_timeout_ms, origin,
-                host_samples[last_wait_start].phase[phase].wait_start - origin,
-                last_wait_start / rows_per_group, last_wait_start % rows_per_group,
-                ready_tail.ready - origin, last_ready / rows_per_group, last_ready % rows_per_group,
-                ready_tail.ready - ready_tail.wait_start,
-                done_tail.done - origin, last_done / rows_per_group, last_done % rows_per_group,
-                done_tail.done - done_tail.ready,
-                wait.ready - wait.wait_start, longest_wait / rows_per_group, longest_wait % rows_per_group,
-                compute.done - compute.ready, longest_compute / rows_per_group, longest_compute % rows_per_group);
-    }
-    samples_pending = false;
-}
-
-ggml_hip_expert_overlap::~ggml_hip_expert_overlap() {
-    if (upload_stream) {
-        CUDA_CHECK(hipStreamSynchronize(upload_stream));
-        CUDA_CHECK(hipStreamDestroy(upload_stream));
-    }
-    for (auto event : events) {
-        if (event) {
-            CUDA_CHECK(hipEventDestroy(event));
-        }
-    }
-    if (samples_done) {
-        CUDA_CHECK(hipEventDestroy(samples_done));
-        CUDA_CHECK(hipHostFree(host_samples));
-        CUDA_CHECK(hipFree(gpu_samples));
-    }
-    if (host_ticket) {
-        CUDA_CHECK(hipHostFree(host_ticket));
-    }
-}
-
-void ggml_hip_expert_overlap::finish(bool publish) {
-    if (!graph) {
-        return;
-    }
-    const bool timeline = ggml_hip_expert_timeline_enabled();
-    const uint64_t timeline_start = timeline ? ggml_hip_expert_boottime_ns() : 0;
-    static const bool profile = [] {
-        const char * value = std::getenv("LLAMA_EXPERT_PROFILE_CALLBACK");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    const int64_t wait_start_us = profile ? ggml_time_us() : 0;
-    if (publish) {
-        constexpr int64_t deadline_us = 4000000;
-        const int64_t deadline = ggml_time_us() + deadline_us;
-        const auto log_event_error = [&](unsigned i, hipError_t status, const char * reason) {
-            std::fprintf(stderr, "hip_mtp3_expert_dma_error reason=%s hip_status=%d hip_error=%s deadline_us=%" PRId64
-                    " plan=%p sequence=%u bank=%s events=%u event_index=%u event=%p expert=%d slot=%d"
-                    " last_published_ticket=%u expected_ticket=%u boottime_ns=%" PRIu64 "\n",
-                    reason, static_cast<int>(status), hipGetErrorName(status), deadline_us,
-                    static_cast<const void *>(this), base, bank_name, cold.count, i + 1,
-                    static_cast<const void *>(events[i]), experts[i], cold.ids[i],
-                    __atomic_load_n(host_ticket, __ATOMIC_RELAXED), base + i + 1, ggml_hip_expert_boottime_ns());
-            std::fflush(stderr);
-        };
-        for (unsigned i = 0; i < cold.count; ++i) {
-            hipError_t status;
-            while ((status = hipEventQuery(events[i])) == hipErrorNotReady) {
-                if (ggml_time_us() >= deadline) {
-                    log_event_error(i, status, "hipEventQuery_not_ready_timeout");
-                    GGML_ABORT("HIP MTP3 Expert DMA timed out");
-                }
-            }
-            if (status != hipSuccess) {
-                log_event_error(i, status, "hipEventQuery_failed");
-                CUDA_CHECK(status);
-            }
-            // Events release to system scope after SDMA; no reader may pass its ticket before that.
-            __atomic_store_n(host_ticket, base + i + 1, __ATOMIC_RELEASE);
-        }
-    } else {
-        CUDA_CHECK(hipStreamSynchronize(upload_stream));
-        __atomic_store_n(host_ticket, base + cold.count, __ATOMIC_RELEASE);
-    }
-    const uint64_t timeline_end = timeline ? ggml_hip_expert_boottime_ns() : 0;
-    if (profile) {
-        GGML_LOG_INFO("hip_mtp3_expert_dma_completion_wait mode=%s events=%u wait_us=%" PRId64 "\n",
-                publish ? "publish" : "drain", cold.count, ggml_time_us() - wait_start_us);
-    }
-    if (timeline) {
-        ggml_hip_expert_log_timeline(*this, base, publish ? "publish" : "drain", timeline_start, timeline_end);
-    }
-    base += cold.count;
-    graph = nullptr;
-}
-
-static void ggml_hip_finish_expert_overlap(ggml_backend_cuda_context & ctx) {
-    if (ctx.expert_overlap) {
-        ctx.expert_overlap->finish(false);
-    }
-}
-#endif
-
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    if (expert_overlap) {
-        ggml_cuda_set_device(device);
-        ggml_hip_finish_expert_overlap(*this);
-        CUDA_CHECK(hipStreamSynchronize(stream(device, 0)));
-        expert_overlap->collect_gpu_samples();
-        if (ggml_hip_expert_stream_wait_enabled()) {
-            for (bool after_q8 : {false, true}) {
-                const auto & counts = ggml_hip_expert_stream_wait_counts[after_q8];
-                const uint64_t cold1 = counts[0].load(std::memory_order_relaxed);
-                const uint64_t cold2 = counts[1].load(std::memory_order_relaxed);
-                const uint64_t cold3 = counts[2].load(std::memory_order_relaxed);
-                const uint64_t cold4 = counts[3].load(std::memory_order_relaxed);
-                if (cold1 || cold2 || cold3 || cold4 || after_q8 == ggml_hip_expert_stream_wait_after_q8_enabled()) {
-                    GGML_LOG_INFO("hip_mtp3_expert_stream_wait_dispatches scope=process cold1=%" PRIu64 " cold2=%" PRIu64
-                            " cold3=%" PRIu64 " cold4=%" PRIu64 " wait_position=%s\n",
-                            cold1, cold2, cold3, cold4, after_q8 ? "after_q8" : "before_q8");
-                }
-            }
-        }
-        expert_overlap.reset();
-    }
-#endif
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2589,34 +2330,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-#ifdef GGML_USE_HIP
-static bool ggml_cuda_mtp_fused_hit_node(const ggml_tensor * node) {
-    return node->op == GGML_OP_GLU && std::strcmp(node->name, "ffn_moe_mtp_gate_up_fuse_hits") == 0;
-}
-
-static bool ggml_cuda_mtp_shared_q8_1_node(const ggml_tensor * node) {
-    return node->op == GGML_OP_CPY && std::strcmp(node->name, "ffn_moe_mtp_shared_q8_1") == 0;
-}
-
-static bool ggml_cuda_mtp_shared_q8_1_supported(const ggml_tensor * node, int cc) {
-    const auto * src = node->src[0];
-    return cc == GGML_CUDA_CC_VEGA20 && src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) &&
-           src->ne[0] == 2560 && src->ne[0] % MATRIX_ROW_PADDING == 0 && src->ne[1] == 1 &&
-           src->ne[2] == 3 && src->ne[3] == 1 && node->type == GGML_TYPE_Q8_1 &&
-           ggml_are_same_shape(src, node) && ggml_is_contiguous(node);
-}
-
-static bool ggml_cuda_mtp_fuse_hits(const ggml_tensor * ids, int cc) {
-    const auto * lookup = ids->view_src;
-    if (cc != GGML_CUDA_CC_VEGA20 || !ggml_cuda_is_compact_moe_lookup(lookup) ||
-            lookup->op_params[1] != 3 || lookup->op_params[0] != ((1 << 30) - 1)) {
-        return false;
-    }
-    static const bool disabled = ggml_cuda_env_flag("GGML_HIP_GFX906_DISABLE_ROUTED_SWIGLU_FUSION");
-    return !disabled && !ggml_cuda_fusion_disabled();
-}
-#endif
-
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -3588,16 +3301,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    ggml_hip_finish_expert_overlap(*cuda_ctx);
-#endif
     CUDA_CHECK(ggml_cuda_stream_synchronize(cuda_ctx->stream()));
-
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    if (cuda_ctx->expert_overlap && cuda_ctx->expert_overlap->samples_pending) {
-        cuda_ctx->expert_overlap->collect_gpu_samples();
-    }
-#endif
 
     GGML_UNUSED(backend);
 }
@@ -5950,51 +5654,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-                auto * overlap = cuda_ctx->expert_overlap.get();
-                const bool pending_overlap = overlap && overlap->graph;
-                if (pending_overlap) {
-                    if (overlap->first == node && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2] == overlap->output &&
-                            !use_cuda_graph && !is_concurrent_event_active) {
-                        auto * glu = cgraph->nodes[i + 2];
-                        const auto * up = glu->src[1];
-                        ggml_cuda_mm_fusion_args_host fusion{};
-                        fusion.gate = glu->src[0]->src[0];
-                        fusion.glu_op = GGML_GLU_OP_SWIGLU;
-                        const bool timeline = ggml_hip_expert_timeline_enabled();
-                        const uint64_t fused_start = timeline ? ggml_hip_expert_boottime_ns() : 0;
-                        const unsigned sequence = overlap->base;
-                        if (ggml_hip_expert_stream_wait_enabled()) {
-                            const auto * weights = up->src[0];
-                            const auto * input = up->src[1];
-                            const auto * ids = up->src[2];
-                            // MMVQ can clear padding in compute weights or return early for compact IDs.
-                            const bool wait_after_q8 = ggml_hip_expert_stream_wait_after_q8_enabled() &&
-                                    ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                                    input->buffer != weights->buffer && !ggml_cuda_is_compact_moe_lookup(ids->view_src);
-                            if (!wait_after_q8) {
-                                ggml_hip_expert_wait_on_stream(*overlap, cuda_ctx->stream(), false);
-                            }
-                        }
-                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion);
-                        if (timeline) {
-                            ggml_hip_expert_log_timeline(*overlap, sequence, "fused_host_call", fused_start,
-                                                         ggml_hip_expert_boottime_ns());
-                        }
-                        GGML_ASSERT(!overlap->graph);
-                        i += 2;
-                        continue;
-                    }
-                    for (const auto * src : node->src) {
-                        if (src == overlap->bank || (src && src->view_src == overlap->bank)) {
-                            overlap->finish(false);
-                            break;
-                        }
-                    }
-                }
-#else
-                constexpr bool pending_overlap = false;
-#endif
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
                 }
@@ -6003,74 +5662,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-#ifdef GGML_USE_HIP
-                const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-                if (ggml_cuda_mtp_shared_q8_1_node(node)) {
-                    GGML_ASSERT(ggml_cuda_mtp_shared_q8_1_supported(node, cc));
-                    const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
-                    const auto * src = node->src[0];
-                    quantize_row_q8_1_cuda(static_cast<const float *>(src->data), node->data, src->ne[0],
-                            src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
-                            node->ne[0], node->ne[1], node->ne[2], node->ne[3], cuda_ctx->stream());
-                    uint64_t * counter;
-                    std::memcpy(&counter, node->op_params + 4, sizeof(counter));
-                    ++*counter;
-                    if (profile_enabled) {
-                        profile_dispatch(i, 1, dispatch_start_us);
-                    }
-                    continue;
-                }
-                if (ggml_cuda_mtp_fused_hit_node(node) && ggml_cuda_mtp_fuse_hits(node->src[3], cc)) {
-                    const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
-                    ggml_cuda_mm_fusion_args_host fusion{};
-                    fusion.gate = node->src[5];
-                    fusion.glu_op = GGML_GLU_OP_SWIGLU;
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[4], node->src[2], node->src[3], node, &fusion);
-                    uint64_t * counter;
-                    std::memcpy(&counter, node->op_params + 4, sizeof(counter));
-                    ++*counter;
-                    if (profile_enabled) {
-                        profile_dispatch(i, 1, dispatch_start_us);
-                    }
-                    continue;
-                }
-                const bool mtp_gate_up_merge = node->op == GGML_OP_ADD &&
-                        std::strcmp(node->name, "ffn_moe_mtp_gate_up_merge") == 0;
-                const auto * projection = mtp_gate_up_merge ? node->src[1] : node;
-                if (projection->op == GGML_OP_MUL_MAT_ID) {
-                    const auto * lookup = projection->src[2]->view_src;
-                    if (!mtp_gate_up_merge && ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[2]) {
-                        GGML_ASSERT(cc == GGML_CUDA_CC_VEGA20 && ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
-                                "shared MTP3 gate/up output requires gfx906 MMVQ");
-                        if (lookup->op_params[1] == 2) {
-                            GGML_ASSERT(node->view_src == node->src[3] && node->data == node->src[3]->data);
-                        }
-                        GGML_ASSERT(lookup->op_params[0] >= 0);
-                        if (lookup->op_params[0] != 0) {
-                            const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
-                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node,
-                                    nullptr, node->src[4]);
-                            uint64_t * counter;
-                            std::memcpy(&counter, lookup->op_params + 4, sizeof(counter));
-                            ++*counter;
-                            if (profile_enabled) {
-                                profile_dispatch(i, 1, dispatch_start_us);
-                            }
-                        }
-                        continue;
-                    }
-                    if (!mtp_gate_up_merge && ggml_cuda_mtp_fuse_hits(projection->src[2], cc)) {
-                        continue;
-                    }
-                    if (ggml_cuda_is_compact_moe_lookup(lookup) && lookup->op_params[1] == 2 && lookup->op_params[0] == 0) {
-                        GGML_ASSERT(!mtp_gate_up_merge || node->data == node->src[0]->data);
-                        continue;
-                    }
-                }
-#endif
                 const int64_t dispatch_start_us = profile_enabled ? profile_begin() : 0;
-                // Pending tuple readers must pass the explicit fusion check above.
-                int nodes_to_skip = pending_overlap ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
                     if (profile_enabled) {
@@ -6317,161 +5910,22 @@ static void ggml_backend_cuda_finish_stream_telemetry(void * state, uint64_t * t
     CUDA_CHECK(cudaSetDevice(previous_device));
 }
 #endif
-#if defined(GGML_USE_HIP) && defined(__linux__)
-static bool ggml_backend_hip_stage_expert_overlap(ggml_backend_t backend, const ggml_cgraph * graph,
-        const ggml_tensor * lookup, const ggml_tensor * bank, const void * const * sources,
-        const int * slots, const int * experts, unsigned count, size_t stride) {
-    if (!ggml_backend_is_cuda(backend) || count == 0 || count > ggml_hip_expert_overlap::max_uploads) {
-        return false;
-    }
-    auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
-    ggml_cuda_set_device(ctx.device);
-    ggml_hip_finish_expert_overlap(ctx);
-    if (ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_VEGA20 || ggml_cuda_fusion_disabled() ||
-            !ctx.stream_context().concurrent_events.empty() || bank->type != GGML_TYPE_I8 || !stride || ggml_nbytes(bank) % stride ||
-            !bank->buffer || bank->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
-        return false;
-    }
-    for (unsigned i = 0; i < count; ++i) {
-        if (!sources[i] || slots[i] < 0 || size_t(slots[i]) >= ggml_nbytes(bank) / stride ||
-                std::find(slots, slots + i, slots[i]) != slots + i) {
-            return false;
-        }
-    }
-
-    const ggml_tensor * first = nullptr;
-    const ggml_tensor * output = nullptr;
-    for (int i = 0; i + 2 < graph->n_nodes; ++i) {
-        const auto * candidate = graph->nodes[i + 2];
-        if (candidate->op != GGML_OP_GLU || ggml_get_glu_op(candidate) != GGML_GLU_OP_SWIGLU ||
-                candidate->type != GGML_TYPE_F32 || candidate->ne[0] != 640 || candidate->ne[1] != 10 ||
-                candidate->ne[2] != 3 || candidate->ne[3] != 1 || !ggml_is_contiguous(candidate)) {
-            continue;
-        }
-        const auto * gate = candidate->src[0];
-        const auto * up = candidate->src[1];
-        const auto * ids = up->src[2];
-        const bool consecutive = (gate == graph->nodes[i] && up == graph->nodes[i + 1]) ||
-                                 (up == graph->nodes[i] && gate == graph->nodes[i + 1]);
-        if (!consecutive || gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
-                !(gate->flags & up->flags & candidate->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-                !ids || ids->view_src != lookup || ids->ne[0] != 10 || ids->ne[1] != 3 ||
-                !ggml_cuda_can_fuse(graph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {}) ||
-                ggml_cuda_routed_swiglu_fusion_disabled(up, candidate) || !ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
-            continue;
-        }
-        const auto * input = up->src[1];
-        const auto * gate_weight = gate->src[0];
-        const auto * up_weight = up->src[0];
-        if (gate_weight->view_src != bank || up_weight->view_src != bank ||
-                !ggml_are_same_shape(gate_weight, up_weight) || gate_weight->type != GGML_TYPE_IQ3_XXS ||
-                up_weight->type != GGML_TYPE_IQ3_XXS || up_weight->ne[0] != 2560 || up_weight->ne[1] != 640 ||
-                up_weight->nb[2] != stride || gate_weight->nb[2] != stride || up_weight->nb[1] != gate_weight->nb[1] ||
-                input->ne[0] != 2560 || input->ne[1] != 1 || input->ne[2] != 3 || input->ne[3] != 1) {
-            continue;
-        }
-        // Earlier graph nodes must not read any plane in the tuple bank.
-        for (int j = 0; j < i; ++j) {
-            for (const auto * src : graph->nodes[j]->src) {
-                if (src == bank || (src && src->view_src == bank)) {
-                    return false;
-                }
-            }
-        }
-        first = graph->nodes[i];
-        output = candidate;
-        break;
-    }
-    if (!output) {
-        return false;
-    }
-
-    if (!ctx.expert_overlap) {
-        auto resources = std::make_unique<ggml_hip_expert_overlap>();
-        int wall_clock_khz = 0;
-        int copy_engines = 0;
-        if (hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, ctx.device) != hipSuccess ||
-                hipDeviceGetAttribute(&copy_engines, hipDeviceAttributeAsyncEngineCount, ctx.device) != hipSuccess ||
-                wall_clock_khz <= 0 || copy_engines <= 0 ||
-                hipStreamCreateWithFlags(&resources->upload_stream, hipStreamNonBlocking) != hipSuccess ||
-                hipHostMalloc(&resources->host_ticket, sizeof(unsigned), hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess ||
-                hipHostGetDevicePointer(reinterpret_cast<void **>(&resources->device_ticket), resources->host_ticket, 0) != hipSuccess) {
-            return false;
-        }
-        static_assert(__atomic_always_lock_free(sizeof(unsigned), nullptr), "HIP Expert ticket requires lock-free stores");
-        new (resources->host_ticket) unsigned(0);
-        resources->timeout_ticks = uint64_t(ggml_hip_expert_overlap::wait_timeout_ms) * wall_clock_khz;
-        for (auto & event : resources->events) {
-            if (hipEventCreateWithFlags(&event, hipEventDisableTiming | hipEventReleaseToSystem) != hipSuccess) {
-                return false;
-            }
-        }
-        ctx.expert_overlap = std::move(resources);
-    }
-    auto & plan = *ctx.expert_overlap;
-    if (plan.base > std::numeric_limits<unsigned>::max() - count) {
-        CUDA_CHECK(hipStreamSynchronize(ctx.stream()));
-        plan.base = 0;
-        __atomic_store_n(plan.host_ticket, 0, __ATOMIC_RELEASE);
-    }
-    const bool timeline = ggml_hip_expert_timeline_enabled();
-    const uint64_t submit_start = timeline ? ggml_hip_expert_boottime_ns() : 0;
-    for (unsigned i = 0; i < count; ++i) {
-        auto * dest = static_cast<uint8_t *>(bank->data) + slots[i] * stride;
-        CUDA_CHECK(hipMemcpyAsync(dest, sources[i], stride, hipMemcpyHostToDevice, plan.upload_stream));
-        CUDA_CHECK(hipEventRecord(plan.events[i], plan.upload_stream));
-        plan.cold.ids[i] = slots[i];
-        plan.experts[i] = experts[i];
-    }
-    plan.cold.count = count;
-    plan.first = first;
-    plan.output = output;
-    plan.bank = bank;
-    std::memcpy(plan.bank_name, bank->name, sizeof(plan.bank_name));
-    plan.graph = graph;
-    if (timeline) {
-        ggml_hip_expert_log_timeline(plan, plan.base, "dma_batch_submit", submit_start, ggml_hip_expert_boottime_ns(),
-                                     bank->name);
-    }
-    return true;
-}
-#endif
-
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    if (cuda_ctx->expert_overlap && cuda_ctx->expert_overlap->graph != cgraph) {
-        ggml_hip_finish_expert_overlap(*cuda_ctx);
-    }
-    const auto * overlap = cuda_ctx->expert_overlap.get();
-    const bool timeline = overlap && overlap->graph && ggml_hip_expert_timeline_enabled();
-    const uint64_t graph_start = timeline ? ggml_hip_expert_boottime_ns() : 0;
-    const unsigned sequence = timeline ? overlap->base : 0;
-#endif
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    bool dynamic_moe_routes = false;
-#ifdef GGML_USE_HIP
-    for (int i = 0; i < cgraph->n_nodes && !dynamic_moe_routes; ++i) {
-        dynamic_moe_routes = ggml_cuda_is_compact_moe_lookup(cgraph->nodes[i]) ||
-                ggml_cuda_mtp_fused_hit_node(cgraph->nodes[i]) || ggml_cuda_mtp_shared_q8_1_node(cgraph->nodes[i]);
-    }
-#endif
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    dynamic_moe_routes |= cuda_ctx->expert_overlap && cuda_ctx->expert_overlap->graph != nullptr;
-#endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (!dynamic_moe_routes && graph->is_enabled()) {
+    if (graph->is_enabled()) {
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
@@ -6527,12 +5981,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, nullptr, nullptr, components);
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    ggml_hip_finish_expert_overlap(*cuda_ctx);
-    if (timeline) {
-        ggml_hip_expert_log_timeline(*overlap, sequence, "graph_host_call", graph_start, ggml_hip_expert_boottime_ns());
-    }
-#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (sample && cudaEventRecord(sample->stop, telemetry_stream) != cudaSuccess) {
@@ -7489,11 +6937,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_CPY:
             {
-#ifdef GGML_USE_HIP
-                if (ggml_cuda_mtp_shared_q8_1_node(op)) {
-                    return ggml_cuda_mtp_shared_q8_1_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
-                }
-#endif
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
                 if (src0_type == GGML_TYPE_F8_E4M3 && src1_type == GGML_TYPE_F8_E4M3) {
@@ -7992,11 +7435,6 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    if (strcmp(name, "ggml_backend_hip_stage_expert_overlap_v2") == 0) {
-        return (void *) ggml_backend_hip_stage_expert_overlap;
-    }
-#endif
     if (strcmp(name, "ggml_backend_cuda_make_ssm_conv_history") == 0) {
         return (void *) ggml_backend_cuda_make_ssm_conv_history;
     }

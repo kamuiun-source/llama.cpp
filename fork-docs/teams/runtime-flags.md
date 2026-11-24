@@ -38,4 +38,4 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | 未設定（通常） / `0`（比較用） | 現在層の投入後発行を切り分ける旧比較設定。通常起動で設定する必要はない。 |
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。 |
 
-先読みと併用する場合も、非同期プリフィルは `LLAMA_EXPERT_HIP_PREFILL=1`、非同期昇格は `LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION=1` で指定する。旧ビルドでは併用を拒否していたが、`752311f45` 以降で両方ONを確認済み。分割Expert転送並行化と単一カーネル並行転送は次層先読みと併用できない。[併用時の計測](../rocm/09-single-bank-mtp3.md#非同期プリフィルと非同期昇格の併用)
+先読みと併用する場合も、非同期プリフィルは `LLAMA_EXPERT_HIP_PREFILL=1`、非同期昇格は `LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION=1` で指定する。同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。[併用時の計測](../rocm/09-single-bank-mtp3.md#非同期プリフィルと非同期昇格の併用)
