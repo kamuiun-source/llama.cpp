@@ -31,25 +31,30 @@ public:
     void end_prompt_trace(bool success);
     void begin_generation_trace(const llama_ubatch & ubatch, uint32_t verify_width);
     void end_generation_trace(bool success);
+    bool next_router_trace_active() const;
+    void trace_next_router(int32_t il, const ggml_tensor * ids);
+    bool next_router_prefetch_enabled() const;
+    int next_router_score_mode() const;
+    void begin_next_router_prefetch(ggml_backend_sched_t sched, const std::vector<ggml_tensor *> & predictions,
+            const std::vector<ggml_tensor *> & scores);
+    void end_next_router_prefetch(ggml_backend_sched_t sched);
+    bool next_router_profile_enabled() const;
+    void begin_next_router_profile();
+    void end_next_router_profile(int nodes, int splits, int hc_pre, int hc_comb, int hc_post, bool success);
     void record_decode_width(uint32_t tokens);
     void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part, bool mtp_three = false) const;
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
     int32_t get_prefill_waves(int32_t il, int64_t n_tokens, int64_t n_used) const;
     ggml_tensor * get_prefill_map(int32_t il, int32_t wave) const;
     ggml_tensor * get_mtp_verify_map(int32_t il, int32_t wave) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w, bool cold = false) const;
-    ggml_tensor * get_cold_slot_map(int32_t il, bool mtp_three = false) const;
-    bool uses_hip_mtp_compact() const;
-    ggml_tensor * get_hip_mtp_gate_up_full_map(int32_t il) const;
-    uint64_t * get_hip_mtp_fused_hit_count() const;
-    uint64_t * get_hip_mtp_shared_output_count() const;
-    uint64_t * get_hip_mtp_q8_1_count() const;
+    ggml_tensor * get_cold_slot_map(int32_t il) const;
     llama_rtx_expert * get_rtx_expert() const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others

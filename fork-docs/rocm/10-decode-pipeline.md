@@ -127,6 +127,37 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 
 通常実行のサーバーは終了コード0。トレースでは応答と両プロファイラーの出力保存を確認後、終了待ちのコンテナを停止したため終了コード143だった。再エクスポートしたSQLiteの整合性検査はOK。通常集計とトレース照合結果は Git 外の `/tmp/llama-rocm-mtp3-decode-pipeline/pinned-handoff-breakdown/`。
 
+### MI50からRTXへのストリーム通知の単体試験
+
+2026-11-25にRTX 4070 TiとMI50、CUDA 12.9・HIP 7.2.53211の既存コンテナで試験した。両ランタイムが登録した同じホスト領域を使い、MI50でD2H後に `hipStreamWriteValue32`（フラグ引数0）を投入し、RTXの `cuStreamWaitValue32`（EQ、FLUSHなし）の後にH2Dした。CPU同期版はMI50のストリームをCPUで待ってからRTXにH2Dを投入する。同じ共有バッファを使い、RTXへのコピーが終わってから次のデータで上書きした。時間はMI50のD2H投入直前からRTXのコピー完了をCPUが確認するまで。RTXからの検証用読み戻しと全バイト照合は時間外に行った。
+
+| ペイロード | CPU同期 p50 / p99 / 最大 | GPU通知 p50 / p99 / 最大 |
+| --- | ---: | ---: |
+| 30,720 B | 13.876 / 23.745 / 129.264 µs | 35.507 / 38.923 / 337.146 µs |
+| 65,536 B | 18.886 / 21.370 / 34.175 µs | 44.083 / 48.883 / 86.583 µs |
+
+両サイズ、両方式ともウォームアップ100回を含む各3,100回で不一致、タイムアウト、APIエラー0。各実行の終了コード0。RTXのFLUSH機能照会は0。GPU通知は動作したが、今回の単発受け渡しでは中央値とP99がいずれも増えた。実モデルの連続グラフ、逆方向、複数枠の並行再利用、HIP/ROCm別版での動作は未検証。コマンド・生ログはGit外の `/home/t-saka/rocm-cross-gpu-handoff-20261125/run-logs/`。
+
+[試験コード](../scripts/mi50-rtx-handoff/)は計測時のソースと同一。リポジトリのルートから、ビルドと標準出力をGit管理外に保存して再実行できる。以下はMI50が `/dev/dri/renderD128` で、HIP・CUDAでそれぞれ対象GPUが0番の場合。
+
+```bash
+handoff_work=$(mktemp -d)
+cp fork-docs/scripts/mi50-rtx-handoff/{build.sh,run.sh,handoff.cpp,hip-source.cpp} "$handoff_work/"
+docker run --rm --gpus all \
+  --device=/dev/kfd --device=/dev/dri/renderD128 \
+  --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+  --ulimit memlock=1048576:1048576 \
+  --mount "type=bind,src=$handoff_work,dst=/workspace/handoff" \
+  --workdir /workspace/handoff llama-cuda-rocm-dev:latest bash -euc '
+    ./build.sh
+    for bytes in 30720 65536; do
+      for mode in cpu gpu; do
+        ./run.sh "$mode" "$bytes" 3000 100 0 0 > "$mode-$bytes.csv"
+      done
+    done
+  '
+```
+
 ### MI50の小容量転送と昇格の実装順
 
 実装は下表の順に進める。実モデルは全項目をONにして一度に計測し、改善が得られた場合に寄与を個別に切り分ける。比較には既存の② ONの8K再実行を使う。
@@ -166,7 +197,7 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 
 #### 単一バンク・固定3幅の採用設定
 
-2026-11-22の運用判断として、入力H2D、戻りD2H、スロット表、昇格時の書き戻しの非同期化と、Expertの連続配置・直接DMAをONにする。従来の単一バンク・固定3幅のDocker起動オプションに以下を加える。個別検証は別作業として保留する。
+2026-11-25の移植ブランチでは、統合版から次層Expert先読みと非同期プリフィルを取り込み、既存の移植機能と組み合わせる。単一バンク・固定3幅のDocker起動オプションに以下を加える。
 
 ```bash
   --ulimit memlock=22548578304:22548578304 \
@@ -183,7 +214,11 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1 \
+  -e LLAMA_EXPERT_HIP_PREFILL=1 \
+  -e LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH=1 \
 ```
+
+次層先読みを有効にすると、共有8枠、ヒット分のイベント待ち、現在層の投入後の先読み発行、実ミス優先が適用される。通常起動では `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT`、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT`、`LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` を未設定にする。必要転送後のホスト同期省略 `LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND` と詳細ログ `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` も未設定にする。[採用設定と比較フラグ](../teams/runtime-flags.md#rocm統合ブランチの固定3幅)
 
 直接DMAは、ROCmの単一バンク・固定3幅と `--load-mode none` で検証した。既存の `LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM` は未設定または `0` にする。連続配置はモデル読み込み時に決まるため、切り替えるときはサーバーを起動し直す。計測用のExpertミス集計と詳細トレースは通常起動に含めない。
 
@@ -194,6 +229,29 @@ Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を�
 移植ブランチでSSMとGDNの融合を含むビルドでは、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
 MI50の固定3幅では、符号復号・LDS先読み・出力4行を上記の3つの `GGML_HIP_GFX906_IQ*` フラグで有効にする。出力4行はIQ3_XXSのgate/up＋SwiGLUの3位置経路で適用する。Expert初期配置の比較では、この3設定と直接DMAを共通にする。
+
+#### MI50のカーネル時間を集計する
+
+既存のROCTx計測を使い、`host-marks.csv` とrocprofv3のマーカー、カーネル、メモリコピーのCSVを同じ計測ディレクトリに保存する。`verify_submit_3` の開始と `verify_sync_3` の終了の間を本体検証として集計する。プロンプトのプリフィル、RTXのカーネル、MTPドラフトを含めない。
+
+```bash
+python3 fork-docs/scripts/report-rocm-verify-kernels.py "$run_dir" --width 3 --json "$run_dir/mi50-kernel-report.json"
+```
+
+カーネル別の回数、合計、検証1回あたりの時間、p50、p95、最大値を表示し、JSONに生の名前と起動形状を残す。`copyBuffer` とGPUメモリコピーは演算から分ける。重なったGPU処理を区間の和集合でも表示する。MI50でカーネルやコピーが観測されない区間には、RTXの演算、CPU処理、同期などが含まれる。
+
+2026-11-24に統合版 `85e2ae78a` を再ビルドし、RTX 4070 TiとMI50で固定3幅・単一バンク・直接DMAの固定5問を実行した。5問完走、生成640 IDとMTP採用349/566は保存済み結果と一致。ROCTxの全1,124境界を照合し、実際に3位置を検証した281回を集計した。rocprof有効時の生成は35.14 tok/s。
+
+| MI50の演算 | 主な量子型 | 合計 ms | 1検証あたり ms | 演算時間の割合 |
+| --- | --- | ---: | ---: | ---: |
+| gate/up＋SwiGLU | IQ2_S、IQ3_XXS、IQ4_XS | 3,337.91 | 11.88 | 69.38% |
+| down | IQ4_NL、Q2_0 | 1,204.81 | 4.29 | 25.04% |
+| Q8_1入力量子化 | Q8_1 | 146.23 | 0.52 | 3.04% |
+| その他 | Expert重み付き加算、行参照 | 122.40 | 0.44 | 2.54% |
+
+個別ではIQ2_Sのgate/up＋SwiGLUが7.03 ms/検証、IQ3_XXSが4.72 ms/検証、IQ4_NLのdownが3.91 ms/検証。IQ2_Sの融合は第1問で150.0 msと123.3 msの長い2件があった（通常の中央値0.232 ms）。この2件を除いてもgate/up＋SwiGLUが演算時間の67.5%で最上位。1検証の壁時計57.36 msのうち、MI50演算区間の和集合17.07 ms、コピー区間の和集合13.77 ms。両者を合わせた区間は28.57 msで、残り28.79 msはMI50で観測された演算またはコピーの外側にあった。
+
+収集に使ったランナー、ROCTxの計測shim、報告JSONと生ログはGit外の `/home/t-saka/rocm-mtp3-integrated-trace-20261124/`。
 
 ## Expert原本の連続配置と直接DMAの調査
 

@@ -1,6 +1,6 @@
 # 検証設定とON/OFFフラグ
 
-更新 2026-11-20。直近の高速3幅比較の `japanese/width-3/settings.json` に基づく。実験フラグはブランチによって追加・削除される。再実行前に対象のコード、ビルド、ランナーを確認する。
+更新 2026-11-25。Vulkanの設定は高速3幅比較の `japanese/width-3/settings.json` に基づく。実験フラグはブランチによって追加・削除される。再実行前に対象のコード、ビルド、ランナーを確認する。
 
 ## Linux ROCm・固定3幅の採用設定
 
@@ -36,3 +36,21 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 `GGML_VK_ASYNC_USE_TRANSFER_QUEUE` は値の存在で判定するため、専用Expert並行転送の比較では環境変数を削除する。直近の設定は `GGML_VK_VISIBLE_DEVICES=0,2,1` で `CUDA0,Vulkan1` を使用。番号は起動前に `--list-devices` で機種名を照合する。
 
 通常速度では詳細計測と `GGML_CUDA_DISABLE_GRAPHS` を未設定にする。計測用の追加同期を使う実験は別のログに記録する。新しいフラグを記録するときは、正確な名前、ON・OFFの値、適用条件または既定値、検証した版と結果を添える。
+
+## ROCm統合ブランチの固定3幅
+
+`codex/rocm-expert-single-kernel-overlap` から採用した次層先読みは `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH=1` で有効にする。共有8枠、必要なヒットだけのイベント待ち、現在層の投入後に先読みを発行する順序、実ミス優先が含まれる。単一バンク・固定3幅・直接tuple DMAの下で、非同期プリフィル `LLAMA_EXPERT_HIP_PREFILL=1` と非同期昇格 `LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION=1` を併用する。[Dockerの正式採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
+
+通常はヒット待ち、後発行、スコアフィルター、必要転送後のホスト同期省略、詳細計測の各フラグを未設定にする。GPU間のストリーム通知は単体試験として記録している。[先読み併用時の計測](../rocm/09-single-bank-mtp3.md#非同期プリフィルと非同期昇格の併用) · [GPU間通知の単体試験](../rocm/10-decode-pipeline.md#mi50からrtxへのストリーム通知の単体試験)
+
+### 次層Expert先読みの比較フラグ
+
+| 設定 | 値 | 動作 |
+| --- | --- | --- |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT` | 未設定（通常） / `0`（比較用） | イベント待ちを切り分ける旧比較設定。通常起動で設定する必要はない。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | 未設定（通常） / `0`（比較用） | 現在層の投入後発行を切り分ける旧比較設定。通常起動で設定する必要はない。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。 |
+| `LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND` | 未設定（既定OFF） / `1`（試作） | 固定3幅の必要転送から融合までを計算ストリーム上で連結する。既存の先読み後発行・実ミス優先、非同期スロット表と非同期昇格が有効な構成で使う。 |
+| `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` | 未設定（通常） / `1`（詳細比較） | 試作ON/OFF両方に層ごとのホスト時刻を出す。GPU時刻はrocprofで照合する。 |
+
+同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。

@@ -840,6 +840,8 @@ struct llm_graph_params {
     llm_graph_result * res;
     bool target_mtp_verify_three = false;
     bool target_mtp_verify_packed = false;
+    bool trace_next_router = false;
+    int next_router_score_mode = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -918,6 +920,8 @@ struct llm_graph_params {
             mtp_vocab_ids == other.mtp_vocab_ids &&
             target_mtp_verify_three == other.target_mtp_verify_three &&
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
+            trace_next_router == other.trace_next_router &&
+            next_router_score_mode == other.next_router_score_mode &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -986,6 +990,8 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    std::vector<ggml_tensor *> t_next_router;
+    std::vector<ggml_tensor *> t_next_router_scores;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1275,8 +1281,7 @@ struct llm_graph_context {
                     bool   cold = false,
                  int32_t   prefill_wave = -1,
              ggml_tensor * prefill_ids = nullptr,
-                bool   mtp_verify_three = false,
-         ggml_tensor * full_map = nullptr) const;
+                bool   mtp_verify_three = false) const;
 
     //
     // inputs
