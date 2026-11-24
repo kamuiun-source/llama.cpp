@@ -33,6 +33,9 @@ public:
     void end_generation_trace(bool success);
     bool next_router_trace_active() const;
     void trace_next_router(int32_t il, const ggml_tensor * ids);
+    bool next_router_prefetch_enabled() const;
+    void begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions);
+    void end_next_router_prefetch();
     void record_decode_width(uint32_t tokens);
     void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;

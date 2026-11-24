@@ -2102,8 +2102,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
     gparams.trace_next_router = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_expert_used() == 10 &&
-            model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed &&
-            moe_cache && moe_cache->next_router_trace_active();
+            model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed && target_mtp_verify_width == 3 &&
+            !cparams.warmup && moe_cache && (moe_cache->next_router_trace_active() || moe_cache->next_router_prefetch_enabled());
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2154,7 +2154,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
+    ggml_status status;
+    {
+        struct prefetch_scope {
+            llama_moe_cache * cache;
+            ~prefetch_scope() {
+                if (cache) {
+                    cache->end_next_router_prefetch();
+                }
+            }
+        } prefetch{!res->t_next_router.empty() && moe_cache->next_router_prefetch_enabled() ? moe_cache.get() : nullptr};
+        if (prefetch.cache) {
+            prefetch.cache->begin_next_router_prefetch(res->t_next_router);
+        }
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2163,7 +2177,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
-    if (!res->t_next_router.empty()) {
+    if (!res->t_next_router.empty() && moe_cache->next_router_trace_active()) {
         ggml_backend_sched_synchronize(sched.get());
         for (size_t i = 0; i < res->t_next_router.size(); ++i) {
             moe_cache->trace_next_router(i + 1, res->t_next_router[i]);
