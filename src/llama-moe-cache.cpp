@@ -594,6 +594,24 @@ struct llama_moe_cache::impl {
     bool next_prefetch_hit_wait = false;
     bool next_prefetch_after_submit = false;
     bool next_prefetch_demand_priority = false;
+    bool hip_demand_trace = false;
+    ggml_backend_event_ptr hip_demand_event;
+    bool hip_demand_pending = false;
+    bool next_prefetch_submit_launch = false;
+    size_t hip_demand_layers = 0;
+    size_t hip_demand_fallbacks = 0;
+    size_t hip_demand_promotion_dependencies = 0;
+    size_t hip_demand_reuse_dependencies = 0;
+    int64_t hip_demand_end_wait_us = 0;
+    uint64_t hip_demand_trace_graph = 0;
+    struct demand_trace_entry {
+        int64_t us;
+        int32_t layer;
+        const char * phase;
+        size_t count;
+        size_t bytes;
+    };
+    std::vector<demand_trace_entry> hip_demand_trace_entries;
     bool (*next_prefetch_event_ready)(ggml_backend_t, ggml_backend_event_t) = nullptr;
     struct next_prefetch_task {
         int32_t expert;
@@ -1413,6 +1431,7 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         // The context synchronizes its backends before destroying the cache.
+        finish_async_demand();
         finish_next_prefetch();
         wait_hip_cold_upload();
         finish_hip_mtp_promotion();
@@ -1718,7 +1737,9 @@ struct llama_moe_cache::impl {
             return;
         }
         const int64_t start = ggml_time_us();
+        demand_trace(hip_mtp_pending_move.il, "promotion_join_begin");
         ggml_backend_synchronize(hip_upload_backend.get());
+        demand_trace(hip_mtp_pending_move.il, "promotion_join_end");
         (hip_mtp_pending_four ? hip_mtp4_promotion_wait_us : hip_mtp_promotion_wait_us) += ggml_time_us() - start;
         const auto * data = placement->hip_tuple_dma ? hip_mtp_pending_move.planes[0].host_data :
                 static_cast<const uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_promotion_staging.get()));
@@ -1728,7 +1749,8 @@ struct llama_moe_cache::impl {
         hip_mtp_pending_move.n_planes = 0;
     }
 
-    void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict, bool mtp_four) {
+    void submit_hip_mtp_promotion(const layer & l, int32_t il, int32_t scratch_index, int32_t evict, bool mtp_four,
+            bool async_demand) {
         GGML_ASSERT(!hip_mtp_pending_move.n_planes);
         const auto move = prepare_packed_promotion(l, il, scratch_index, evict);
         wait_next_prefetch_source(il, move.host_slot);
@@ -1739,11 +1761,17 @@ struct llama_moe_cache::impl {
         }
         const int64_t start = ggml_time_us();
         try {
+            if (async_demand) {
+                ggml_backend_event_wait(hip_upload_backend.get(), hip_demand_event.get());
+                ++hip_demand_promotion_dependencies;
+                demand_trace(il, "promotion_dependency");
+            }
             for (size_t i = 0; i < move.n_planes; ++i) {
                 const auto & p = move.planes[i];
                 ggml_backend_tensor_get_async(hip_upload_backend.get(), p.bank, data, move.old_gpu_slot * p.stride, p.stride);
                 data += p.stride;
             }
+            demand_trace(il, "promotion_submit", 1, move.bytes);
         } catch (...) {
             ggml_backend_synchronize(hip_upload_backend.get());
             throw;
@@ -2373,6 +2401,42 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_WARN("packed expert HIP next Router prefetch: event queries unavailable, submitting all speculative transfers after split submit\n");
             }
         }
+        const char * async_demand = std::getenv("LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND");
+        if (async_demand && std::strcmp(async_demand, "1") == 0) {
+            if (next_prefetch_demand_priority && hip_mtp_slot_staging && hip_mtp_promotion_async) {
+                hip_demand_event.reset(ggml_backend_event_new(placement->target));
+            }
+            if (!hip_demand_event) {
+                LLAMA_LOG_WARN("packed expert HIP MTP3 async demand unavailable; using the existing upload wait\n");
+            } else {
+                LLAMA_LOG_INFO("packed expert HIP MTP3 async demand enabled\n");
+            }
+        }
+        const char * trace = std::getenv("LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE");
+        hip_demand_trace = trace && std::strcmp(trace, "1") == 0;
+        if (hip_demand_trace) {
+            hip_demand_trace_entries.reserve(64 * placement->maps.size());
+        }
+    }
+
+    void demand_trace(int32_t il, const char * phase, size_t count = 0, size_t bytes = 0) {
+        if (hip_demand_trace && next_prefetch_predictions &&
+                hip_demand_trace_entries.size() < hip_demand_trace_entries.capacity()) {
+            hip_demand_trace_entries.push_back({ggml_time_us(), il, phase, count, bytes});
+        }
+    }
+
+    void finish_async_demand() {
+        if (hip_demand_pending) {
+            const int64_t start = ggml_time_us();
+            if (!next_prefetch_event_ready(hip_upload_backend.get(), hip_demand_event.get())) {
+                demand_trace(-1, "demand_end_wait_begin");
+                ggml_backend_event_synchronize(hip_demand_event.get());
+                demand_trace(-1, "demand_end_wait_end");
+                hip_demand_end_wait_us += ggml_time_us() - start;
+            }
+            hip_demand_pending = false;
+        }
     }
 
     void retire_next_prefetch(size_t hits) {
@@ -2414,7 +2478,9 @@ struct llama_moe_cache::impl {
         for (size_t i = next_prefetch_completed; i < next_prefetch_sources; ++i) {
             if (next_prefetch_source_slots[i] == host_slot) {
                 const int64_t start = ggml_time_us();
+                demand_trace(il, "promotion_source_wait_begin");
                 ggml_backend_event_synchronize(next_prefetch_events[i].get());
+                demand_trace(il, "promotion_source_wait_end");
                 next_prefetch_source_wait_us += ggml_time_us() - start;
                 ++next_prefetch_source_waits;
                 complete_next_prefetch_prefix(i + 1);
@@ -2706,28 +2772,46 @@ struct llama_moe_cache::impl {
         }
     }
 
-    void schedule_next_prefetch(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
-        if (next_prefetch_after_submit) {
-            if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
-                return;
-            }
+    bool arm_next_prefetch_submit(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
+        const bool has_next = size_t(il) < next_prefetch_predictions->size() && size_t(il + 1) < placement->maps.size();
+        if (has_next) {
             auto * prediction = (*next_prefetch_predictions)[il];
             const auto producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
             // Readback must not synchronize the stream that runs the current Expert split.
-            if (producer != expert_backend && next_prefetch_submit_layer < 0 &&
-                    ggml_backend_sched_after_split_submit(sched, [](ggml_backend_sched_t sched, void * user_data) {
-                        auto & self = *static_cast<impl *>(user_data);
-                        const int32_t il = self.next_prefetch_submit_layer;
-                        self.next_prefetch_submit_layer = -1;
+            if (producer == expert_backend) {
+                return false;
+            }
+        }
+        if (next_prefetch_submit_layer >= 0 ||
+                !ggml_backend_sched_after_split_submit(sched, [](ggml_backend_sched_t sched, void * user_data) {
+                    auto & self = *static_cast<impl *>(user_data);
+                    const int32_t il = self.next_prefetch_submit_layer;
+                    self.next_prefetch_submit_layer = -1;
+                    self.demand_trace(il, "dispatch_end");
+                    if (self.next_prefetch_submit_launch) {
                         ++self.next_prefetch_submit_executed;
                         const int64_t start = self.next_profile_start ? ggml_time_us() : 0;
                         self.launch_next_prefetch(sched, il, self.next_prefetch_demand_priority);
                         if (start) {
                             self.next_prefetch_submit_cpu_us += ggml_time_us() - start;
                         }
-                    }, this)) {
-                next_prefetch_submit_layer = il;
-                ++next_prefetch_submit_scheduled;
+                    }
+                }, this)) {
+            return false;
+        }
+        next_prefetch_submit_layer = il;
+        next_prefetch_submit_launch = has_next && next_prefetch_after_submit;
+        next_prefetch_submit_scheduled += next_prefetch_submit_launch;
+        return true;
+    }
+
+    void schedule_next_prefetch(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
+        if (next_prefetch_after_submit) {
+            if (next_prefetch_submit_layer == il ||
+                    size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
+                return;
+            }
+            if (arm_next_prefetch_submit(sched, expert_backend, il)) {
                 return;
             }
             ++next_prefetch_submit_fallback;
@@ -2763,7 +2847,7 @@ struct llama_moe_cache::impl {
 
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false,
-                         llama_expert_staging_telemetry * callback_totals = nullptr) {
+                         llama_expert_staging_telemetry * callback_totals = nullptr, bool * async_demand_reads = nullptr) {
         const bool tuple_dma = placement->hip_tuple_dma;
         GGML_ASSERT(!hip_async || ((cold || tuple_dma) && !submitted));
         GGML_ASSERT(!hip_direct || (!cold && !hip_async && !submitted && !retry_bytes));
@@ -2810,6 +2894,7 @@ struct llama_moe_cache::impl {
                     }
                     const auto * data = static_cast<const uint8_t *>(tuple.host->data) + host_slot * tuple.stride;
                     submit(tuple.device, data, slot * tuple.stride, tuple.stride);
+                    demand_trace(il, "h2d_submit", 1, tuple.stride);
                     if (next_profile_start) {
                         ++next_profile_demand_count;
                         next_profile_demand_bytes += tuple.stride;
@@ -2838,10 +2923,12 @@ struct llama_moe_cache::impl {
                 GGML_ASSERT(!hip_async && !submitted);
                 // The H2D stream is FIFO. The last needed event covers all hits.
                 ggml_backend_event_wait(backend, next_prefetch_events[last_needed].get());
+                demand_trace(il, "prefetch_prefix_wait", last_needed + 1);
                 ++next_prefetch_dependencies;
                 next_prefetch_dependency_slots += last_needed + 1;
                 for (size_t i = 0; i < prefetch_hits; ++i) {
                     copy_next_prefetch(backend, placement->tuples[il], needed[i].expert, needed[i].slot);
+                    demand_trace(il, "d2d_submit", 1, placement->tuples[il].stride);
                 }
             }
         } catch (...) {
@@ -2858,11 +2945,16 @@ struct llama_moe_cache::impl {
             // The normal slots cannot be published until both upload streams have finished writing them.
             finish_next_prefetch(prefetch_hits);
         }
-        if (!hip_async && (!submitted || !*submitted)) {
+        if (async_demand_reads) {
+            *async_demand_reads = last_needed >= 0;
+            demand_trace(il, "consumer_sync_skipped", fills.size(), bytes);
+        } else if (!hip_async && (!submitted || !*submitted)) {
             const bool trace_wait = !generation_trace_positions.empty();
             const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy || callback_totals || last_needed >= 0;
             const int64_t start = measure_wait ? ggml_time_us() : 0;
+            demand_trace(il, "consumer_sync_begin", fills.size(), bytes);
             ggml_backend_synchronize(backend);
+            demand_trace(il, "consumer_sync_end", fills.size(), bytes);
             if (measure_wait) {
                 const uint64_t us = ggml_time_us() - start;
                 if (last_needed >= 0) {
@@ -2891,8 +2983,9 @@ struct llama_moe_cache::impl {
         }
         next_prefetch_top20_only_hits += prefetch_top20_hits;
         if (il == next_prefetch_layer && next_prefetch_hit_wait) {
-            // The consumer sync above has drained the shared bank reads before its next use.
-            complete_next_prefetch_prefix(last_needed + 1);
+            if (!async_demand_reads) {
+                complete_next_prefetch_prefix(last_needed + 1);
+            }
             retire_next_prefetch(prefetch_hits);
         }
         return bytes;
@@ -3328,6 +3421,17 @@ struct llama_moe_cache::impl {
             const bool hip_async_slot_map = ((fixed_three && hip_mtp_slot_async) || (fixed_four && hip_mtp4_slot_async)) &&
                     hip_mtp_slot_staging && sched &&
                     ggml_backend_sched_get_n_copies(sched) == 1 && !rtx_expert;
+            const bool async_map_dst = hip_async_slot_map && dst->buffer &&
+                    ggml_backend_buffer_get_type(dst->buffer) == ggml_backend_get_default_buffer_type(backend);
+            const bool demand_candidate = hip_demand_event && fixed_three && next_prefetch_predictions;
+            const bool can_async_demand = demand_candidate && async_map_dst && !early && !profile && !use_waves;
+            const bool trace_split = hip_demand_trace && fixed_three && next_prefetch_predictions && !early && sched;
+            const bool submit_armed = (can_async_demand || trace_split) && arm_next_prefetch_submit(sched, backend, il);
+            const bool async_demand = can_async_demand && submit_armed;
+            hip_demand_fallbacks += demand_candidate && !async_demand;
+            if (trace_split) {
+                demand_trace(il, async_demand ? "layer_async" : "layer_wait", ids.size());
+            }
             const bool batch = packed_staging != nullptr || hip_direct || placement->hip_tuple_dma;
             if (batch) {
                 fills.clear();
@@ -3588,14 +3692,14 @@ struct llama_moe_cache::impl {
                 telemetry_scope scope(set_telemetry_cause, "slot_map");
                 const int64_t map_start = fine_profile ? ggml_time_us() : 0;
                 const size_t bytes_map = ggml_nbytes(dst);
-                if (hip_async_slot_map && dst->buffer &&
-                        ggml_backend_buffer_get_type(dst->buffer) == ggml_backend_get_default_buffer_type(backend)) {
+                if (async_map_dst) {
                     GGML_ASSERT(bytes_map == sizeof(slots));
                     auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get()));
                     staging += il * sizeof(slots);
                     // This callback's destination wait has drained any prior use of this layer's staging.
                     std::memcpy(staging, slots.data(), bytes_map);
                     ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
+                    demand_trace(il, "slot_map_submit", 1, bytes_map);
                     if (fixed_four) {
                         ++hip_mtp4_async_maps;
                     } else {
@@ -3612,6 +3716,7 @@ struct llama_moe_cache::impl {
             };
             bool upload_submitted = false;
             bool overlap_submitted = false;
+            bool async_demand_reads = false;
             const bool can_overlap = !hip_direct && (!use_waves || overlap_three_fit) && overlap_expert_upload &&
                     !profile && sched && ggml_backend_sched_get_n_copies(sched) == 1;
             const bool can_overlap_promotion = can_overlap && overlap_expert_promotion && evict >= 0;
@@ -3628,7 +3733,8 @@ struct llama_moe_cache::impl {
                     }
                     if (!overlap_submitted && !fills.empty()) {
                         bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr,
-                                overlap_copied_bytes, false, hip_direct, fine_profile ? &callback_totals : nullptr);
+                                overlap_copied_bytes, false, hip_direct, fine_profile ? &callback_totals : nullptr,
+                                async_demand ? &async_demand_reads : nullptr);
                     }
                 } catch (...) {
                     for (const auto & fill : fills) {
@@ -3637,7 +3743,7 @@ struct llama_moe_cache::impl {
                     throw;
                 }
             }
-            if (n_uploads > 0 && !upload_submitted && !overlap_submitted) {
+            if (n_uploads > 0 && !upload_submitted && !overlap_submitted && !async_demand) {
                 if (!batch) {
                     telemetry_scope scope(set_telemetry_cause, "expert_upload");
                     ggml_backend_synchronize(backend);
@@ -3658,11 +3764,24 @@ struct llama_moe_cache::impl {
                     finish_next_prefetch();
                 }
             }
+            if (async_demand) {
+                GGML_ASSERT(!upload_submitted && !overlap_submitted);
+                write_slot_map();
+                ggml_backend_event_record(hip_demand_event.get(), backend);
+                hip_demand_pending = true;
+                ++hip_demand_layers;
+                if (async_demand_reads) {
+                    // The consumer only waits on earlier events from the upload stream.
+                    ggml_backend_event_wait(next_prefetch_backend.get(), hip_demand_event.get());
+                    ++hip_demand_reuse_dependencies;
+                    demand_trace(il, "prefetch_reuse_wait");
+                }
+            }
             if (evict >= 0 && !overlap_submitted) {
                 const int64_t promotion_start = fine_profile ? ggml_time_us() : 0;
                 if (((fixed_three && hip_mtp_promotion_async) || (fixed_four && hip_mtp4_promotion_async)) && !rtx_expert && sched &&
                         ggml_backend_sched_get_n_copies(sched) == 1) {
-                    submit_hip_mtp_promotion(l, il, promote_index, evict, fixed_four);
+                    submit_hip_mtp_promotion(l, il, promote_index, evict, fixed_four, async_demand);
                 } else {
                     promote_packed(l, il, promote_index, evict);
                 }
@@ -3682,13 +3801,13 @@ struct llama_moe_cache::impl {
                 packed_overlap_uploads += bytes != 0;
                 packed_overlap_upload_bytes += bytes;
                 ++packed_deferred_maps;
-            } else if (defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
+            } else if (!async_demand && defer_slot_map && !profile && defer_slot_map(backend, dst, slots.data())) {
                 ++packed_deferred_maps;
                 if (upload_submitted) {
                     ++packed_deferred_uploads;
                     packed_deferred_upload_bytes += bytes;
                 }
-            } else {
+            } else if (!async_demand) {
                 if (upload_submitted) {
                     telemetry_scope scope(set_telemetry_cause, "expert_upload");
                     ggml_backend_synchronize(backend);
@@ -3698,7 +3817,7 @@ struct llama_moe_cache::impl {
                 }
                 write_slot_map();
             }
-            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !upload_submitted && !overlap_submitted;
+            packed_synchronous_uploads += defer_upload_requested && n_uploads > 0 && !upload_submitted && !overlap_submitted && !async_demand;
             stats_small.hits += hits + scratch_hits;
             packed_scratch_hits += scratch_hits;
             stats_small.misses += n_uploads;
@@ -3851,6 +3970,10 @@ struct llama_moe_cache::impl {
                     next_prefetch_demand_priority, next_prefetch_deferred, next_prefetch_progress_checks,
                     next_prefetch_progressed, next_prefetch_canceled, next_prefetch_canceled_needed,
                     next_prefetch_discarded, next_prefetch_priority_immediate);
+            LLAMA_LOG_INFO("packed expert HIP MTP3 async demand: enabled=%d layers=%zu fallbacks=%zu prefetch_reuse=%zu"
+                    " promotion_dependencies=%zu end_cpu_wait_us=%" PRId64 "\n", hip_demand_event != nullptr,
+                    hip_demand_layers, hip_demand_fallbacks, hip_demand_reuse_dependencies,
+                    hip_demand_promotion_dependencies, hip_demand_end_wait_us);
         }
         for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
             if (!layers[il].slot_map) {
@@ -4147,23 +4270,46 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     self.next_prefetch_predictions = &predictions;
     GGML_ASSERT(!self.next_prefetch_score_mode || scores.size() == predictions.size());
     self.next_prefetch_scores = self.next_prefetch_score_mode ? &scores : nullptr;
-    if (self.next_prefetch_demand_priority) {
+    if (self.hip_demand_trace) {
+        ++self.hip_demand_trace_graph;
+    }
+    if (self.next_prefetch_demand_priority || self.hip_demand_trace) {
         ggml_backend_sched_set_before_split_submit(sched, [](void * data) {
-            static_cast<impl *>(data)->progress_next_prefetch();
+            auto & self = *static_cast<impl *>(data);
+            self.progress_next_prefetch();
+            if (self.next_prefetch_submit_layer >= 0) {
+                self.demand_trace(self.next_prefetch_submit_layer, "dispatch_begin");
+            }
         }, pimpl.get());
     }
 }
 
 void llama_moe_cache::end_next_router_prefetch(ggml_backend_sched_t sched) {
-    if (pimpl->next_prefetch_demand_priority) {
+    if (pimpl->next_prefetch_demand_priority || pimpl->hip_demand_trace) {
         ggml_backend_sched_set_before_split_submit(sched, nullptr, nullptr);
+    }
+    if (pimpl->next_prefetch_demand_priority) {
         pimpl->discard_next_prefetch_queue();
     }
     if (pimpl->next_prefetch_submit_layer >= 0) {
-        ++pimpl->next_prefetch_submit_canceled;
+        pimpl->next_prefetch_submit_canceled += pimpl->next_prefetch_submit_launch;
         pimpl->next_prefetch_submit_layer = -1;
     }
+    pimpl->finish_async_demand();
     pimpl->finish_next_prefetch();
+    if (!pimpl->hip_demand_trace_entries.empty()) {
+        try {
+            std::ostringstream trace;
+            for (const auto & row : pimpl->hip_demand_trace_entries) {
+                trace << "hip_mtp3_demand graph=" << pimpl->hip_demand_trace_graph << " us=" << row.us << " layer=" << row.layer
+                      << " phase=" << row.phase << " count=" << row.count << " bytes=" << row.bytes << '\n';
+            }
+            LLAMA_LOG_INFO("%s", trace.str().c_str());
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("HIP MTP3 demand trace: %s\n", err.what());
+        }
+        pimpl->hip_demand_trace_entries.clear();
+    }
     pimpl->next_prefetch_predictions = nullptr;
     pimpl->next_prefetch_scores = nullptr;
 }
