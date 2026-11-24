@@ -344,6 +344,14 @@ Astraが時刻と領域を照合した。0.5秒以上のトークン出力間隔
 
 生ログと照合結果はGit外の `/home/t-saka/rocm-expert-hit-wait-20261124/both-off-userptr-flight/`、応答とスワップ時系列は `session-batch-06/`。
 
+###### AstraによるExpert原本の無効化の再照合
+
+実行中カーネルのBTFを独立に確認し、取得した1,002,297ページの範囲が第6のExpert固定領域と完全に一致した。 4分割GGUFの各層の量子型からtuple strideを再計算し、4 GiBのバッファ上限でまとめ直したところ、6領域すべての確保サイズと一致した。第6の領域のページ丸め前は4,105,405,440 Bで、モデルの層0〜9のRAM側Expertのgate/up/down原本を含む。第6は仮想アドレス順の番号。最初のスワップ増加区間に残った、この領域への無効化通知は `kcompactd0` 21,811件、別ワーカー32件。全件が4 KiBの `MMU_NOTIFY_CLEAR`。 21,816枚の異なるページに及び、領域先頭から約111〜3,763 MiBに分布した。バッファを層単位に分けると、影響を受けた各バッファの復元単位を小さくできるが、複数バッファへ無効化が及ぶため全体の改善幅は未検証。ほかのExpert原本5領域に対する通知は同区間の保存分では確認できなかった。第6領域の約3.82 GiBのうちTHPは448 MiB（11.4%）で、ほかの5領域のTHP比率は55〜100%。第6領域に集中した理由は未確定。
+
+Linuxはページ移動でも `MMU_NOTIFY_CLEAR` を発行する。通常の匿名THPの結合ではPMD相当の範囲を無効化する。記録された4 KiB通知と `kcompactd0` の組み合わせは、通常ページの移動を伴うコンパクションと整合する。通知種別だけでは発端を決められず、アドレスリングでは一部CPUの対象区間以前の記録が上書きされていた。さらに、KFDは無効化されたバッファについてページ情報を全ページ分確保し直す。第6領域の場合はPFN配列が約7.65 MiB。重みデータを再確保する処理ではない。[Linuxページ移動](https://raw.githubusercontent.com/torvalds/linux/v7.0/mm/rmap.c) · [Linux THP結合](https://raw.githubusercontent.com/torvalds/linux/v7.0/mm/khugepaged.c) · [AMDGPU HMM](https://raw.githubusercontent.com/torvalds/linux/v7.0/drivers/gpu/drm/amd/amdgpu/amdgpu_hmm.c)
+
+当該ホストの `vm.compact_unevictable_allowed` は1。カーネル文書によると、この設定では `mlock` 済みページもコンパクションの走査対象にできる。切り分ける場合は、Expert領域に交差する `amdgpu_hmm_invalidate_hsa` に限定して、コンパクション・THPそれぞれの呼び出しスタックを少数保存する。設定変更で比較するなら、この値だけを一時的に0にする方法もある。ホスト全体の連続メモリ確保に作用する設定で、今回のレビューでは変更していない。[Linux VM設定](https://docs.kernel.org/admin-guide/sysctl/vm.html#compact-unevictable-allowed)
+
 ###### 先読みOFFで発生したスワップの既存経路をAstraが確認
 
 固定3幅では本体の recurrent rollback が2位置分に対応し、ドラフトは最大2候補。検証ごとに `common_sampler_clone()` で最大約2.84 MiBの候補配列（248,320語）を一時複製するが、この構成では退避したサンプラーを復元する分岐に入らない。複製は各検証で解放するため、累積のコピー量はヒープの常駐増加や今回のスワップ原因を示さない。本体の検証ごとのチェックポイント保存も同じ幅条件でスキップされる。プリフィルで保存する112.61 MiBの通常チェックポイントは別経路で、第5問の最初のトークンより前に既存の1個を入れ替えている。
