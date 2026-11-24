@@ -1409,6 +1409,8 @@ struct ggml_backend_sched {
         void (*callback)(ggml_backend_sched_t sched, void * user_data) = nullptr;
         void * user_data = nullptr;
     } * active_after_submit;
+    void (*before_split_submit)(void * user_data);
+    void * before_split_submit_user_data;
     int carry_prefix_end;
     ggml_tensor * carry_accumulator;
     ggml_custom_op_t custom_dispatch;
@@ -3998,6 +4000,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             main_graph = &after_carry;
         }
         if (!sched->callback_eval) {
+            if (sched->before_split_submit) {
+                sched->before_split_submit(sched->before_split_submit_user_data);
+            }
             enum ggml_status ec = dispatch(main_graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -4562,6 +4567,12 @@ bool ggml_backend_sched_after_split_submit(ggml_backend_sched_t sched,
     }
     *pending = {split, callback, user_data};
     return true;
+}
+
+void ggml_backend_sched_set_before_split_submit(ggml_backend_sched_t sched,
+        void (*callback)(void * user_data), void * user_data) {
+    sched->before_split_submit = callback;
+    sched->before_split_submit_user_data = user_data;
 }
 
 bool ggml_backend_sched_set_target_mtp_verify(ggml_backend_sched_t sched, bool enabled) {

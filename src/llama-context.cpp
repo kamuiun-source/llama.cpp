@@ -2165,7 +2165,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const ggml_status & status;
             ~prefetch_scope() {
                 if (cache) {
-                    cache->end_next_router_prefetch();
+                    cache->end_next_router_prefetch(sched);
                 }
                 if (profile_cache) {
                     int hc_pre = 0, hc_comb = 0, hc_post = 0;
@@ -2188,7 +2188,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             prefetch.profile_cache->begin_next_router_profile();
         }
         if (prefetch.cache) {
-            prefetch.cache->begin_next_router_prefetch(res->t_next_router, res->t_next_router_scores);
+            prefetch.cache->begin_next_router_prefetch(sched.get(), res->t_next_router, res->t_next_router_scores);
         }
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
     }

@@ -400,6 +400,8 @@ extern "C" {
     // Register one callback during a weight copy. Run it after that split is submitted successfully.
     GGML_API bool ggml_backend_sched_after_split_submit(ggml_backend_sched_t sched,
             void (*callback)(ggml_backend_sched_t sched, void * user_data), void * user_data);
+    GGML_API void ggml_backend_sched_set_before_split_submit(ggml_backend_sched_t sched,
+            void (*callback)(void * user_data), void * user_data);
     // Carry an accumulator through an empty prefix from the active weight copy callback.
     GGML_API void ggml_backend_sched_mark_mtp_three_empty_wave(ggml_backend_sched_t sched, const struct ggml_cgraph * wave_zero);
     GGML_API bool ggml_backend_sched_carry_accumulator(ggml_backend_sched_t sched, const struct ggml_cgraph * graph, struct ggml_tensor * accumulator);

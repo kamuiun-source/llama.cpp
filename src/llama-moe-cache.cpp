@@ -613,6 +613,24 @@ struct llama_moe_cache::impl {
     bool next_prefetch_tail_pending = false;
     bool next_prefetch_hit_wait = false;
     bool next_prefetch_after_submit = false;
+    bool next_prefetch_demand_priority = false;
+    bool (*next_prefetch_event_ready)(ggml_backend_t, ggml_backend_event_t) = nullptr;
+    struct next_prefetch_task {
+        int32_t expert;
+        int32_t host_slot;
+        bool beyond_top10;
+    };
+    std::array<next_prefetch_task, next_prefetch_slots> next_prefetch_queue;
+    int32_t next_prefetch_queue_layer = -1;
+    size_t next_prefetch_queue_head = 0;
+    size_t next_prefetch_queue_count = 0;
+    size_t next_prefetch_deferred = 0;
+    size_t next_prefetch_progress_checks = 0;
+    size_t next_prefetch_progressed = 0;
+    size_t next_prefetch_canceled = 0;
+    size_t next_prefetch_canceled_needed = 0;
+    size_t next_prefetch_discarded = 0;
+    size_t next_prefetch_priority_immediate = 0;
     int32_t next_prefetch_submit_layer = -1;
     size_t next_prefetch_submit_scheduled = 0;
     size_t next_prefetch_submit_executed = 0;
@@ -2401,6 +2419,16 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_WARN("packed expert HIP next Router prefetch: after-submit requires hit wait, using immediate launch\n");
             }
         }
+        const char * demand_priority = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_DEMAND_PRIORITY");
+        if (demand_priority && std::strcmp(demand_priority, "1") == 0) {
+            auto * reg = ggml_backend_dev_backend_reg(placement->target);
+            next_prefetch_event_ready = reinterpret_cast<decltype(next_prefetch_event_ready)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_event_ready"));
+            next_prefetch_demand_priority = next_prefetch_after_submit && next_prefetch_event_ready;
+            if (!next_prefetch_demand_priority) {
+                LLAMA_LOG_WARN("packed expert HIP next Router prefetch: demand priority requires after-submit and event queries\n");
+            }
+        }
     }
 
     void retire_next_prefetch(size_t hits) {
@@ -2532,7 +2560,65 @@ struct llama_moe_cache::impl {
         }
     }
 
-    bool priority_next_prefetch(int32_t layer, const next_prefetch_routes & ids, const next_prefetch_logits & scores) {
+    void stage_next_prefetch(int32_t layer, int32_t expert, int32_t host_slot, bool beyond_top10, bool defer) {
+        if (defer) {
+            next_prefetch_queue_layer = layer;
+            next_prefetch_queue[next_prefetch_queue_count++] = {expert, host_slot, beyond_top10};
+        } else {
+            submit_next_prefetch(layer, expert, host_slot, beyond_top10);
+        }
+    }
+
+    void progress_next_prefetch() {
+        if (next_prefetch_queue_layer < 0) {
+            return;
+        }
+        const bool initial = next_prefetch_queue_head == 0;
+        if (!initial) {
+            ++next_prefetch_progress_checks;
+            if (!next_prefetch_event_ready(next_prefetch_backend.get(), next_prefetch_events[next_prefetch_count - 1].get())) {
+                return;
+            }
+        }
+        // Keep at most two queued H2D operations ahead of a possible demand copy.
+        const size_t end = std::min(next_prefetch_queue_count, next_prefetch_queue_head + 2);
+        while (next_prefetch_queue_head < end) {
+            const auto & task = next_prefetch_queue[next_prefetch_queue_head++];
+            submit_next_prefetch(next_prefetch_queue_layer, task.expert, task.host_slot, task.beyond_top10);
+            next_prefetch_progressed += !initial;
+        }
+        if (initial) {
+            next_prefetch_deferred += next_prefetch_queue_count - end;
+        }
+        if (end == next_prefetch_queue_count) {
+            clear_next_prefetch_queue();
+        }
+    }
+
+    void clear_next_prefetch_queue() {
+        next_prefetch_queue_layer = -1;
+        next_prefetch_queue_head = 0;
+        next_prefetch_queue_count = 0;
+    }
+
+    void discard_next_prefetch_queue() {
+        next_prefetch_discarded += next_prefetch_queue_count - next_prefetch_queue_head;
+        clear_next_prefetch_queue();
+    }
+
+    void cancel_next_prefetch_queue(int32_t layer) {
+        if (layer != next_prefetch_queue_layer) {
+            return;
+        }
+        for (size_t i = next_prefetch_queue_head; i < next_prefetch_queue_count; ++i) {
+            const int32_t expert = next_prefetch_queue[i].expert;
+            next_prefetch_canceled_needed += std::find(ids.begin(), ids.end(), expert) != ids.end();
+        }
+        next_prefetch_canceled += next_prefetch_queue_count - next_prefetch_queue_head;
+        clear_next_prefetch_queue();
+    }
+
+    bool priority_next_prefetch(int32_t layer, const next_prefetch_routes & ids, const next_prefetch_logits & scores, bool defer) {
         struct candidate {
             int32_t expert;
             float score;
@@ -2577,16 +2663,19 @@ struct llama_moe_cache::impl {
         });
         for (size_t i = 0; i < budget; ++i) {
             const auto & c = candidates[i];
-            submit_next_prefetch(layer, c.expert, map.host[c.expert], !c.top10);
+            stage_next_prefetch(layer, c.expert, map.host[c.expert], !c.top10, defer);
         }
         return true;
     }
 
-    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il) {
+    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il, bool defer = false) {
         if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
             return;
         }
         const int32_t target = il + 1;
+        if (next_prefetch_queue_layer >= 0) {
+            discard_next_prefetch_queue();
+        }
         if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
                 (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
             finish_next_prefetch();
@@ -2623,8 +2712,11 @@ struct llama_moe_cache::impl {
         }
 
         if (next_prefetch_score_mode == 2) {
-            if (read_scores && priority_next_prefetch(target, predicted, logits)) {
+            if (read_scores && priority_next_prefetch(target, predicted, logits, defer)) {
                 ++next_prefetch_priority_layers;
+                if (defer) {
+                    progress_next_prefetch();
+                }
                 return;
             }
             ++next_prefetch_priority_fallbacks;
@@ -2649,11 +2741,24 @@ struct llama_moe_cache::impl {
                         std::find(next_prefetch_ids.begin(), end, expert) != end) {
                     continue;
                 }
-                submit_next_prefetch(target, expert, host_slot, false);
-                if (next_prefetch_count == next_prefetch_slots) {
+                if (defer) {
+                    const auto queue_end = next_prefetch_queue.begin() + next_prefetch_queue_count;
+                    if (std::find_if(next_prefetch_queue.begin(), queue_end,
+                            [expert](const next_prefetch_task & task) { return task.expert == expert; }) != queue_end) {
+                        continue;
+                    }
+                }
+                stage_next_prefetch(target, expert, host_slot, false, defer);
+                if (next_prefetch_queue_count == next_prefetch_slots || next_prefetch_count == next_prefetch_slots) {
+                    if (defer) {
+                        progress_next_prefetch();
+                    }
                     return;
                 }
             }
+        }
+        if (defer) {
+            progress_next_prefetch();
         }
     }
 
@@ -2672,7 +2777,7 @@ struct llama_moe_cache::impl {
                         self.next_prefetch_submit_layer = -1;
                         ++self.next_prefetch_submit_executed;
                         const int64_t start = self.next_profile_start ? ggml_time_us() : 0;
-                        self.launch_next_prefetch(sched, il);
+                        self.launch_next_prefetch(sched, il, self.next_prefetch_demand_priority);
                         if (start) {
                             self.next_prefetch_submit_cpu_us += ggml_time_us() - start;
                         }
@@ -2682,6 +2787,7 @@ struct llama_moe_cache::impl {
                 return;
             }
             ++next_prefetch_submit_fallback;
+            next_prefetch_priority_immediate += next_prefetch_demand_priority;
         }
         launch_next_prefetch(sched, il);
     }
@@ -3280,6 +3386,9 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (next_prefetch_queue_layer == il) {
+            cancel_next_prefetch_queue(il);
+        }
         const int64_t plan_begin = fine_profile ? ggml_time_us() : 0;
         if (fine_profile) {
             callback_totals.router_us += plan_begin - router_begin;
@@ -3938,6 +4047,11 @@ struct llama_moe_cache::impl {
                         next_prefetch_priority_layers, next_prefetch_priority_fallbacks,
                         next_prefetch_top20_only, next_prefetch_top20_only_hits);
             }
+            LLAMA_LOG_INFO("packed expert HIP next Router demand priority: enabled=%d deferred=%zu checks=%zu progressed=%zu"
+                    " canceled=%zu canceled_needed=%zu discarded=%zu immediate_fallbacks=%zu\n",
+                    next_prefetch_demand_priority, next_prefetch_deferred, next_prefetch_progress_checks,
+                    next_prefetch_progressed, next_prefetch_canceled, next_prefetch_canceled_needed,
+                    next_prefetch_discarded, next_prefetch_priority_immediate);
         }
         for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
             if (!layers[il].slot_map) {
@@ -4260,15 +4374,25 @@ int llama_moe_cache::next_router_score_mode() const {
     return pimpl->next_prefetch_score_mode;
 }
 
-void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions, const std::vector<ggml_tensor *> & scores) {
+void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, const std::vector<ggml_tensor *> & predictions,
+        const std::vector<ggml_tensor *> & scores) {
     auto & self = *pimpl;
     GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
     GGML_ASSERT(!self.next_prefetch_score_mode || scores.size() == predictions.size());
     self.next_prefetch_scores = self.next_prefetch_score_mode ? &scores : nullptr;
+    if (self.next_prefetch_demand_priority) {
+        ggml_backend_sched_set_before_split_submit(sched, [](void * data) {
+            static_cast<impl *>(data)->progress_next_prefetch();
+        }, pimpl.get());
+    }
 }
 
-void llama_moe_cache::end_next_router_prefetch() {
+void llama_moe_cache::end_next_router_prefetch(ggml_backend_sched_t sched) {
+    if (pimpl->next_prefetch_demand_priority) {
+        ggml_backend_sched_set_before_split_submit(sched, nullptr, nullptr);
+        pimpl->discard_next_prefetch_queue();
+    }
     if (pimpl->next_prefetch_submit_layer >= 0) {
         ++pimpl->next_prefetch_submit_canceled;
         pimpl->next_prefetch_submit_layer = -1;
