@@ -217,6 +217,17 @@ ONの `smaps` で既にウォームアップ前から存在する84,524 KiBの�
 
 速度と応答境界はGit外の `/home/t-saka/rocm-expert-shared10-prefetch-ctx2-reclaim-trace-20261124/` 配下、実行引数・生トレース・時刻窓別のスタック集計は `/home/t-saka/rocm-prefetch-reclaim-trace-20261124/` 配下に保存した。
 
+
+##### 次層Expert先読み単体のON/OFF計測
+
+同じビルド、固定MTP 3幅、単一バンク、tuple直接DMA、固定5問で、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` を共通にして `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH=0` / `1` だけを切り替える。応答中のスワップと出力・MTP採用数も一緒に記録する。旧 `LLAMA_EXPERT_NEXT_ROUTER_TRACE` は両条件で無効にする。このフラグを有効にすると、先読みOFFでも予測ノードと診断用の同期待ちが入る。
+
+正常終了時の `packed expert HIP next Router profile: phase=verify3` 行に、起動時のウォームアップとプリフィルを除いた3位置検証の集計を出す。比較単位は本体グラフ1回あたりとし、`graphs`、`failed`、`graph_nodes`、`splits`、`hc_*_nodes` と、通常H2Dの件数・量・発行・待ち、予測IDの読み出し・RTX待ち、先読みH2D・ヒット後D2Dの発行、先読みストリームの待ちを確認する。サーバーの一回の起動から停止までを集計する。APIで行う8トークンの試運転も、本体が3位置を検証した分は集計に含む。1応答のみを切り出すなら、同じプロセスでほかの検証リクエストを送らない。既存の `packed expert HIP next Router prefetch` 行にはヒット・未使用件数と先読み転送量が出る。
+
+GPUの実行時間が必要な場合は別計測で CUDA Graphsを維持し、Nsight Systemsの `--trace=cuda --cuda-graph-trace=node` でRTXのHCカーネル名・回数・時間を、rocprofv3の `--hip-trace --kernel-trace --memory-copy-trace` でMI50のH2D/D2DとExpertカーネルを確認する。CPUの発行・待ち時間はGPUの実行区間と重なるため加算しない。
+
+保存済みON/OFFの起動ログでは、DeepSeek V4 HCのpre・comb・postは両方とも有効。Qwen4expはFFN前のHC mixの出力を予測Routerへ分岐させるため、HC融合の設定は共通でも、中間値の利用先とグラフの分割は変わり得る。実際のHCカーネル数の比較には起動時の対応判定に加え、RTXのGPUトレースを使う。旧 `GGML_CUDA_HC_SCALE_SILU_FUSE` の実装は幅2以下が対象。
+
 ## 単一カーネル内でExpertアップロードと計算を重ねる試作
 
 `codex/rocm-integrated-test` の `85e2ae78a` から `codex/rocm-expert-single-kernel-overlap` を作成。固定3幅、単一バンク相当の `IQ3_XXS gate/up＋SwiGLU` を対象にし、Router確定後のミス分転送を常駐Expertの計算の裏に重ねる。転送を先に終える条件と並行条件で同じ行列積カーネルを1層1回起動し、`down` の処理と起動順序は本試作の対象外とする。

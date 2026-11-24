@@ -545,7 +545,9 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
 
         if (params.trace_next_router && il + 1 < n_layer) {
             auto * logits = ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, cur);
+            cb(logits, "ffn_next_router_logits", il + 1);
             auto * probs = ggml_soft_max(ctx0, logits);
+            cb(probs, "ffn_next_router_probs", il + 1);
             auto * ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, n_expert_used));
             cb(ids, "ffn_next_router_topk", il + 1);
             // Keep these IDs live until the trace reads them after graph execution.

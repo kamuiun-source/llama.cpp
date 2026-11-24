@@ -601,6 +601,26 @@ struct llama_moe_cache::impl {
     size_t next_prefetch_h2d_bytes = 0;
     size_t next_prefetch_d2d_bytes = 0;
     int64_t next_prefetch_wait_us = 0;
+    bool next_profile_enabled = false;
+    int64_t next_profile_start = 0;
+    uint64_t next_profile_graphs = 0;
+    uint64_t next_profile_failed = 0;
+    uint64_t next_profile_nodes = 0;
+    uint64_t next_profile_splits = 0;
+    uint64_t next_profile_hc_pre = 0;
+    uint64_t next_profile_hc_comb = 0;
+    uint64_t next_profile_hc_post = 0;
+    int64_t next_profile_graph_us = 0;
+    llama_expert_staging_telemetry next_profile_callback;
+    uint64_t next_profile_demand_count = 0;
+    uint64_t next_profile_demand_bytes = 0;
+    uint64_t next_profile_demand_waits = 0;
+    uint64_t next_profile_readbacks = 0;
+    int64_t next_profile_read_submit_us = 0;
+    int64_t next_profile_read_wait_us = 0;
+    int64_t next_profile_h2d_submit_us = 0;
+    int64_t next_profile_d2d_submit_us = 0;
+    uint64_t next_profile_prefetch_waits = 0;
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
     bool hip_mtp_slot_async = false;
     bool hip_mtp4_slot_async = false;
@@ -1023,6 +1043,10 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+            const char * next_profile = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE");
+            next_profile_enabled = next_profile && std::strcmp(next_profile, "1") == 0 &&
+                    model.arch == LLM_ARCH_QWEN4EXP && placement->hip_tuple_dma && placement->hip_mtp_verify_three &&
+                    !placement->hip_mtp_overlap && !placement->overlap;
             const char * next_prefetch = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH");
             if (next_prefetch && std::strcmp(next_prefetch, "1") == 0) {
                 const char * single_kernel = std::getenv("LLAMA_EXPERT_HIP_MTP3_SINGLE_KERNEL_OVERLAP");
@@ -2319,6 +2343,9 @@ struct llama_moe_cache::impl {
         }
         const int64_t start = ggml_time_us();
         ggml_backend_synchronize(next_prefetch_backend.get());
+        if (next_profile_start) {
+            ++next_profile_prefetch_waits;
+        }
         next_prefetch_wait_us += ggml_time_us() - start;
         next_prefetch_hits += hits;
         next_prefetch_unused += next_prefetch_count - hits;
@@ -2339,8 +2366,15 @@ struct llama_moe_cache::impl {
         constexpr int n_used = 10;
         std::array<int32_t, n_tokens * n_used> predicted;
         GGML_ASSERT(ggml_nbytes(prediction) == sizeof(predicted));
+        const int64_t read_start = next_profile_start ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, sizeof(predicted));
+        const int64_t wait_start = read_start ? ggml_time_us() : 0;
         ggml_backend_synchronize(producer);
+        if (read_start) {
+            ++next_profile_readbacks;
+            next_profile_read_submit_us += wait_start - read_start;
+            next_profile_read_wait_us += ggml_time_us() - wait_start;
+        }
 
         const int32_t target = il + 1;
         const auto & map = placement->maps[target];
@@ -2359,8 +2393,12 @@ struct llama_moe_cache::impl {
                 }
                 GGML_ASSERT(size_t(host_slot) < ggml_nbytes(tuple.host) / tuple.stride);
                 next_prefetch_layer = target;
+                const int64_t start = next_profile_start ? ggml_time_us() : 0;
                 ggml_backend_tensor_set_async(next_prefetch_backend.get(), next_prefetch_bank, host + host_slot * tuple.stride,
                         next_prefetch_count * tuple.stride, tuple.stride);
+                if (start) {
+                    next_profile_h2d_submit_us += ggml_time_us() - start;
+                }
                 next_prefetch_h2d_bytes += tuple.stride;
                 next_prefetch_ids[next_prefetch_count++] = expert;
                 if (next_prefetch_count == 1) {
@@ -2383,6 +2421,7 @@ struct llama_moe_cache::impl {
     }
 
     void copy_next_prefetch(const llama_expert_placement::tuple_bank & tuple, int32_t from, int32_t to) {
+        const int64_t start = next_profile_start ? ggml_time_us() : 0;
         auto * ctx = next_prefetch_views.get();
         auto * src = ggml_view_1d(ctx, next_prefetch_bank, tuple.stride, from * tuple.stride);
         auto * dst = ggml_view_1d(ctx, tuple.device, tuple.stride, to * tuple.stride);
@@ -2391,6 +2430,9 @@ struct llama_moe_cache::impl {
         }
         auto * backend = next_prefetch_backend.get();
         ggml_backend_tensor_copy_async(backend, backend, src, dst);
+        if (start) {
+            next_profile_d2d_submit_us += ggml_time_us() - start;
+        }
         next_prefetch_d2d_bytes += tuple.stride;
     }
 
@@ -2436,7 +2478,7 @@ struct llama_moe_cache::impl {
 
     size_t upload_packed(ggml_backend_t backend, const layer & l, int32_t il, bool cold,
                          bool * submitted = nullptr, size_t retry_bytes = 0, bool hip_async = false, bool hip_direct = false,
-                         bool fine_profile = false) {
+                         llama_expert_staging_telemetry * callback_totals = nullptr) {
         const bool tuple_dma = placement->hip_tuple_dma;
         GGML_ASSERT(!hip_async || ((cold || placement->hip_mtp_overlap || tuple_dma) && !submitted));
         GGML_ASSERT(!hip_direct || (!cold && !hip_async && !submitted && !retry_bytes));
@@ -2450,10 +2492,10 @@ struct llama_moe_cache::impl {
         size_t bytes = 0;
         size_t prefetch_hits = 0;
         const auto submit = [&](ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
-            const int64_t start = fine_profile ? ggml_time_us() : 0;
+            const int64_t start = callback_totals ? ggml_time_us() : 0;
             ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
-            if (fine_profile) {
-                packed_staging_totals.submit_us += ggml_time_us() - start;
+            if (callback_totals) {
+                callback_totals->submit_us += ggml_time_us() - start;
             }
             bytes += size;
         };
@@ -2473,6 +2515,10 @@ struct llama_moe_cache::impl {
                     }
                     const auto * data = static_cast<const uint8_t *>(tuple.host->data) + host_slot * tuple.stride;
                     submit(tuple.device, data, slot * tuple.stride, tuple.stride);
+                    if (next_profile_start) {
+                        ++next_profile_demand_count;
+                        next_profile_demand_bytes += tuple.stride;
+                    }
                     ++tuple_h2d_count;
                     tuple_h2d_payload_bytes += tuple.payload_bytes;
                     tuple_h2d_bytes += tuple.stride;
@@ -2484,7 +2530,7 @@ struct llama_moe_cache::impl {
                     const auto * data = packed_host_data(l, host, map.host[fill.expert], binding.packed_offset);
                     if (!hip_direct) {
                         GGML_ASSERT(stride <= staging_bytes - bytes);
-                        copy_upload_staging(staging + bytes, data, stride, retry_bytes, fine_profile);
+                        copy_upload_staging(staging + bytes, data, stride, retry_bytes, callback_totals != nullptr);
                         data = staging + bytes;
                     }
                     submit(cold ? binding.cold : binding.cached, data, slot * stride, stride);
@@ -2509,13 +2555,16 @@ struct llama_moe_cache::impl {
         }
         if (!hip_async && (!submitted || !*submitted)) {
             const bool trace_wait = !generation_trace_positions.empty();
-            const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy || fine_profile;
+            const bool measure_wait = hip_direct || trace_wait || profile_packed_ram_copy || callback_totals;
             const int64_t start = measure_wait ? ggml_time_us() : 0;
             ggml_backend_synchronize(backend);
             if (measure_wait) {
                 const uint64_t us = ggml_time_us() - start;
-                if (fine_profile) {
-                    packed_staging_totals.completion_us += us;
+                if (callback_totals) {
+                    callback_totals->completion_us += us;
+                }
+                if (next_profile_start) {
+                    ++next_profile_demand_waits;
                 }
                 if (profile_packed_ram_copy) {
                     packed_staging_totals.upload_wait_us += us;
@@ -2725,7 +2774,7 @@ struct llama_moe_cache::impl {
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool profile, bool early,
             ggml_backend_sched_t sched, bool fixed_mtp_pair, bool mtp_four) {
-        const int64_t callback_start = profile_packed_callback && !early ? ggml_time_us() : 0;
+        const int64_t callback_start = (profile_packed_callback || next_profile_start) && !early ? ggml_time_us() : 0;
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -2882,15 +2931,32 @@ struct llama_moe_cache::impl {
                 !placement->overlap && !placement->hip_mtp_overlap &&
                 (packed_staging || placement->hip_tuple_dma) && src == l.slot_map &&
                 ggml_nelements(sel) == 30;
+        auto & callback_totals = next_profile_start ? next_profile_callback : packed_staging_totals;
         struct callback_measurement {
             int64_t start;
+            llama_expert_staging_telemetry & totals;
+            llama_expert_staging_telemetry previous;
+            bool mirror;
             ~callback_measurement() {
                 if (start) {
-                    ++packed_staging_totals.callback_calls;
-                    packed_staging_totals.callback_us += ggml_time_us() - start;
+                    ++totals.callback_calls;
+                    totals.callback_us += ggml_time_us() - start;
+                }
+                if (mirror) {
+                    packed_staging_totals.callback_calls += totals.callback_calls - previous.callback_calls;
+                    packed_staging_totals.callback_us += totals.callback_us - previous.callback_us;
+                    packed_staging_totals.router_us += totals.router_us - previous.router_us;
+                    packed_staging_totals.plan_us += totals.plan_us - previous.plan_us;
+                    packed_staging_totals.submit_us += totals.submit_us - previous.submit_us;
+                    packed_staging_totals.completion_us += totals.completion_us - previous.completion_us;
+                    packed_staging_totals.promotion_us += totals.promotion_us - previous.promotion_us;
+                    packed_staging_totals.map_us += totals.map_us - previous.map_us;
                 }
             }
-        } callback_measure{fine_profile ? callback_start : 0};
+        };
+        const bool mirror_profile = fine_profile && next_profile_start && profile_packed_callback;
+        callback_measurement callback_measure{fine_profile ? callback_start : 0, callback_totals,
+            mirror_profile ? callback_totals : llama_expert_staging_telemetry{}, mirror_profile};
         const int64_t router_begin = fine_profile ? ggml_time_us() : 0;
         ids.resize(ggml_nelements(sel));
         if (use_waves && wave > 0) {
@@ -2913,7 +2979,7 @@ struct llama_moe_cache::impl {
 
         const int64_t plan_begin = fine_profile ? ggml_time_us() : 0;
         if (fine_profile) {
-            packed_staging_totals.router_us += plan_begin - router_begin;
+            callback_totals.router_us += plan_begin - router_begin;
         }
         if (placement) {
             const auto & map = placement->maps[il];
@@ -3292,7 +3358,7 @@ struct llama_moe_cache::impl {
             }
             const int32_t evict = placement->dynamic_resident && promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
             if (fine_profile) {
-                packed_staging_totals.plan_us += ggml_time_us() - plan_begin;
+                callback_totals.plan_us += ggml_time_us() - plan_begin;
             }
             const auto write_slot_map = [&] {
                 telemetry_scope scope(set_telemetry_cause, "slot_map");
@@ -3317,7 +3383,7 @@ struct llama_moe_cache::impl {
                     packed_synchronous_maps += defer_slot_map_requested;
                 }
                 if (fine_profile) {
-                    packed_staging_totals.map_us += ggml_time_us() - map_start;
+                    callback_totals.map_us += ggml_time_us() - map_start;
                 }
             };
             bool upload_submitted = false;
@@ -3349,7 +3415,7 @@ struct llama_moe_cache::impl {
                     }
                     if (!hip_single_kernel_submitted && !overlap_submitted && !fills.empty()) {
                         bytes = upload_packed(backend, l, il, false, can_defer ? &upload_submitted : nullptr,
-                                overlap_copied_bytes, false, hip_direct, fine_profile);
+                                overlap_copied_bytes, false, hip_direct, fine_profile ? &callback_totals : nullptr);
                     }
                 } catch (...) {
                     for (const auto & fill : fills) {
@@ -3384,7 +3450,7 @@ struct llama_moe_cache::impl {
                     promote_packed(l, il, promote_index, evict);
                 }
                 if (fine_profile) {
-                    packed_staging_totals.promotion_us += ggml_time_us() - promotion_start;
+                    callback_totals.promotion_us += ggml_time_us() - promotion_start;
                 }
             }
             if (gate_up_diag_ids && fixed_mtp_pair && src == l.slot_map && ids.size() == 20) {
@@ -3520,6 +3586,28 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (next_profile_enabled) {
+            const auto & c = next_profile_callback;
+            LLAMA_LOG_INFO("packed expert HIP next Router profile: phase=verify3 prefetch=%d graphs=%" PRIu64
+                    " failed=%" PRIu64 " graph_nodes=%" PRIu64 " splits=%" PRIu64 " scheduler_cpu_wall_us=%" PRId64
+                    " hc_pre_nodes=%" PRIu64 " hc_comb_nodes=%" PRIu64 " hc_post_nodes=%" PRIu64 "\n",
+                    next_prefetch_bank != nullptr, next_profile_graphs, next_profile_failed, next_profile_nodes,
+                    next_profile_splits, next_profile_graph_us, next_profile_hc_pre, next_profile_hc_comb, next_profile_hc_post);
+            LLAMA_LOG_INFO("packed expert HIP next Router profile: phase=verify3 layer_callbacks=%" PRIu64
+                    " callback_cpu_wall_us=%" PRIu64 " router_read_cpu_wall_us=%" PRIu64 " plan_cpu_wall_us=%" PRIu64
+                    " promotion_cpu_wall_us=%" PRIu64 " slot_map_cpu_wall_us=%" PRIu64 "\n",
+                    c.callback_calls, c.callback_us, c.router_us, c.plan_us, c.promotion_us, c.map_us);
+            LLAMA_LOG_INFO("packed expert HIP next Router profile: phase=verify3 demand_h2d_tuples=%" PRIu64
+                    " demand_h2d_bytes=%" PRIu64 " demand_h2d_submit_cpu_us=%" PRIu64 " demand_stream_waits=%" PRIu64
+                    " demand_stream_cpu_wait_us=%" PRIu64 "\n", next_profile_demand_count, next_profile_demand_bytes,
+                    c.submit_us, next_profile_demand_waits, c.completion_us);
+            LLAMA_LOG_INFO("packed expert HIP next Router profile: phase=verify3 prediction_reads=%" PRIu64
+                    " prediction_read_submit_cpu_us=%" PRId64 " prediction_producer_cpu_wait_us=%" PRId64
+                    " prefetch_h2d_submit_cpu_us=%" PRId64 " hit_d2d_submit_cpu_us=%" PRId64
+                    " prefetch_stream_waits=%" PRIu64 " prefetch_stream_cpu_wait_us=%" PRId64 "\n",
+                    next_profile_readbacks, next_profile_read_submit_us, next_profile_read_wait_us, next_profile_h2d_submit_us,
+                    next_profile_d2d_submit_us, next_profile_prefetch_waits, next_prefetch_wait_us);
+        }
         if (next_prefetch_bank) {
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: launches=%zu hits=%zu unused=%zu h2d_bytes=%zu d2d_bytes=%zu wait_us=%" PRId64 "\n",
                     next_prefetch_launches, next_prefetch_hits, next_prefetch_unused,
@@ -3851,6 +3939,28 @@ void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *
 void llama_moe_cache::end_next_router_prefetch() {
     pimpl->finish_next_prefetch();
     pimpl->next_prefetch_predictions = nullptr;
+}
+
+bool llama_moe_cache::next_router_profile_enabled() const {
+    return pimpl->next_profile_enabled;
+}
+
+void llama_moe_cache::begin_next_router_profile() {
+    GGML_ASSERT(!pimpl->next_profile_start);
+    pimpl->next_profile_start = ggml_time_us();
+}
+
+void llama_moe_cache::end_next_router_profile(int nodes, int splits, int hc_pre, int hc_comb, int hc_post, bool success) {
+    auto & self = *pimpl;
+    self.next_profile_graph_us += ggml_time_us() - self.next_profile_start;
+    self.next_profile_start = 0;
+    ++self.next_profile_graphs;
+    self.next_profile_failed += !success;
+    self.next_profile_nodes += nodes;
+    self.next_profile_splits += splits;
+    self.next_profile_hc_pre += hc_pre;
+    self.next_profile_hc_comb += hc_comb;
+    self.next_profile_hc_post += hc_post;
 }
 
 void llama_moe_cache::trace_next_router(int32_t il, const ggml_tensor * ids) {

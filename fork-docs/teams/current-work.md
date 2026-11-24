@@ -6,6 +6,8 @@
 
 ## 現在の状態
 
+- 次層Expert先読みの比較ログ `LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` を追加。固定3幅の生成検証に絞り、スケジューラ分割とHCノード数、通常H2D、予測IDの読み出し、先読みH2D・ヒットD2Dを比較する。保存済み起動ログではHC pre・comb・postは先読みON/OFFとも有効。GPU時間とカーネル回数は既存プロファイラーで別計測する。[計測設定](../rocm/09-single-bank-mtp3.md#次層expert先読み単体のonoff計測)
+
 - Astraが次層Expert先読みのスワップをレビュー。明示的なホストのExpert複製や継続的な割り当て増加は確認できず、退避の一部は既存cuBLASLtの書き込み領域と特定。先読みONのまま `--ctx-checkpoints 2` で5問を3回測り、応答中スワップアウトは0、155.36、0 MiB。チェックポイント削減後も再現した。[コードレビューと実測](../rocm/09-single-bank-mtp3.md#先読みonのスワップアウトをastraがレビュー)
 
 - 共有10枠での実際の次層Expert先読みを試作した。固定3幅の5問でOFF→ONの出力・MTP採用は一致。使用8,595件、未使用20,213件、Expert H2Dは51.46→90.07 GiB、生成38.42→34.16 tok/s。ONには応答中スワップアウト45.10 MiBもあり、通常起動はOFF。[実装と実測](../rocm/09-single-bank-mtp3.md#共有10枠で実際に次層のexpertを先読みする試作)

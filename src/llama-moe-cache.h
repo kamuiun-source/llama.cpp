@@ -36,6 +36,9 @@ public:
     bool next_router_prefetch_enabled() const;
     void begin_next_router_prefetch(const std::vector<ggml_tensor *> & predictions);
     void end_next_router_prefetch();
+    bool next_router_profile_enabled() const;
+    void begin_next_router_profile();
+    void end_next_router_profile(int nodes, int splits, int hc_pre, int hc_comb, int hc_post, bool success);
     void record_decode_width(uint32_t tokens);
     void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;

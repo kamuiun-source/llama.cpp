@@ -2154,16 +2154,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    ggml_status status;
+    ggml_status status = GGML_STATUS_FAILED;
     {
         struct prefetch_scope {
             llama_moe_cache * cache;
+            llama_moe_cache * profile_cache;
+            ggml_backend_sched_t sched;
+            const llm_graph_result * res;
+            const ggml_status & status;
             ~prefetch_scope() {
                 if (cache) {
                     cache->end_next_router_prefetch();
                 }
+                if (profile_cache) {
+                    int hc_pre = 0, hc_comb = 0, hc_post = 0;
+                    for (const auto & node : res->get_fused_nodes()) {
+                        hc_pre  += node.op == LLM_FUSED_OP_DSV4_HC_PRE;
+                        hc_comb += node.op == LLM_FUSED_OP_DSV4_HC_COMB;
+                        hc_post += node.op == LLM_FUSED_OP_DSV4_HC_POST;
+                    }
+                    profile_cache->end_next_router_profile(ggml_graph_n_nodes(res->get_gf()),
+                            ggml_backend_sched_get_n_splits(sched), hc_pre, hc_comb, hc_post, status == GGML_STATUS_SUCCESS);
+                }
             }
-        } prefetch{!res->t_next_router.empty() && moe_cache->next_router_prefetch_enabled() ? moe_cache.get() : nullptr};
+        } prefetch{
+            !res->t_next_router.empty() && moe_cache->next_router_prefetch_enabled() ? moe_cache.get() : nullptr,
+            !cparams.warmup && target_mtp_verify_width == 3 && gparams.target_mtp_verify_packed &&
+                    moe_cache && moe_cache->next_router_profile_enabled() ? moe_cache.get() : nullptr,
+            sched.get(), res, status,
+        };
+        if (prefetch.profile_cache) {
+            prefetch.profile_cache->begin_next_router_profile();
+        }
         if (prefetch.cache) {
             prefetch.cache->begin_next_router_prefetch(res->t_next_router);
         }
