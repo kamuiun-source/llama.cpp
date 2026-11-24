@@ -1029,7 +1029,7 @@ static constexpr int iq_lds_activation_blocks = iq_lds_ncols / QK8_1;
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false,
-          int iq_lds_tokens = 0, int iq_lds_row_groups = 1>
+          int iq_lds_tokens = 0, int iq_row_groups = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1050,7 +1050,8 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
 
-    static_assert(iq_lds_row_groups == 1 || (iq_lds_row_groups == 2 && iq_lds_tokens == 3));
+    static_assert(iq_row_groups == 1 || (iq_row_groups == 2 && (iq_lds_tokens == 3 ||
+        (iq_lds_tokens == 0 && type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion && !compact && packed_signs))));
 
     using grid_entry = std::conditional_t<type == GGML_TYPE_IQ2_S, uint64_t, uint32_t>;
     const grid_entry * staged_grid = nullptr;
@@ -1139,8 +1140,8 @@ static __global__ void mul_mat_vec_q_moe(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
 
 #pragma unroll 1
-    for (int group = 0; group < iq_lds_row_groups; ++group) {
-        const int row0 = c_rows_per_block*(iq_lds_row_groups*blockIdx.x + group);
+    for (int group = 0; group < iq_row_groups; ++group) {
+        const int row0 = c_rows_per_block*(iq_row_groups*blockIdx.x + group);
         const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
         // partial sum for each thread
@@ -1419,9 +1420,9 @@ static void mul_mat_vec_q_moe_launch(
             const auto launch = [&](auto lds, auto groups) {
                 constexpr int lds_tokens = decltype(lds)::value;
                 constexpr int row_groups = decltype(groups)::value;
-                const dim3 block_nums_lds(row_groups == 1 ? block_nums.x : nrows_x / (rows_per_block*row_groups), block_nums.y);
-                const ggml_cuda_kernel_launch_params launch_params_lds(block_nums_lds, block_dims, 0, stream);
-                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true, lds_tokens, row_groups>, launch_params_lds,
+                const dim3 block_nums_iq(row_groups == 1 ? block_nums.x : nrows_x / (rows_per_block*row_groups), block_nums.y);
+                const ggml_cuda_kernel_launch_params launch_params_iq(block_nums_iq, block_dims, 0, stream);
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, true, lds_tokens, row_groups>, launch_params_iq,
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                     stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                     ncols_dst, ids_stride, compact_moe_routes{});
@@ -1437,19 +1438,39 @@ static void mul_mat_vec_q_moe_launch(
                         return true;
                     }();
                     GGML_UNUSED(logged_lds);
+                } else if constexpr (row_groups == 2) {
+                    static const bool logged_groups = [] {
+                        GGML_LOG_INFO("HIP gfx906 IQ2_S routed SwiGLU without LDS prefetch applied: positions=3 row_groups=2\n");
+                        return true;
+                    }();
+                    GGML_UNUSED(logged_groups);
                 }
             };
+            bool use_no_lds_row_groups = false;
+            if constexpr (type == GGML_TYPE_IQ2_S) {
+                static const bool no_lds_row_groups = [] {
+                    const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_NO_LDS_ROW_GROUPS");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                use_no_lds_row_groups = no_lds_row_groups && ncols_dst == 3 && nrows_x % (2*rows_per_block) == 0;
+            }
             static const bool lds_prefetch = [] {
-                const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
+                const char * value = std::getenv(type == GGML_TYPE_IQ2_S ?
+                    "GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH" : "GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
                 return value && std::strcmp(value, "1") == 0;
             }();
             const bool use_lds = lds_prefetch && stride_col_y == iq_lds_activation_blocks &&
                 (type == GGML_TYPE_IQ3_XXS || ncols_dst == 3);
-            if (!use_lds) {
+            if (use_no_lds_row_groups) {
+                if constexpr (type == GGML_TYPE_IQ2_S) {
+                    launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{});
+                }
+            } else if (!use_lds) {
                 launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
             } else if (ncols_dst == 3) {
                 static const bool lds_row_groups = [] {
-                    const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
+                    const char * value = std::getenv(type == GGML_TYPE_IQ2_S ?
+                        "GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS" : "GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
                     return value && std::strcmp(value, "1") == 0;
                 }();
                 if (lds_row_groups && nrows_x % (2*rows_per_block) == 0) {
