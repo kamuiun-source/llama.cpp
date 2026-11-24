@@ -12,6 +12,8 @@
 
 ### Linux ROCmのIQ2_S LDS横展開
 
+- 固定3幅・LDSなし2行のIQ2_S gate/up＋SwiGLUに `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` を試作。正式採用設定ONの固定5問は45.18→45.56 tok/sで、全640生成ID・本文、MTP 358/549が一致。実3位置のIQ2_S融合は平均4.877→4.344 ms/検証（273検証・7,098カーネル）。通常実行は各1回、トレース条件は基準と一部異なる。試作は既定OFF。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
+
 - 現在の作業先は `codex/rocm-castagna-port`。各移植の測定、LDS切り替え、スワップ再検証、別ブランチのExpert並行転送、移植ブランチに戻した後のビルドは[計測索引](../rocm/10-decode-pipeline.md#移植ブランチの計測索引)から参照する。
 
 - `codex/rocm-castagna-port` で、固定3幅のgfx906 IQ2_S gate/up＋SwiGLUへLDS先読みと出力4行を追加。既存のIQ3_XXS用LDSフラグ2つを共用。MI50の合成入力で3構成の19,200出力がビット一致した。固定5問の実モデル10回は全完走し、発動・生成ID・本文・MTP採用数を確認。合算は追加前の保存済み20回の39.44 tok/sに対して36.59 tok/s。I/O待ちやスワップインの増えた回があり、カーネル単体の速度差は未分離。 [移植メモ](../rocm/10-decode-pipeline.md#固定3幅のiq2_sへの横展開)
