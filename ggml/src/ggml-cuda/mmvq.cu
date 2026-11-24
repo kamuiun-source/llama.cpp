@@ -1021,15 +1021,15 @@ struct compact_moe_routes {
     uint8_t lanes[30]{};
 };
 
-static constexpr int iq3_lds_ncols = 2560;
-static constexpr int iq3_lds_activation_blocks = iq3_lds_ncols / QK8_1;
+static constexpr int iq_lds_ncols = 2560;
+static constexpr int iq_lds_activation_blocks = iq_lds_ncols / QK8_1;
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool compact = false, bool packed_signs = false,
-          int iq3_lds_tokens = 0, int iq3_lds_row_groups = 1>
+          int iq_lds_tokens = 0, int iq_lds_row_groups = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1050,21 +1050,28 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<packed_signs>(type);
 
-    static_assert(iq3_lds_row_groups == 1 || (iq3_lds_row_groups == 2 && iq3_lds_tokens == 3));
+    static_assert(iq_lds_row_groups == 1 || (iq_lds_row_groups == 2 && iq_lds_tokens == 3));
 
-    const uint32_t * staged_grid = nullptr;
+    using grid_entry = std::conditional_t<type == GGML_TYPE_IQ2_S, uint64_t, uint32_t>;
+    const grid_entry * staged_grid = nullptr;
     const block_q8_1 * staged_y = nullptr;
-    if constexpr (iq3_lds_tokens != 0) {
-        static_assert(iq3_lds_tokens == 2 || iq3_lds_tokens == 3);
-        static_assert(type == GGML_TYPE_IQ3_XXS && c_rows_per_block == 2 && has_fusion && !compact && packed_signs);
+    if constexpr (iq_lds_tokens != 0) {
+        static_assert((type == GGML_TYPE_IQ2_S && iq_lds_tokens == 3) ||
+                      (type == GGML_TYPE_IQ3_XXS && (iq_lds_tokens == 2 || iq_lds_tokens == 3)));
+        static_assert(c_rows_per_block == 2 && has_fusion && !compact && packed_signs);
         static_assert(sizeof(block_q8_1) % sizeof(uint32_t) == 0 && alignof(block_q8_1) <= alignof(uint32_t));
-        constexpr int grid_size = 256;
-        constexpr int activation_words = iq3_lds_activation_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
-        __shared__ uint32_t grid[grid_size];
-        __shared__ uint32_t activation[iq3_lds_tokens][activation_words];
+        constexpr int grid_size = type == GGML_TYPE_IQ2_S ?
+            sizeof(iq2s_grid) / sizeof(iq2s_grid[0]) : sizeof(iq3xxs_grid) / sizeof(iq3xxs_grid[0]);
+        constexpr int activation_words = iq_lds_activation_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
+        __shared__ grid_entry grid[grid_size];
+        __shared__ uint32_t activation[iq_lds_tokens][activation_words];
 
-        for (int i = threadIdx.y * warp_size + threadIdx.x; i < grid_size; i += iq3_lds_tokens * warp_size) {
-            grid[i] = iq3xxs_grid[i];
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < grid_size; i += iq_lds_tokens * warp_size) {
+            if constexpr (type == GGML_TYPE_IQ2_S) {
+                grid[i] = iq2s_grid[i];
+            } else {
+                grid[i] = iq3xxs_grid[i];
+            }
         }
         const auto * src = reinterpret_cast<const uint32_t *>(static_cast<const block_q8_1 *>(vy) + threadIdx.y * stride_col_y);
         auto * token_activation = activation[threadIdx.y];
@@ -1132,41 +1139,42 @@ static __global__ void mul_mat_vec_q_moe(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
 
 #pragma unroll 1
-    for (int group = 0; group < iq3_lds_row_groups; ++group) {
-        const int row0 = c_rows_per_block*(iq3_lds_row_groups*blockIdx.x + group);
+    for (int group = 0; group < iq_lds_row_groups; ++group) {
+        const int row0 = c_rows_per_block*(iq_lds_row_groups*blockIdx.x + group);
         const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
         // partial sum for each thread
         float tmp[c_rows_per_block] = {0.0f};
         float tmp_gate[c_rows_per_block] = {0.0f};
 
-        if constexpr (iq3_lds_tokens != 0) {
+        if constexpr (iq_lds_tokens != 0) {
             const int kbx = threadIdx.x / (qi/vdr);
             const int kqs = vdr * (threadIdx.x % (qi/vdr));
             const int kbx_next = kbx + blocks_per_iter;
             const bool has_next = kbx_next < blocks_per_row_x;
-            const auto * up = static_cast<const block_iq3_xxs *>(vx) + kbx_offset;
-            const auto * gate = static_cast<const block_iq3_xxs *>(vgate) + kbx_offset;
+            using block_iq = std::conditional_t<type == GGML_TYPE_IQ2_S, block_iq2_s, block_iq3_xxs>;
+            const auto * up = static_cast<const block_iq *>(vx) + kbx_offset;
+            const auto * gate = static_cast<const block_iq *>(vgate) + kbx_offset;
             const auto * activation = staged_y + kqs/2;
 
 #pragma unroll
             for (int i = 0; i < c_rows_per_block; ++i) {
                 const int row = i * stride_row_x;
-                const auto up_current = load_iq3_xxs_mmvq_weights(up[row + kbx], kqs);
-                const auto gate_current = load_iq3_xxs_mmvq_weights(gate[row + kbx], kqs);
-                iq3_xxs_mmvq_weights up_next, gate_next;
+                const auto up_current = load_iq_mmvq_weights(up[row + kbx], kqs);
+                const auto gate_current = load_iq_mmvq_weights(gate[row + kbx], kqs);
+                decltype(load_iq_mmvq_weights(up[row + kbx], kqs)) up_next, gate_next;
                 if (has_next) {
-                    up_next = load_iq3_xxs_mmvq_weights(up[row + kbx_next], kqs);
-                    gate_next = load_iq3_xxs_mmvq_weights(gate[row + kbx_next], kqs);
+                    up_next = load_iq_mmvq_weights(up[row + kbx_next], kqs);
+                    gate_next = load_iq_mmvq_weights(gate[row + kbx_next], kqs);
                 }
 
                 const auto & current = activation[kbx * (qk/QK8_1)];
-                tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_current, current, staged_grid);
-                tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_current, current, staged_grid);
+                tmp[i] += vec_dot_iq_q8_1_loaded<packed_signs>(up_current, current, staged_grid);
+                tmp_gate[i] += vec_dot_iq_q8_1_loaded<packed_signs>(gate_current, current, staged_grid);
                 if (has_next) {
                     const auto & next = activation[kbx_next * (qk/QK8_1)];
-                    tmp[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(up_next, next, staged_grid);
-                    tmp_gate[i] += vec_dot_iq3_xxs_q8_1_loaded<packed_signs>(gate_next, next, staged_grid);
+                    tmp[i] += vec_dot_iq_q8_1_loaded<packed_signs>(up_next, next, staged_grid);
+                    tmp_gate[i] += vec_dot_iq_q8_1_loaded<packed_signs>(gate_next, next, staged_grid);
                 }
             }
         } else {
@@ -1403,7 +1411,7 @@ static void mul_mat_vec_q_moe_launch(
 
 #ifdef GGML_USE_HIP
     if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
-        if ((ncols_dst == 2 || ncols_dst == 3) && ncols_x == iq3_lds_ncols && nrows_x == 640 && nchannels_dst == 10 &&
+        if ((ncols_dst == 2 || ncols_dst == 3) && ncols_x == iq_lds_ncols && nrows_x == 640 && nchannels_dst == 10 &&
                 nchannels_y.z == 1 &&
                 fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU && !fusion.x_bias && !fusion.gate_bias &&
                 !fusion.x_scale && !fusion.gate_scale && !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
@@ -1419,42 +1427,38 @@ static void mul_mat_vec_q_moe_launch(
                     ncols_dst, ids_stride, compact_moe_routes{});
                 if constexpr (lds_tokens != 0) {
                     static const bool logged_lds = [] {
+                        constexpr const char * type_name = type == GGML_TYPE_IQ2_S ? "IQ2_S" : "IQ3_XXS";
                         if constexpr (row_groups == 2) {
-                            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU LDS prefetch applied: positions=%d row_groups=%d\n",
-                                    lds_tokens, row_groups);
+                            GGML_LOG_INFO("HIP gfx906 %s routed SwiGLU LDS prefetch applied: positions=%d row_groups=%d\n",
+                                    type_name, lds_tokens, row_groups);
                         } else {
-                            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU LDS prefetch applied: positions=%d\n", lds_tokens);
+                            GGML_LOG_INFO("HIP gfx906 %s routed SwiGLU LDS prefetch applied: positions=%d\n", type_name, lds_tokens);
                         }
                         return true;
                     }();
                     GGML_UNUSED(logged_lds);
                 }
             };
-            bool use_lds = false;
-            if constexpr (type == GGML_TYPE_IQ3_XXS) {
-                static const bool lds_prefetch = [] {
-                    const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
-                use_lds = lds_prefetch && stride_col_y == iq3_lds_activation_blocks;
-                if (use_lds) {
-                    if (ncols_dst == 2) {
-                        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
-                    } else {
-                        static const bool lds_row_groups = [] {
-                            const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
-                            return value && std::strcmp(value, "1") == 0;
-                        }();
-                        if (lds_row_groups && nrows_x % (2*rows_per_block) == 0) {
-                            launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
-                        } else {
-                            launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});
-                        }
-                    }
-                }
-            }
+            static const bool lds_prefetch = [] {
+                const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            const bool use_lds = lds_prefetch && stride_col_y == iq_lds_activation_blocks &&
+                (type == GGML_TYPE_IQ3_XXS || ncols_dst == 3);
             if (!use_lds) {
                 launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
+            } else if (ncols_dst == 3) {
+                static const bool lds_row_groups = [] {
+                    const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                if (lds_row_groups && nrows_x % (2*rows_per_block) == 0) {
+                    launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
+                } else {
+                    launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});
+                }
+            } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+                launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
             }
             static std::once_flag logged[2];
             std::call_once(logged[ncols_dst - 2], [ncols_dst] {
