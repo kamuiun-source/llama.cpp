@@ -14,6 +14,11 @@ extern "C" void setup_hip(int device, void * shared, size_t shared_bytes, size_t
 extern "C" void map_hip_ticket(void * host_ticket);
 extern "C" void fill_hip(const void * expected, size_t bytes);
 extern "C" void copy_from_hip(void * shared, size_t bytes);
+extern "C" void setup_hip_add(void * raw, size_t payload_offset, const float * rhs, size_t bytes, bool map, size_t expert_bytes);
+extern "C" void fill_hip_add(const float * lhs, size_t bytes);
+extern "C" void copy_hip_expert(size_t bytes);
+extern "C" void launch_hip_add(size_t count, bool direct);
+extern "C" void blit_from_hip(size_t count);
 extern "C" void signal_hip(uint32_t value);
 extern "C" void sync_hip();
 extern "C" void cleanup_hip(void * shared);
@@ -47,15 +52,29 @@ int main(int argc, char ** argv) {
     const bool baseline = std::strcmp(mode, "both") == 0 || std::strcmp(mode, "cpu") == 0;
     const bool doorbell = std::strcmp(mode, "both") == 0 || std::strcmp(mode, "gpu") == 0 || std::strcmp(mode, "gpu-flush") == 0;
     const bool flush = std::strcmp(mode, "gpu-flush") == 0;
-    if ((!baseline && !doorbell) || argc > 7) {
+    const bool add_all = std::strcmp(mode, "add-all") == 0;
+    const bool add_sdma = add_all || std::strcmp(mode, "add-sdma") == 0;
+    const bool add_blit = add_all || std::strcmp(mode, "add-blit") == 0;
+    const bool add_mapped = add_all || std::strcmp(mode, "add-mapped") == 0;
+    const bool add = add_sdma || add_blit || add_mapped;
+    constexpr size_t add_count = 3 * 2560;
+    constexpr size_t add_bytes = add_count * sizeof(float);
+    if ((!baseline && !doorbell && !add) || argc > (add ? 8 : 7)) {
         std::fprintf(stderr, "usage: %s [both|cpu|gpu|gpu-flush] [bytes=30720] [samples=3000] [warmup=100] [hip=0] [cuda=0]\n", argv[0]);
+        std::fprintf(stderr, "       %s {add-all|add-sdma|add-blit|add-mapped} [bytes=30720] [samples=3000] [warmup=100] [hip=0] [cuda=0] [expert_mib=0|2]\n", argv[0]);
         return 1;
     }
-    const size_t bytes = argc > 2 ? number(argv[2], 1, 16*1024*1024) : 30720;
+    const size_t bytes = argc > 2 ? number(argv[2], 1, 16*1024*1024) : add_bytes;
     const unsigned samples = argc > 3 ? number(argv[3], 1, 100000) : 3000;
     const unsigned warmup = argc > 4 ? number(argv[4], 0, 10000) : 100;
     const int amd = argc > 5 ? number(argv[5], 0, 255) : 0;
     const int nvidia = argc > 6 ? number(argv[6], 0, 255) : 0;
+    const unsigned expert_mib = argc > 7 ? number(argv[7], 0, 2) : 0;
+    if (add && (bytes != add_bytes || expert_mib == 1)) {
+        std::fprintf(stderr, "add modes require %zu bytes and expert_mib of 0 or 2\n", add_bytes);
+        return 1;
+    }
+    const size_t expert_bytes = expert_mib * 1024u * 1024u;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         std::fprintf(stderr, "failure stage=sysconf(page_size)\n");
@@ -94,31 +113,64 @@ int main(int argc, char ** argv) {
     check(cuMemHostRegister(raw, total, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP), "cuMemHostRegister");
     std::printf("# dual_registered=%zu page=%zu ticket_offset=0 payload_offset=%zu payload_bytes=%zu samples=%u warmup=%u\n",
             total, page, page, bytes, samples, warmup);
-    std::printf("# latency=host_steady_clock_before_amd_d2h_enqueue_to_after_rtx_stream_sync verification=outside_timer\n");
+    std::vector<float> lhs(add ? add_count : 0), rhs(add ? add_count : 0);
+    if (add) {
+        for (size_t j = 0; j < rhs.size(); ++j) {
+            rhs[j] = (int(j % 257) - 128) * 0.25f;
+        }
+        setup_hip_add(raw, page, rhs.data(), bytes, add_blit || add_mapped, expert_bytes);
+        std::printf("# latency=host_steady_clock_before_hip_add_submit_to_after_rtx_stream_sync verification=outside_timer\n");
+        std::printf("# add_shape=3x2560_fp32 producer_sync=hipStreamSynchronize expert_h2d_bytes=%zu\n", expert_bytes);
+        if (expert_bytes) {
+            std::printf("# expert_h2d=same_hip_stream_enqueued_before_timer residual_wait=inside_timer\n");
+        }
+    } else {
+        std::printf("# latency=host_steady_clock_before_amd_d2h_enqueue_to_after_rtx_stream_sync verification=outside_timer\n");
+    }
 
     uint32_t ticket = 0;
     CUdeviceptr cuda_ticket = 0;
     std::vector<uint8_t> expected(bytes), received(bytes);
-    auto run = [&](const char * label, bool use_doorbell) {
+    auto run = [&](const char * label, bool use_doorbell, bool blit = false, bool direct = false) {
         std::printf("# stage=%s begin\n", label);
         std::vector<int64_t> timings;
         timings.reserve(samples);
         for (unsigned i = 0; i < warmup + samples; ++i) {
-            ++ticket;
-            uint32_t value = ticket * 0x9e3779b9u;
-            for (auto & byte : expected) {
-                value ^= value << 13;
-                value ^= value >> 17;
-                value ^= value << 5;
-                byte = value >> 24;
+            if (add) {
+                for (size_t j = 0; j < lhs.size(); ++j) {
+                    const uint32_t bits = (i * 0x9e3779b9u + uint32_t(j) * 0x85ebca6bu) & 0x7fffffu;
+                    lhs[j] = (int(bits) - 0x400000) * 0.125f;
+                    const float sum = lhs[j] + rhs[j];
+                    std::memcpy(expected.data() + j * sizeof(sum), &sum, sizeof(sum));
+                }
+                fill_hip_add(lhs.data(), bytes);
+            } else {
+                ++ticket;
+                uint32_t value = ticket * 0x9e3779b9u;
+                for (auto & byte : expected) {
+                    value ^= value << 13;
+                    value ^= value >> 17;
+                    value ^= value << 5;
+                    byte = value >> 24;
+                }
+                fill_hip(expected.data(), bytes);
             }
-            fill_hip(expected.data(), bytes);
             using clock = std::chrono::steady_clock;
             if (i == 0) {
-                std::fprintf(stderr, "stage=%s first_handoff enqueue_amd_d2h\n", label);
+                std::fprintf(stderr, "stage=%s first_handoff %s\n", label, add ? "submit_hip_add" : "enqueue_amd_d2h");
+            }
+            if (expert_bytes) {
+                copy_hip_expert(expert_bytes);
             }
             const auto start = clock::now();
-            copy_from_hip(shared, bytes);
+            if (add) {
+                launch_hip_add(add_count, direct);
+            }
+            if (blit) {
+                blit_from_hip(add_count);
+            } else if (!direct) {
+                copy_from_hip(shared, bytes);
+            }
             if (use_doorbell) {
                 signal_hip(ticket);
                 const unsigned flags = static_cast<unsigned>(CU_STREAM_WAIT_VALUE_EQ) | (flush ? static_cast<unsigned>(CU_STREAM_WAIT_VALUE_FLUSH) : 0u);
@@ -127,7 +179,7 @@ int main(int argc, char ** argv) {
                 sync_hip();
             }
             check(cuMemcpyHtoDAsync(destination, shared, bytes, stream), "cuMemcpyHtoDAsync(RTX_payload)");
-            if (i == 0) {
+            if (i == 0 && !add) {
                 std::fprintf(stderr, "stage=%s first_handoff queued_wait_and_payload joining_rtx\n", label);
             }
             check(cuStreamSynchronize(stream), "cuStreamSynchronize(RTX_payload)");
@@ -153,6 +205,15 @@ int main(int argc, char ** argv) {
                 static_cast<long long>(percentile(50)), static_cast<long long>(percentile(99)),
                 static_cast<long long>(timings.back()), samples + warmup);
     };
+    if (add_sdma) {
+        run("add-sdma", false);
+    }
+    if (add_blit) {
+        run("add-blit", false, true);
+    }
+    if (add_mapped) {
+        run("add-mapped", false, false, true);
+    }
     if (baseline) {
         run("cpu", false);
     }
