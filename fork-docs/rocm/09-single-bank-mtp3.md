@@ -352,6 +352,16 @@ Linuxはページ移動でも `MMU_NOTIFY_CLEAR` を発行する。通常の匿�
 
 当該ホストの `vm.compact_unevictable_allowed` は1。カーネル文書によると、この設定では `mlock` 済みページもコンパクションの走査対象にできる。切り分ける場合は、Expert領域に交差する `amdgpu_hmm_invalidate_hsa` に限定して、コンパクション・THPそれぞれの呼び出しスタックを少数保存する。設定変更で比較するなら、この値だけを一時的に0にする方法もある。ホスト全体の連続メモリ確保に作用する設定で、今回のレビューでは変更していない。[Linux VM設定](https://docs.kernel.org/admin-guide/sysctl/vm.html#compact-unevictable-allowed)
 
+###### Expert原本を無効化した呼び出しスタックを採取
+
+同じビルド・両方OFFで再実行。層0〜9の約3.82 GiBのExpert原本を確保した時点と各応答の開始時点で、そのアドレス範囲に交差する無効化に限定してスタックを採取した。回収スタック・無効化アドレス・無効化の呼び出し元は別々のリングに記録し、第2問で最初のコンテナのスワップアウト11.84 MiBを検知して保存した。
+
+- 第2問の最初の増加を観測したサンプル窓の約5 ms前に、`kcompactd → compact_node → compact_zone → migrate_pages → try_to_migrate_one → amdgpu_hmm_invalidate_hsa` を採取した。バックグラウンドのコンパクションが、対象原本のページ移動に伴う無効化を発行した。
+- モデル読み込み後と第1問では、`amdgpu_amdkfd_restore_userptr_worker → amdgpu_hmm_range_get_pages → __alloc_pages_direct_compact → compact_zone → try_to_migrate_one → amdgpu_hmm_invalidate_hsa` も採取した。モデル読み込み後の3件では、同じワーカーが別のExpert原本（約3.78 GiB）のページ情報を再取得した直後に、対象の約3.82 GiBを無効化していた。復元時の確保による直接コンパクションが別の原本を無効化する経路も実測で確認した。
+- 第2問の最初の増加区間の回収要求は2件。1件は別のExpert原本のAMD GPU復元処理、もう1件はブラウザーのAMD GPUバッファ確保。複数の発行元が存在し、11.84 MiBすべてを単独の要求に帰属させることはできない。
+
+5問は完走、cgroupの応答中スワップアウトは82.65 MiB。採ったスタック・アドレス・トリガ時刻はGit外の `/home/t-saka/rocm-expert-hit-wait-20261124/both-off-invalidation-origin/`、応答時系列は `session-batch-07/`。ページの固定を維持し、ホスト設定の変更は実施していない。
+
 ###### 先読みOFFで発生したスワップの既存経路をAstraが確認
 
 固定3幅では本体の recurrent rollback が2位置分に対応し、ドラフトは最大2候補。検証ごとに `common_sampler_clone()` で最大約2.84 MiBの候補配列（248,320語）を一時複製するが、この構成では退避したサンプラーを復元する分岐に入らない。複製は各検証で解放するため、累積のコピー量はヒープの常駐増加や今回のスワップ原因を示さない。本体の検証ごとのチェックポイント保存も同じ幅条件でスキップされる。プリフィルで保存する112.61 MiBの通常チェックポイントは別経路で、第5問の最初のトークンより前に既存の1個を入れ替えている。
