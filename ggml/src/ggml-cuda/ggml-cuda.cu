@@ -953,7 +953,15 @@ static bool ggml_hip_expert_stream_wait_enabled() {
     return enabled;
 }
 
-static std::atomic<uint64_t> ggml_hip_expert_stream_wait_counts[ggml_hip_expert_overlap::max_uploads] = {};
+bool ggml_hip_expert_stream_wait_after_q8_enabled() {
+    static const bool enabled = ggml_hip_expert_stream_wait_enabled() && [] {
+        const char * value = std::getenv("GGML_HIP_MTP3_EXPERT_STREAM_EVENT_WAIT_AFTER_Q8");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static std::atomic<uint64_t> ggml_hip_expert_stream_wait_counts[2][ggml_hip_expert_overlap::max_uploads] = {};
 
 static uint64_t ggml_hip_expert_boottime_ns() {
     struct timespec time;
@@ -971,7 +979,8 @@ static void ggml_hip_expert_log_timeline(const ggml_hip_expert_overlap & plan, u
             phase, static_cast<const void *>(&plan), sequence, bank_name, plan.cold.count, start_ns, end_ns);
 }
 
-static void ggml_hip_expert_wait_on_stream(ggml_hip_expert_overlap & plan, hipStream_t stream, bool timeline) {
+void ggml_hip_expert_wait_on_stream(ggml_hip_expert_overlap & plan, hipStream_t stream, bool after_q8) {
+    const bool timeline = ggml_hip_expert_timeline_enabled();
     const uint64_t begin = timeline ? ggml_hip_expert_boottime_ns() : 0;
     // The final event follows every tuple copy. The single-copy scheduler waits for this compute stream before reusing slots.
     CUDA_CHECK(hipStreamWaitEvent(stream, plan.events[plan.cold.count - 1], 0));
@@ -979,10 +988,10 @@ static void ggml_hip_expert_wait_on_stream(ggml_hip_expert_overlap & plan, hipSt
         ggml_hip_expert_log_timeline(plan, plan.base, "stream_wait_enqueue", begin, ggml_hip_expert_boottime_ns(),
                                      plan.bank_name);
     }
-    auto & count = ggml_hip_expert_stream_wait_counts[plan.cold.count - 1];
+    auto & count = ggml_hip_expert_stream_wait_counts[after_q8][plan.cold.count - 1];
     if (count.fetch_add(1, std::memory_order_relaxed) == 0) {
-        GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU stream-event wait: MTP positions=3 cold_uploads=%u\n",
-                plan.cold.count);
+        GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU stream-event wait: MTP positions=3 cold_uploads=%u wait_position=%s\n",
+                plan.cold.count, after_q8 ? "after_q8" : "before_q8");
     }
     plan.base += plan.cold.count;
     plan.graph = nullptr;
@@ -1173,12 +1182,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(hipStreamSynchronize(stream(device, 0)));
         expert_overlap->collect_gpu_samples();
         if (ggml_hip_expert_stream_wait_enabled()) {
-            GGML_LOG_INFO("hip_mtp3_expert_stream_wait_dispatches scope=process cold1=%" PRIu64 " cold2=%" PRIu64
-                    " cold3=%" PRIu64 " cold4=%" PRIu64 "\n",
-                    ggml_hip_expert_stream_wait_counts[0].load(std::memory_order_relaxed),
-                    ggml_hip_expert_stream_wait_counts[1].load(std::memory_order_relaxed),
-                    ggml_hip_expert_stream_wait_counts[2].load(std::memory_order_relaxed),
-                    ggml_hip_expert_stream_wait_counts[3].load(std::memory_order_relaxed));
+            for (bool after_q8 : {false, true}) {
+                const auto & counts = ggml_hip_expert_stream_wait_counts[after_q8];
+                const uint64_t cold1 = counts[0].load(std::memory_order_relaxed);
+                const uint64_t cold2 = counts[1].load(std::memory_order_relaxed);
+                const uint64_t cold3 = counts[2].load(std::memory_order_relaxed);
+                const uint64_t cold4 = counts[3].load(std::memory_order_relaxed);
+                if (cold1 || cold2 || cold3 || cold4 || after_q8 == ggml_hip_expert_stream_wait_after_q8_enabled()) {
+                    GGML_LOG_INFO("hip_mtp3_expert_stream_wait_dispatches scope=process cold1=%" PRIu64 " cold2=%" PRIu64
+                            " cold3=%" PRIu64 " cold4=%" PRIu64 " wait_position=%s\n",
+                            cold1, cold2, cold3, cold4, after_q8 ? "after_q8" : "before_q8");
+                }
+            }
         }
         expert_overlap.reset();
     }
@@ -5950,7 +5965,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         const uint64_t fused_start = timeline ? ggml_hip_expert_boottime_ns() : 0;
                         const unsigned sequence = overlap->base;
                         if (ggml_hip_expert_stream_wait_enabled()) {
-                            ggml_hip_expert_wait_on_stream(*overlap, cuda_ctx->stream(), timeline);
+                            const auto * weights = up->src[0];
+                            const auto * input = up->src[1];
+                            const auto * ids = up->src[2];
+                            // MMVQ can clear padding in compute weights or return early for compact IDs.
+                            const bool wait_after_q8 = ggml_hip_expert_stream_wait_after_q8_enabled() &&
+                                    ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                                    input->buffer != weights->buffer && !ggml_cuda_is_compact_moe_lookup(ids->view_src);
+                            if (!wait_after_q8) {
+                                ggml_hip_expert_wait_on_stream(*overlap, cuda_ctx->stream(), false);
+                            }
                         }
                         ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion);
                         if (timeline) {

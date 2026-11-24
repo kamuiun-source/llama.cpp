@@ -10,6 +10,11 @@
 #include <cstring>
 #include <type_traits>
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+bool ggml_hip_expert_stream_wait_after_q8_enabled();
+void ggml_hip_expert_wait_on_stream(ggml_hip_expert_overlap & plan, hipStream_t stream, bool after_q8);
+#endif
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
@@ -921,7 +926,9 @@ static constexpr bool compact_moe_type(ggml_type type) {
 }
 
 #ifdef __linux__
-template<bool sample_timeline>
+enum class expert_spin_retry { all_lanes, relaxed, wave_leader };
+
+template<bool sample_timeline, expert_spin_retry retry>
 static __global__ void mul_mat_vec_iq3_xxs_moe_overlap(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * input,
         const int32_t * ids, float * dst, int ids_stride, int expert_stride, int row_stride,
@@ -955,12 +962,42 @@ static __global__ void mul_mat_vec_iq3_xxs_moe_overlap(
                     sample->phase[phase].wait_start = begin;
                 }
             }
-            while (!__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected)) {
-                if (__any(wall_clock64() - begin >= timeout_ticks)) {
-                    // Never let down projection consume partial output.
-                    __builtin_trap();
+            if constexpr (retry == expert_spin_retry::wave_leader) {
+                if (!__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected)) {
+                    unsigned candidate;
+                    do {
+                        if (__any(wall_clock64() - begin >= timeout_ticks)) {
+                            __builtin_trap();
+                        }
+                        __builtin_amdgcn_s_sleep(1);
+                        unsigned ticket = 0;
+                        if (lane == 0) {
+                            ticket = __hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                        }
+                        candidate = __shfl(ticket, 0, wave_size);
+                        // Every lane must acquire the completed DMA before reading the tuple.
+                    } while (candidate < expected ||
+                             !__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected));
                 }
-                __builtin_amdgcn_s_sleep(1);
+            } else if constexpr (retry == expert_spin_retry::relaxed) {
+                if (!__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected)) {
+                    // A relaxed observation only tells us when to retry the acquire.
+                    do {
+                        if (__any(wall_clock64() - begin >= timeout_ticks)) {
+                            __builtin_trap();
+                        }
+                        __builtin_amdgcn_s_sleep(1);
+                    } while (!__all(__hip_atomic_load(ready, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= expected) ||
+                             !__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected));
+                }
+            } else {
+                while (!__all(__hip_atomic_load(ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) >= expected)) {
+                    if (__any(wall_clock64() - begin >= timeout_ticks)) {
+                        // Never let down projection consume partial output.
+                        __builtin_trap();
+                    }
+                    __builtin_amdgcn_s_sleep(1);
+                }
             }
             if constexpr (sample_timeline) {
                 if (lane == 0) {
@@ -1925,18 +1962,40 @@ void ggml_cuda_mul_mat_vec_q(
 
 #ifdef GGML_USE_HIP
 #ifdef __linux__
+    if (ctx.expert_overlap && ctx.expert_overlap->graph && ctx.expert_overlap->output == dst &&
+            ggml_hip_expert_stream_wait_after_q8_enabled()) {
+        // Input quantization is queued. Only the following MMVQ reads the tuple weights.
+        ggml_hip_expert_wait_on_stream(*ctx.expert_overlap, stream, true);
+    }
     if (ctx.expert_overlap && ctx.expert_overlap->graph && ctx.expert_overlap->output == dst) {
         auto & plan = *ctx.expert_overlap;
         constexpr int rows = ggml_hip_expert_overlap::rows_per_group;
         const auto & device = ggml_cuda_info().devices[ctx.device];
         const ggml_cuda_kernel_launch_params params(dim3(ggml_hip_expert_overlap::groups), dim3(device.warp_size, rows), 0, stream);
         auto * samples = plan.begin_gpu_sample();
-        const auto launch = [&](auto sample_timeline) {
-            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_moe_overlap<decltype(sample_timeline)::value>, params,
+        static const bool relaxed_retry = [] {
+            const char * value = std::getenv("GGML_HIP_MTP3_EXPERT_SPIN_RELAXED_RETRY");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        static const bool wave_leader_retry = [] {
+            const char * value = std::getenv("GGML_HIP_MTP3_EXPERT_SPIN_WAVE_LEADER_RETRY");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const auto launch_variant = [&](auto sample_timeline, auto retry) {
+            ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_moe_overlap<decltype(sample_timeline)::value, decltype(retry)::value>, params,
                     static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
                     static_cast<const block_q8_1 *>(src1_q8_1), ids_d, dst_d, int(ids_stride), int(s02), int(s01),
                     int(stride_col_y), int(stride_channel_dst), int(stride_col_dst), plan.cold, plan.device_ticket,
                     plan.base, plan.timeout_ticks, samples);
+        };
+        const auto launch = [&](auto sample_timeline) {
+            if (wave_leader_retry) {
+                launch_variant(sample_timeline, std::integral_constant<expert_spin_retry, expert_spin_retry::wave_leader>{});
+            } else if (relaxed_retry) {
+                launch_variant(sample_timeline, std::integral_constant<expert_spin_retry, expert_spin_retry::relaxed>{});
+            } else {
+                launch_variant(sample_timeline, std::integral_constant<expert_spin_retry, expert_spin_retry::all_lanes>{});
+            }
         };
         if (samples) {
             launch(std::true_type{});
@@ -1950,7 +2009,11 @@ void ggml_cuda_mul_mat_vec_q(
             plan.submit_gpu_sample(stream);
         }
         if (!logged[count - 1].exchange(true, std::memory_order_relaxed)) {
-            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU single-kernel overlap: MTP positions=3 cold_uploads=%u\n", count);
+            const char * retry_detail = wave_leader_retry ?
+                    (relaxed_retry ? " spin_retry=wave_leader relaxed_retry_ignored=1" : " spin_retry=wave_leader") :
+                    (relaxed_retry ? " spin_retry=relaxed" : "");
+            GGML_LOG_INFO("HIP gfx906 IQ3_XXS routed SwiGLU single-kernel overlap: MTP positions=3 cold_uploads=%u%s\n",
+                    count, retry_detail);
         }
         return;
     }
