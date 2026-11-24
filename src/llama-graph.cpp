@@ -1429,6 +1429,8 @@ void llm_graph_result::reset() {
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+    t_next_router.clear();
+    t_next_router_scores.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -2638,90 +2640,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    auto * gate_up_full_map = target_mtp_verify_packed && moe_cache ?
-            moe_cache->get_hip_mtp_gate_up_full_map(il) : nullptr;
-    if (gate_up_full_map) {
-        if (!can_cpu_share || !up_exps || !gate_exps || gate_up_exps || up_exps_s || gate_exps_s ||
-                up_exps_b || gate_exps_b || type_op != LLM_FFN_SILU || hparams.swiglu_clamp_exp[il] > 1e-6f) {
-            throw std::runtime_error("HIP MTP3 gate/up overlap requires separate plain gate/up projections and unclamped SwiGLU");
-        }
-        const bool shared_output = moe_cache->get_hip_mtp_shared_output_count() != nullptr;
-        const auto shared_projection_type = [](ggml_type type) {
-            return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS;
-        };
-        if (shared_output && (!shared_projection_type(up_exps->type) || !shared_projection_type(gate_exps->type) ||
-                up_exps->ne[0] != 2560 || gate_exps->ne[0] != 2560 ||
-                up_exps->ne[1] != 640 || gate_exps->ne[1] != 640 || selected_experts->ne[0] != 10 || n_tokens != 3)) {
-            throw std::runtime_error("HIP MTP3 shared gate/up output requires the Flash-Next quantized gate/up shape");
-        }
-        ggml_tensor * shared_q8 = nullptr;
-        if (auto * count = moe_cache->get_hip_mtp_q8_1_count()) {
-            shared_q8 = ggml_cast(ctx0, cur, GGML_TYPE_Q8_1);
-            ggml_set_name(shared_q8, "ffn_moe_mtp_shared_q8_1");
-            std::memcpy(shared_q8->op_params + 4, &count, sizeof(count));
-            auto * backend = moe_cache->backend(il);
-            if (!ggml_backend_supports_op(backend, shared_q8)) {
-                throw std::runtime_error("HIP MTP3 shared gate/up Q8_1 requires gfx906 and a 2560x1x3 F32 activation");
-            }
-            ggml_backend_sched_set_tensor_backend(sched, shared_q8, backend);
-        }
-        auto project = [&](ggml_tensor * weight, ggml_tensor * slots, const char * name, ggml_tensor * output = nullptr) {
-            auto * projection = build_lora_mm_id(weight, cur, selected_experts, nullptr, slots, true);
-            if (shared_q8) {
-                GGML_ASSERT(projection->src[1] == shared_q8->src[0]);
-                projection->src[4] = shared_q8;
-            }
-            if (output) {
-                GGML_ASSERT(ggml_are_same_shape(projection, output) && ggml_are_same_stride(projection, output));
-                projection->view_src = output;
-                projection->src[3] = output;
-            }
-            cb(projection, name, il);
-            if (shared_output) {
-                ggml_backend_sched_set_tensor_backend(sched, projection, moe_cache->backend(il));
-            }
-            ggml_build_forward_expand(gf, projection);
-            return projection;
-        };
-        auto * gate_hot = project(gate_exps, cache.slots, "ffn_moe_gate_hot");
-        auto * up_hot = project(up_exps, cache.slots, "ffn_moe_up_hot");
-        const auto cold = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, false, il, true);
-        auto * gate_miss = project(gate_exps, cold.slots, "ffn_moe_gate_miss", shared_output ? gate_hot : nullptr);
-        auto * up_miss = project(up_exps, cold.slots, "ffn_moe_up_miss", shared_output ? up_hot : nullptr);
-        auto * gate = gate_miss;
-        auto * up = up_miss;
-        if (!shared_output) {
-            gate = ggml_add_inplace(ctx0, gate_hot, gate_miss);
-            up = ggml_add_inplace(ctx0, up_hot, up_miss);
-            ggml_set_name(gate, "ffn_moe_mtp_gate_up_merge");
-            ggml_set_name(up, "ffn_moe_mtp_gate_up_merge");
-        }
-        auto * act = ggml_swiglu_split(ctx0, gate, up);
-        cb(act, "ffn_moe_swiglu", il);
-        const auto type = up_hot->src[0]->type;
-        auto * fused_hit_count = moe_cache->get_hip_mtp_fused_hit_count();
-        if (fused_hit_count && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS) &&
-                type == gate_hot->src[0]->type && ggml_are_same_shape(up_hot->src[0], gate_hot->src[0]) &&
-                ggml_are_same_stride(up_hot->src[0], gate_hot->src[0]) &&
-                up_hot->src[1] == gate_hot->src[1] && up_hot->src[1]->ne[1] == 1 &&
-                up_hot->src[0]->ne[0] == 2560 && up_hot->ne[0] == 640 && up_hot->ne[1] == 10 && up_hot->ne[2] == 3) {
-            auto * lookup = cache.slots->view_src;
-            GGML_ASSERT(lookup && lookup->op == GGML_OP_GET_ROWS);
-            lookup->op_params[1] = 3;
-            // Keep the fused inputs live past the hot split.
-            act->src[2] = up_hot->src[1];
-            act->src[3] = cache.slots;
-            act->src[4] = up_hot->src[0];
-            act->src[5] = gate_hot->src[0];
-            std::memcpy(act->op_params + 4, &fused_hit_count, sizeof(fused_hit_count));
-            ggml_set_name(act, "ffn_moe_mtp_gate_up_fuse_hits");
-        }
-        ggml_build_forward_expand(gf, act);
-        const auto full = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps,
-                false, il, false, -1, nullptr, false, gate_up_full_map);
-        experts = build_lora_mm_id(down_exps, act, selected_experts, down_exps_s, full.slots, true);
-        cb(experts, "ffn_moe_down", il);
-    } else if (compact_prefill) {
+    if (compact_prefill) {
         experts = moe_cache->build_compact_prefill(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), selected_experts, il,
                 up_exps, gate_exps, down_exps, gate_up_exps, up_exps_s, gate_exps_s, down_exps_s);
         if (!ggml_backend_sched_set_custom_op_backend(sched, experts, moe_cache->backend(il))) {
@@ -2750,7 +2669,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         experts = build_experts(cur, selected_experts, cache.slots, true);
     }
-    if (!gate_up_full_map && moe_cache && moe_cache->get_cold_slot_map(il, target_mtp_verify_packed)) {
+    if (moe_cache && moe_cache->get_cold_slot_map(il)) {
         if (gate_up_exps_b || gate_exps_b || up_exps_b || !loras->empty()) {
             throw std::runtime_error("expert overlap requires bias-free gate/up projections and no LoRA");
         }
@@ -2767,7 +2686,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_merged", il);
     }
 
-    if (moe_cache && il >= 0 && cache.slots && !cache.cpu_ids && !moe_cache->get_cold_slot_map(il, target_mtp_verify_packed) &&
+    if (moe_cache && il >= 0 && cache.slots && !cache.cpu_ids && !moe_cache->get_cold_slot_map(il) &&
             can_cpu_share && type_op == LLM_FFN_SILU && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
             !gate_up_exps_b && !gate_exps_b && !up_exps_b && !down_exps_b &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm) {
@@ -2861,8 +2780,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
                 bool   cold,
              int32_t   prefill_wave,
          ggml_tensor * prefill_ids,
-                bool   mtp_verify_three,
-         ggml_tensor * full_map) const {
+                bool   mtp_verify_three) const {
     if (moe_cache == nullptr) {
         return { nullptr, nullptr };
     }
@@ -2875,11 +2793,10 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     };
 
     ggml_tensor * cpu_map  = cpu_part ? moe_cache->get_cpu_map(il, selected_experts->ne[1]) : nullptr;
-    ggml_tensor * slot_map = full_map ? full_map :
-            mtp_verify_three ? moe_cache->get_mtp_verify_map(il, prefill_wave) :
+    ggml_tensor * slot_map = mtp_verify_three ? moe_cache->get_mtp_verify_map(il, prefill_wave) :
             prefill_wave >= 0 ? moe_cache->get_prefill_map(il, prefill_wave) :
-            cold ? moe_cache->get_cold_slot_map(il, target_mtp_verify_packed) :
-            moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr, target_mtp_verify_packed);
+            cold ? moe_cache->get_cold_slot_map(il) :
+            moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], cpu_map != nullptr);
     if (slot_map == nullptr) {
         return unavailable(format("no slots for %" PRId64 " tokens and %" PRId64 " selected experts", selected_experts->ne[1], selected_experts->ne[0]).c_str());
     }
@@ -2913,23 +2830,12 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, cold ? "ffn_moe_cold_slots" : "ffn_moe_slots", il);
-    if (!full_map && target_mtp_verify_packed && moe_cache->uses_hip_mtp_compact()) {
-        ggml_set_name(slots, "ffn_moe_mtp_compact_slots");
-        slots->op_params[0] = -1;
-        if (moe_cache->get_hip_mtp_gate_up_full_map(il)) {
-            slots->op_params[1] = cold ? 2 : 1;
-            if (auto * count = moe_cache->get_hip_mtp_shared_output_count()) {
-                slots->op_params[2] = 1;
-                std::memcpy(slots->op_params + 4, &count, sizeof(count));
-            }
-        }
-    }
     static const bool shared_iq3_weights = [] {
         const char * value = std::getenv("GGML_HIP_GFX906_MTP3_IQ3_XXS_SHARE_WEIGHTS");
         return value && std::strcmp(value, "1") == 0;
     }();
-    if (shared_iq3_weights && target_mtp_verify_packed && !full_map && !cold && prefill_wave < 0 &&
-            !moe_cache->get_cold_slot_map(il, true) && selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3 &&
+    if (shared_iq3_weights && target_mtp_verify_packed && !cold && prefill_wave < 0 &&
+            !moe_cache->get_cold_slot_map(il) && selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3 &&
             up_exps && gate_exps && up_exps->type == GGML_TYPE_IQ3_XXS && gate_exps->type == GGML_TYPE_IQ3_XXS &&
             up_exps->ne[0] == 2560 && up_exps->ne[1] == 640 && ggml_are_same_shape(up_exps, gate_exps)) {
         ggml_set_name(slots, "ffn_moe_mtp_share_iq3_weights");

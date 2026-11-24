@@ -1,6 +1,6 @@
 # このフォークの決定事項
 
-更新日: 2026-11-22。明示的な最新のユーザー指示を優先する。
+更新日: 2026-11-24。明示的な最新のユーザー指示を優先する。
 
 ## 担当と作業の進め方
 
@@ -14,9 +14,12 @@
 - フルビルド、モデル実行、速度比較はユーザーが行う。こちらは必要最小限のコンパイル確認、小規模な正確性確認、スクリプト確認までとし、ビルド・実行コマンドを渡す。
 - ユーザーがビルドや実機比較を委任した場合、担当チャットへの依頼文に、実行中の出力はGit管理外のファイルへ保存し、終了コードを確認するよう記載する。2026-11-22以降はONだけを逐次実行し、比較条件に合う既存のOFF試行を使う。比較に使ったOFFの設定と計測時のビルドを記録する。失敗したときは該当エラーの周辺だけ確認する。
 - このチャットでユーザーから委任されたビルド・実機での動作確認・速度計測はLunaに依頼し、親は条件設定と結果のレビューを担当する。
-- 改善ごとにON/OFFを切り替え、他の条件を揃えて比較する。機能実装と採用判断を区別する。
+- 改善ごとにON/OFFを切り替え、他の条件を揃えて比較する。機能実装と採用判断を区別する。 採用済みの改善が新しい構成で使えなくなる場合は、検証前に設定名と併用制限をユーザーに明示し、計測メモにも記載する。
 - 性能調査では、親エージェントが中間データの生成先から最終利用先までをコードとログで追い、GPU内・GPU間・GPU/RAM間で省けるコピー、再変換、転送専用Submitを先に提案する。候補の発生条件、回数、既存の再利用、上書きと同期の制約を確認し、待ちの位置が移る場合は前後を含む時間で評価する。
-- コミット・pushは明示的な指示がある場合のみ。未コミットの他作業差分を消さない。
+## Gitの運用
+
+- ブランチを切り替える前に未コミット差分を確認し、切り替え元のブランチで現在の作業分をコミットする。途中なら途中経過と分かるコミットにして、再開地点を残す。別作業の差分は混ぜず、残っている場合は切り替え先を別のワークツリーで開く。
+- 実装と確認が済んだとき、調査・計測結果をまとめたときなど、作業の区切りで個別の指示を待たずにコミットし、ユーザーのフォークの対応する作業ブランチへpushする。コミットIDとpush先を報告する。ユーザーが特定の作業でコミットやpushを保留するよう指示した場合は、その指示を優先する。
 
 ## テストと評価
 
@@ -108,8 +111,8 @@
 
 ## Branch-based validation workflow (2026-11-17)
 
-The fixed validation checkout is `C:/Users/kamui/.codex/worktrees/rtx-expert-validation/llama-hetero-moe`. Reuse `G:/AI/build-rtx-validation` only with this source directory. Development stays in separate worktrees; validate committed branch tips sequentially in this checkout, preferably detached so development branches remain usable in their own worktrees. Never switch during inference/build, and require a clean checkout before switching. Stop at configure/build failure; never benchmark an old executable after failure. Commit and record the exact experiment tip before each validation. No push needed.
-Historical tested changes and opt-in experiments may share a baseline commit where file boundaries overlap; do not reconstruct artificial historical commits. In-progress Recurrent and transfer-tail changes remain separate. User authorized these local commits, not push/main integration. CLI comparisons keep all HC experiments and RTX sharing OFF unless explicitly testing them.
+The fixed validation checkout is `C:/Users/kamui/.codex/worktrees/rtx-expert-validation/llama-hetero-moe`. Reuse `G:/AI/build-rtx-validation` only with this source directory. Development stays in separate worktrees; validate committed branch tips sequentially in this checkout, preferably detached so development branches remain usable in their own worktrees. Never switch during inference/build, and require a clean checkout before switching. Stop at configure/build failure; never benchmark an old executable after failure. Commit and record the exact experiment tip before each validation. Follow the current Git workflow above for milestone pushes.
+Historical tested changes and opt-in experiments may share a baseline commit where file boundaries overlap; do not reconstruct artificial historical commits. In-progress Recurrent and transfer-tail changes remain separate. The 2026-11-17 local-only approval applied to those historical commits. Apply the current Git workflow above for new work. CLI comparisons keep all HC experiments and RTX sharing OFF unless explicitly testing them.
 
 ## 30 tok/sに到達した検証設定（2026-11-17）
 
