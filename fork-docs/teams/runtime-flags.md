@@ -37,3 +37,4 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT` | `1` | 必要な先読みまでをイベントで待ち、ヒットを通常の仮置き枠へD2Dする。 |
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | `0`（既定） / `1`（試作） | 上の2つが有効で、予測とExpertが異なるバックエンドの場合に、今のExpert分割を投入してから次層の先読みを発行する。 |
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。ともに固定5問で比較済み。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_DEMAND_PRIORITY` | `0`（既定） / `1`（比較用） | ヒット待ちと後発行が有効なとき、先読みを2件ずつ進め、正規Router確定で未発行の候補を打ち切る。 |
