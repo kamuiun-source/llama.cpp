@@ -585,7 +585,7 @@ struct llama_moe_cache::impl {
     size_t profile_upload_bytes = 0;
     ggml_backend_buffer_ptr packed_staging;
     ggml_backend_ptr hip_upload_backend;
-    static constexpr int next_prefetch_slots = 10;
+    static constexpr int next_prefetch_slots = 8;
     ggml_backend_ptr next_prefetch_backend;
     ggml_context_ptr next_prefetch_ctx;
     ggml_context_ptr next_prefetch_views;
