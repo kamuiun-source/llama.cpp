@@ -131,12 +131,32 @@ Expertコールバックは2,400回。GPU間受け渡しとコールバックの
 
 2026-11-25にRTX 4070 TiとMI50、CUDA 12.9・HIP 7.2.53211の既存コンテナで試験した。両ランタイムが登録した同じホスト領域を使い、MI50でD2H後に `hipStreamWriteValue32`（フラグ引数0）を投入し、RTXの `cuStreamWaitValue32`（EQ、FLUSHなし）の後にH2Dした。CPU同期版はMI50のストリームをCPUで待ってからRTXにH2Dを投入する。同じ共有バッファを使い、RTXへのコピーが終わってから次のデータで上書きした。時間はMI50のD2H投入直前からRTXのコピー完了をCPUが確認するまで。RTXからの検証用読み戻しと全バイト照合は時間外に行った。
 
-| ペイロード | CPU同期 p50 / p99 | GPU通知 p50 / p99 |
+| ペイロード | CPU同期 p50 / p99 / 最大 | GPU通知 p50 / p99 / 最大 |
 | --- | ---: | ---: |
-| 30,720 B | 13.88 / 23.75 µs | 35.51 / 38.92 µs |
-| 65,536 B | 18.89 / 21.37 µs | 44.08 / 48.88 µs |
+| 30,720 B | 13.876 / 23.745 / 129.264 µs | 35.507 / 38.923 / 337.146 µs |
+| 65,536 B | 18.886 / 21.370 / 34.175 µs | 44.083 / 48.883 / 86.583 µs |
 
-両サイズ、両方式ともウォームアップ100回を含む各3,100回で不一致、タイムアウト、APIエラー0。各実行の終了コード0。RTXのFLUSH機能照会は0。GPU通知は動作したが、今回の単発受け渡しでは中央値とP99がいずれも増えた。実モデルの連続グラフ、逆方向、複数枠の並行再利用、HIP/ROCm別版での動作は未検証。試験コードとコマンド・生ログはGit外の `/home/t-saka/rocm-cross-gpu-handoff-20261125/`。
+両サイズ、両方式ともウォームアップ100回を含む各3,100回で不一致、タイムアウト、APIエラー0。各実行の終了コード0。RTXのFLUSH機能照会は0。GPU通知は動作したが、今回の単発受け渡しでは中央値とP99がいずれも増えた。実モデルの連続グラフ、逆方向、複数枠の並行再利用、HIP/ROCm別版での動作は未検証。コマンド・生ログはGit外の `/home/t-saka/rocm-cross-gpu-handoff-20261125/run-logs/`。
+
+[試験コード](../scripts/mi50-rtx-handoff/)は計測時のソースと同一。リポジトリのルートから、ビルドと標準出力をGit管理外に保存して再実行できる。以下はMI50が `/dev/dri/renderD128` で、HIP・CUDAでそれぞれ対象GPUが0番の場合。
+
+```bash
+handoff_work=$(mktemp -d)
+cp fork-docs/scripts/mi50-rtx-handoff/{build.sh,run.sh,handoff.cpp,hip-source.cpp} "$handoff_work/"
+docker run --rm --gpus all \
+  --device=/dev/kfd --device=/dev/dri/renderD128 \
+  --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+  --ulimit memlock=1048576:1048576 \
+  --mount "type=bind,src=$handoff_work,dst=/workspace/handoff" \
+  --workdir /workspace/handoff llama-cuda-rocm-dev:latest bash -euc '
+    ./build.sh
+    for bytes in 30720 65536; do
+      for mode in cpu gpu; do
+        ./run.sh "$mode" "$bytes" 3000 100 0 0 > "$mode-$bytes.csv"
+      done
+    done
+  '
+```
 
 ### MI50の小容量転送と昇格の実装順
 
