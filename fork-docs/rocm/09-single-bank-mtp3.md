@@ -201,6 +201,22 @@ ONの `smaps` で既にウォームアップ前から存在する84,524 KiBの�
 
 上限2でも第2回の第3〜5問で38.88、68.57、47.91 MiBのスワップアウトが発生。チェックポイント保持量の削減だけでは退避を止められなかった。第2回の対応するcuBLASLt領域のSwapは事前41,684→事後81,900 KiB（+39.27 MiB）、スワップアウト0の第1・3回はそれぞれ約0.22、0.21 MiB減少した。この差分は事前・事後の比較であり、各リクエスト中の退避先の内訳を示さない。ログと集計はGit外の `/home/t-saka/rocm-expert-shared10-prefetch-ctx2-20261124/session-batch-01/`。
 
+
+##### 先読みONでページ回収の発行元を計測
+
+同じバイナリ・共用10枠のExpert先読みON・固定MTP 3幅・単一バンク・直接DMA・`--ctx-checkpoints 2 --cache-ram 0` で固定5問を2回完走した。GPUプロファイラーを使わず、ホストで `perf record -a --clockid mono --call-graph dwarf,4096` により `vmscan` の `kswapd` 起床要求・起床・休止、直接回収開始・終了をPIDとスタック付きで記録した。応答の開始と終了を同じ単調時計で照合した。
+
+| 試行 | 生成 tok/s | 本体検証 ms/回 | 応答中 cgroup swap-in / out MiB |
+| --- | ---: | ---: | ---: |
+| 1 | 39.46 | 52.30 | 7.73 / 0 |
+| 2 | 27.49 | 77.27 | 75.55 / 353.07 |
+
+640トークンのIDと出力、MTP採用358/549、本体検証276回は一致。第2回は第4・5問で203.77、149.29 MiBのスワップアウトが発生し、生成速度はそれぞれ43.13→16.83、43.24→25.47 tok/sに低下した。表は応答区間の増分で、起動時にも別途109.65、210.84 MiBのスワップアウトがあった。
+
+第4・5問で取得できた `kswapd` 起床要求の104件中102件、直接回収開始の68件すべてが AMDGPU/KFD の `amdgpu_amdkfd_restore_userptr_worker` 経由だった。ワーカーが `update_invalid_user_pages` から `amdgpu_ttm_tt_get_user_pages`、`amdgpu_hmm_range_get_pages` に進み、`kvmalloc` 系の確保でページ回収を要求していた。第1回の応答区間に同経路の起床要求・直接回収開始の採取はなかった。ここまででスワップ増加と重なった回収要求元をドライバのユーザーページ復元処理まで絞れた。ワーカーは非同期のため、どのユーザーバッファの無効化が復元を起こしたか、先読み変更がその原因かは未特定。perfは11チャンクの欠落を報告したため、件数は取得できたサンプルのみ。
+
+速度と応答境界はGit外の `/home/t-saka/rocm-expert-shared10-prefetch-ctx2-reclaim-trace-20261124/` 配下、実行引数・生トレース・時刻窓別のスタック集計は `/home/t-saka/rocm-prefetch-reclaim-trace-20261124/` 配下に保存した。
+
 ## 単一カーネル内でExpertアップロードと計算を重ねる試作
 
 `codex/rocm-integrated-test` の `85e2ae78a` から `codex/rocm-expert-single-kernel-overlap` を作成。固定3幅、単一バンク相当の `IQ3_XXS gate/up＋SwiGLU` を対象にし、Router確定後のミス分転送を常駐Expertの計算の裏に重ねる。転送を先に終える条件と並行条件で同じ行列積カーネルを1層1回起動し、`down` の処理と起動順序は本試作の対象外とする。
