@@ -600,6 +600,13 @@ struct llama_moe_cache::impl {
     int32_t next_prefetch_source_layer = -1;
     bool next_prefetch_tail_pending = false;
     bool next_prefetch_hit_wait = false;
+    bool next_prefetch_after_submit = false;
+    int32_t next_prefetch_submit_layer = -1;
+    size_t next_prefetch_submit_scheduled = 0;
+    size_t next_prefetch_submit_executed = 0;
+    size_t next_prefetch_submit_fallback = 0;
+    size_t next_prefetch_submit_canceled = 0;
+    int64_t next_prefetch_submit_cpu_us = 0;
     size_t next_prefetch_dependencies = 0;
     size_t next_prefetch_dependency_slots = 0;
     size_t next_prefetch_source_waits = 0;
@@ -2366,6 +2373,13 @@ struct llama_moe_cache::impl {
         if (next_prefetch_hit_wait) {
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: hit_wait=1\n");
         }
+        const char * after_submit = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT");
+        if (after_submit && std::strcmp(after_submit, "1") == 0) {
+            next_prefetch_after_submit = next_prefetch_hit_wait;
+            if (!next_prefetch_after_submit) {
+                LLAMA_LOG_WARN("packed expert HIP next Router prefetch: after-submit requires hit wait, using immediate launch\n");
+            }
+        }
     }
 
     void retire_next_prefetch(size_t hits) {
@@ -2484,6 +2498,35 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    void schedule_next_prefetch(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
+        if (next_prefetch_after_submit) {
+            if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
+                return;
+            }
+            auto * prediction = (*next_prefetch_predictions)[il];
+            const auto producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
+            // Readback must not synchronize the stream that runs the current Expert split.
+            if (producer != expert_backend && next_prefetch_submit_layer < 0 &&
+                    ggml_backend_sched_after_split_submit(sched, [](ggml_backend_sched_t sched, void * user_data) {
+                        auto & self = *static_cast<impl *>(user_data);
+                        const int32_t il = self.next_prefetch_submit_layer;
+                        self.next_prefetch_submit_layer = -1;
+                        ++self.next_prefetch_submit_executed;
+                        const int64_t start = self.next_profile_start ? ggml_time_us() : 0;
+                        self.launch_next_prefetch(sched, il);
+                        if (start) {
+                            self.next_prefetch_submit_cpu_us += ggml_time_us() - start;
+                        }
+                    }, this)) {
+                next_prefetch_submit_layer = il;
+                ++next_prefetch_submit_scheduled;
+                return;
+            }
+            ++next_prefetch_submit_fallback;
+        }
+        launch_next_prefetch(sched, il);
     }
 
     int32_t next_prefetch_slot(int32_t il, int32_t expert) const {
@@ -3628,7 +3671,7 @@ struct llama_moe_cache::impl {
                 }
             }
             if (next_prefetch_predictions && fixed_three && !early && sched) {
-                launch_next_prefetch(sched, il);
+                schedule_next_prefetch(sched, backend, il);
             }
             return true;
         }
@@ -3722,6 +3765,9 @@ struct llama_moe_cache::impl {
                     next_prefetch_hit_wait, next_prefetch_dependencies, next_prefetch_dependency_slots,
                     next_prefetch_consumer_wait_us, next_prefetch_source_waits, next_prefetch_source_wait_us,
                     next_prefetch_tail_waits, next_prefetch_tail_wait_us);
+            LLAMA_LOG_INFO("packed expert HIP next Router after-submit: enabled=%d scheduled=%zu executed=%zu fallback=%zu canceled=%zu"
+                    " launch_cpu_wall_us=%" PRId64 "\n", next_prefetch_after_submit, next_prefetch_submit_scheduled,
+                    next_prefetch_submit_executed, next_prefetch_submit_fallback, next_prefetch_submit_canceled, next_prefetch_submit_cpu_us);
         }
         for (size_t il = 0; il < mtp_pair_histograms.size(); ++il) {
             if (!layers[il].slot_map) {
@@ -4047,6 +4093,10 @@ void llama_moe_cache::begin_next_router_prefetch(const std::vector<ggml_tensor *
 }
 
 void llama_moe_cache::end_next_router_prefetch() {
+    if (pimpl->next_prefetch_submit_layer >= 0) {
+        ++pimpl->next_prefetch_submit_canceled;
+        pimpl->next_prefetch_submit_layer = -1;
+    }
     pimpl->finish_next_prefetch();
     pimpl->next_prefetch_predictions = nullptr;
 }
