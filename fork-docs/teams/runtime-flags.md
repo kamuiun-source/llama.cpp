@@ -28,3 +28,11 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 `GGML_VK_ASYNC_USE_TRANSFER_QUEUE` は値の存在で判定するため、専用Expert並行転送の比較では環境変数を削除する。直近の設定は `GGML_VK_VISIBLE_DEVICES=0,2,1` で `CUDA0,Vulkan1` を使用。番号は起動前に `--list-devices` で機種名を照合する。
 
 通常速度では詳細計測と `GGML_CUDA_DISABLE_GRAPHS` を未設定にする。計測用の追加同期を使う実験は別のログに記録する。新しいフラグを記録するときは、正確な名前、ON・OFFの値、適用条件または既定値、検証した版と結果を添える。
+
+## ROCmの次層Expert先読み
+
+| 設定 | 試作時の値 | 動作 |
+| --- | --- | --- |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH` | `1` | 固定3幅で、MI50の共有8枠へ次層の候補を先読みする。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT` | `1` | 必要な先読みまでをイベントで待ち、ヒットを通常の仮置き枠へD2Dする。 |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT` | `0`（既定） / `1`（試作） | 上の2つが有効で、予測とExpertが異なるバックエンドの場合に、今のExpert分割を投入してから次層の先読みを発行する。 |
