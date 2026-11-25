@@ -1519,12 +1519,6 @@ struct ggml_backend_sched {
     ggml_backend_hip_mapped_input_blit_t hip_mapped_input_blit;
     size_t hip_mapped_input_read_eligible;
     size_t hip_mapped_input_read_applied;
-    bool hip_early_router_d2h;
-    size_t hip_early_router_attempted;
-    size_t hip_early_router_issued;
-    size_t hip_early_router_used;
-    size_t hip_early_router_bytes;
-    bool hip_async_return_h2d;
     ggml_backend_event_t hip_return_h2d_event;
     ggml_backend_t hip_return_h2d_pending;
     size_t hip_return_h2d_applied;
@@ -2864,12 +2858,6 @@ struct ggml_backend_sched_mapped_hip_input {
     const ggml_backend_sched_split * destination = nullptr;
     const ggml_tensor * input = nullptr;
     uint8_t * data = nullptr;
-    const ggml_tensor * router[2] = {};
-    const uint8_t * router_data[2] = {};
-    int n_router = 0;
-    int64_t router_start_us = 0;
-    int64_t router_end_us = 0;
-
     void wait() {
         if (source) {
             ggml_backend_synchronize(source);
@@ -2879,49 +2867,6 @@ struct ggml_backend_sched_mapped_hip_input {
 
     ~ggml_backend_sched_mapped_hip_input() { wait(); }
 };
-
-// Stage only the router tensors next to the existing activation mirror.
-static void ggml_backend_sched_early_router_d2h(ggml_backend_sched_t sched, ggml_backend_sched_mapped_hip_input & pending) {
-    constexpr size_t slot_size = 256;
-    constexpr size_t router_offset = 32 * 1024;
-    static_assert(router_offset + 2 * slot_size <= shared_host_capacity, "router slots must fit in the mirror slab");
-    ++sched->hip_early_router_attempted;
-    pending.n_router = 0;
-    if (!pending.source->iface.get_tensor_async) {
-        return;
-    }
-    for (int i = 0; i < pending.destination->n_inputs; ++i) {
-        auto * input = pending.destination->inputs[i];
-        if (input == pending.input || !sched->hv_tensor_requires_copy[hash_id(input)] ||
-                ggml_backend_sched_is_host_weight(input)) {
-            continue;
-        }
-        const bool ids = input->type == GGML_TYPE_I32 && strncmp(input->name, "ffn_moe_topk-", 13) == 0;
-        const bool weights = input->type == GGML_TYPE_F32 && strncmp(input->name, "ffn_moe_weights", 15) == 0;
-        const size_t bytes = ggml_nbytes(input);
-        if (pending.n_router == 2 || (!ids && !weights) || bytes > slot_size ||
-                (input->flags & GGML_TENSOR_FLAG_INPUT) ||
-                ggml_backend_sched_get_tensor_backend(sched, input) != pending.source ||
-                !ggml_backend_sched_device_input_buffer(pending.source, input, bytes)) {
-            pending.n_router = 0;
-            return;
-        }
-        pending.router[pending.n_router++] = input;
-    }
-    if (pending.n_router == 0) {
-        return;
-    }
-    pending.router_start_us = ggml_time_us();
-    for (int i = 0; i < pending.n_router; ++i) {
-        auto * data = pending.data + router_offset + i * slot_size;
-        const size_t bytes = ggml_nbytes(pending.router[i]);
-        pending.router_data[i] = data;
-        ggml_backend_tensor_get_async(pending.source, pending.router[i], data, 0, bytes);
-        sched->hip_early_router_bytes += bytes;
-    }
-    pending.router_end_us = ggml_time_us();
-    ++sched->hip_early_router_issued;
-}
 
 static void ggml_backend_sched_wait_hip_return_h2d(ggml_backend_sched_t sched) {
     if (sched->hip_return_h2d_pending) {
@@ -3061,7 +3006,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             handoff.read_start_us = hip_return->enqueue_start_us;
             handoff.read_end_us = hip_return->enqueue_end_us;
             bool async_h2d = false;
-            if (sched->hip_async_return_h2d && hip_return->mapped && sched->target_mtp_verify_three) {
+            if (hip_return->mapped && sched->target_mtp_verify_three) {
                 auto & event = sched->hip_return_h2d_event;
                 if (!event && split_backend->iface.set_tensor_async) {
                     event = ggml_backend_event_new(split_backend->device);
@@ -3537,21 +3482,6 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
             }
         }
     }
-    const uint8_t * router_data[GGML_SCHED_MAX_SPLIT_INPUTS];
-    bool early_router = mirrored >= 0 && mapped_input.n_router == count - 1;
-    for (int i = 0; early_router && i < count; ++i) {
-        if (i == mirrored) {
-            continue;
-        }
-        router_data[i] = nullptr;
-        for (int j = 0; j < mapped_input.n_router; ++j) {
-            if (mapped_input.router[j] == srcs[i]) {
-                router_data[i] = mapped_input.router_data[j];
-                break;
-            }
-        }
-        early_router = router_data[i] != nullptr;
-    }
     auto & profile = sched->profile;
     const int64_t start_us = profile.enabled ? ggml_time_us() : 0;
 
@@ -3614,33 +3544,26 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         if (upload.compute) {
             sched->shared_input_pending = false;
         }
-        if (early_router) {
-            handoff.read_start_us = mapped_input.router_start_us;
-            handoff.read_end_us = mapped_input.router_end_us;
-            ++sched->hip_early_router_used;
-        } else {
-            handoff.read([&] {
-                if (mirrored < 0) {
-                    ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count);
-                    return;
-                }
-                // Keep the remaining router data as one D2H batch, even if the activation was in the middle.
-                std::swap(srcs[mirrored], srcs[count - 1]);
-                std::swap(sizes[mirrored], sizes[count - 1]);
-                std::swap(data_offsets[mirrored], data_offsets[count - 1]);
-                ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count - 1);
-                std::swap(data_offsets[mirrored], data_offsets[count - 1]);
-                std::swap(sizes[mirrored], sizes[count - 1]);
-                std::swap(srcs[mirrored], srcs[count - 1]);
-            });
-        }
+        handoff.read([&] {
+            if (mirrored < 0) {
+                ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count);
+                return;
+            }
+            // Keep the remaining router data as one D2H batch, even if the activation was in the middle.
+            std::swap(srcs[mirrored], srcs[count - 1]);
+            std::swap(sizes[mirrored], sizes[count - 1]);
+            std::swap(data_offsets[mirrored], data_offsets[count - 1]);
+            ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count - 1);
+            std::swap(data_offsets[mirrored], data_offsets[count - 1]);
+            std::swap(sizes[mirrored], sizes[count - 1]);
+            std::swap(srcs[mirrored], srcs[count - 1]);
+        });
         if (mirrored >= 0) {
             mapped_input.source = nullptr;
         }
     }
     auto input_payload = [&](int i) {
-        return i == mirrored ? mapped_input.data :
-                early_router ? router_data[i] : staging + data_offsets[i];
+        return i == mirrored ? mapped_input.data : staging + data_offsets[i];
     };
     if (async_input) {
         sched->hip_async_input_pending = dst_backend;
@@ -3665,7 +3588,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     }
     ggml_backend_sched_log_handoff(sched, split, src_backend, dst_backend, srcs, count, bytes, handoff,
             producer_copy ? "host_batch_shared_producer" : upload.compute ? "host_batch_shared" :
-            early_router ? "host_batch_dual_pinned_early_router" : mirrored >= 0 ? "host_batch_dual_pinned_mapped_input" :
+            mirrored >= 0 ? "host_batch_dual_pinned_mapped_input" :
             async_input ? "host_batch_dual_pinned_async_input" : pinned ? "host_batch_dual_pinned" : "host_batch");
     if (measure_hip || measure_mtp4 || mtp4_input) {
         ggml_backend_sched_record_hip_handoff(sched, src_backend, count, bytes, pinned != nullptr, handoff,
@@ -4335,6 +4258,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // A reader still owns the slab. Keep the ordinary VRAM output and copy path.
                         ++sched->mapped_hip_input_busy;
                     } else if (ggml_backend_sched_get_dual_pinned(sched, split_backend, dst) && pinned.cuda_mapped &&
+                            (!after_shared || pinned.hip_mapped) &&
                             pinned.cuda_compute(split_backend, graph, mapped_input_uid, producer,
                                 pinned.cuda_mapped + (pinned.cuda_input_data - pinned.data), &mapped_status)) {
                         ++sched->mapped_hip_input_producers;
@@ -4343,9 +4267,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         mapped_input.destination = &next;
                         mapped_input.input = input;
                         mapped_input.data = pinned.cuda_input_data;
-                        if (sched->hip_early_router_d2h && mapped_status == GGML_STATUS_SUCCESS) {
-                            ggml_backend_sched_early_router_d2h(sched, mapped_input);
-                        }
                         if (trace) {
                             ggml_backend_sched_trace_submit(sched, split_id, split_backend, graph, submit_start_us, ggml_time_us());
                         }
@@ -4619,12 +4540,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->mapped_hip_input = ggml_backend_sched_can_map_hip_input(ggml_backend_get_device(backends[i]));
         }
     }
-    const char * early_router_d2h = getenv("GGML_SCHED_HIP_MTP3_EARLY_ROUTER_D2H");
-    const char * async_return_h2d = getenv("GGML_SCHED_HIP_MTP3_ASYNC_RETURN_H2D");
-    sched->hip_early_router_d2h = sched->mapped_hip_input && early_router_d2h && strcmp(early_router_d2h, "1") == 0;
-    sched->hip_async_return_h2d = cuda_hip && async_return_h2d && strcmp(async_return_h2d, "1") == 0;
-    const char * mapped_input_read = getenv("GGML_SCHED_HIP_MAPPED_INPUT_READ");
-    if (sched->mapped_hip_input && mapped_input_read && strcmp(mapped_input_read, "1") == 0) {
+    if (cuda_hip && async_hip_return && strcmp(async_hip_return, "1") == 0) {
+        sched->async_hip_return = sched->dual_pinned_hip_handoff;
+        if (!sched->async_hip_return) {
+            GGML_LOG_WARN("packed HIP MTP3 async return requires dual-pinned handoff\n");
+        }
+    }
+    if (sched->mapped_hip_input && sched->async_hip_return) {
         for (int i = 0; i < n_backends; ++i) {
             if (strncmp(ggml_backend_name(backends[i]), "ROCm", 4) == 0) {
                 const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i]));
@@ -4632,12 +4554,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_mapped_input_blit"));
                 break;
             }
-        }
-    }
-    if (cuda_hip && async_hip_return && strcmp(async_hip_return, "1") == 0) {
-        sched->async_hip_return = sched->dual_pinned_hip_handoff;
-        if (!sched->async_hip_return) {
-            GGML_LOG_WARN("packed HIP MTP3 async return requires dual-pinned handoff\n");
         }
     }
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
@@ -4936,12 +4852,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->hip_mapped_input_read_applied * (2560 * 3 * sizeof(float)), sched->hip_handoff.hip_mapped != nullptr,
                 sched->mapped_hip_input_after_shared_producers);
     }
-    if (sched->hip_early_router_d2h) {
-        GGML_LOG_INFO("packed HIP MTP3 early router D2H: issued=%zu used=%zu fallback=%zu bytes=%zu\n",
-                sched->hip_early_router_issued, sched->hip_early_router_used,
-                sched->hip_early_router_attempted - sched->hip_early_router_used, sched->hip_early_router_bytes);
-    }
-    if (sched->hip_async_return_h2d) {
+    if (sched->async_hip_return) {
         GGML_LOG_INFO("packed HIP MTP3 async return H2D: applied=%zu fallback=%zu reuse_waits=%zu\n",
                 sched->hip_return_h2d_applied, sched->hip_return_h2d_fallback, sched->hip_return_h2d_waits);
     }
