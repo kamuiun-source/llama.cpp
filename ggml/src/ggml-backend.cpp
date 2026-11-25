@@ -22,6 +22,7 @@
 #include <string.h>
 #include <algorithm>
 #include <map>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1365,6 +1366,63 @@ void ggml_backend_get_hip_handoff_timing(ggml_backend_hip_handoff_timing timing[
     std::copy_n(hip_handoff_thread, 2, timing);
 }
 
+struct ggml_backend_hip_verify_trace {
+    static constexpr size_t capacity = 262144;
+    struct row {
+        uint64_t graph;
+        int split;
+        int backend;
+        const char * stage;
+        int64_t start_us;
+        int64_t end_us;
+    };
+
+    const char * path;
+    std::vector<std::string> backend_names;
+    row * rows = new (std::nothrow) row[capacity]{};
+    size_t count = 0;
+    size_t dropped = 0;
+    uint64_t graphs = 0;
+
+    explicit ggml_backend_hip_verify_trace(const char * path) : path(path) {}
+
+    void record(uint64_t graph, int split, int backend, const char * stage, int64_t start, int64_t end) {
+        if (start == end) {
+            return;
+        }
+        if (count < capacity) {
+            rows[count++] = {graph, split, backend, stage, start, end};
+        } else {
+            ++dropped;
+        }
+    }
+
+    ~ggml_backend_hip_verify_trace() { delete[] rows; }
+};
+
+struct ggml_backend_hip_verify_stage {
+    ggml_backend_hip_verify_trace * trace;
+    uint64_t graph;
+    int split;
+    int backend;
+    const char * stage = nullptr;
+    int64_t start = 0;
+
+    void next(const char * next_stage) {
+        if (!trace || (!stage && !next_stage)) {
+            return;
+        }
+        const int64_t end = ggml_time_us();
+        if (stage) {
+            trace->record(graph, split, backend, stage, start, end);
+        }
+        start = end;
+        stage = next_stage;
+    }
+
+    ~ggml_backend_hip_verify_stage() { next(nullptr); }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1453,6 +1511,7 @@ struct ggml_backend_sched {
     bool trace_hip_handoff_wait;
     bool async_hip_input;
     bool mapped_hip_input;
+    ggml_backend_hip_verify_trace * hip_verify_trace;
     size_t mapped_hip_input_producers;
     size_t mapped_hip_input_busy;
     bool async_hip_mtp4_input;
@@ -3821,6 +3880,10 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    auto * host_trace = sched->target_mtp_verify_three ? sched->hip_verify_trace : nullptr;
+    const uint64_t graph_run = host_trace ? ++host_trace->graphs : 0;
+    ggml_backend_hip_verify_stage graph_stage{host_trace, graph_run, -1, -1};
+    graph_stage.next("graph_setup");
 
     sched->trace_handoff_graph = 0;
     if (sched->trace_handoff && sched->n_splits > 8) {
@@ -3865,9 +3928,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     std::vector<ggml_tensor *> merged_nodes;
+    graph_stage.next(nullptr);
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
+        ggml_backend_hip_verify_stage stage{host_trace, graph_run, split_id, split_backend_id};
+        stage.next("split_setup");
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         ggml_backend_sched_host_copies split_host_copies;
         auto * host_copies = sched->capture_host_copies && sched->n_copies == 1 &&
@@ -3915,6 +3981,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        stage.next("early_weight_copy");
         if (sched->callback_copy_early && sched->n_copies == 1 && !profile.enabled &&
                 sched->callback_eval == NULL && prev_backend_id == split_backend_id) {
             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -3928,6 +3995,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        stage.next("nonweight_copy");
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -3985,11 +4053,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (mapped_input.destination == split) {
             mapped_input.wait();
         }
+        stage.next("prefetch_inputs");
         // after the copies above, which may read host memory reused by the copies of the next split
         // before the weights, whose copy callback may queue large uploads
         if (!profile.enabled) {
             ggml_backend_sched_prefetch_inputs(sched, split_id);
         }
+        stage.next("host_weight_copy");
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
@@ -3997,6 +4067,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        stage.next("dispatch_prepare");
         ggml_backend_cuda_profile_compute_t cuda_compute = nullptr;
         if (profile.enabled && profile.cuda) {
             ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
@@ -4229,18 +4300,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         if (!sched->callback_eval) {
             if (sched->before_split_submit) {
+                stage.next("before_submit_callback");
                 sched->before_split_submit(sched->before_split_submit_user_data);
             }
+            stage.next("graph_submit");
             enum ggml_status ec = dispatch(main_graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
             if (after_submit.pending.split == split) {
+                stage.next("after_submit_callback");
                 const auto pending = after_submit.pending;
                 after_submit.pending = {};
                 pending.callback(sched, pending.user_data);
             }
         } else {
+            stage.next("graph_submit_eval");
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -4276,6 +4351,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        stage.next("split_finish");
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
@@ -4288,6 +4364,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    graph_stage.next("graph_cleanup");
     async_input_guard.success = true;
     return GGML_STATUS_SUCCESS;
 }
@@ -4325,11 +4402,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * dual_pinned_hip = getenv("GGML_SCHED_HIP_DUAL_PINNED_HANDOFF");
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
+    const char * verify_trace_path = getenv("GGML_SCHED_HIP_VERIFY_STAGE_TRACE");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
     const char * async_hip_mtp4_return = getenv("GGML_SCHED_HIP_MTP4_ASYNC_RETURN");
     const bool allow_hip_handoff = placement && *placement && sched->n_copies == 1;
+    const bool allow_verify_trace = allow_hip_handoff && verify_trace_path && *verify_trace_path;
     const bool allow_hip_batch = allow_hip_handoff && batch_hip && strcmp(batch_hip, "1") == 0;
     const bool allow_hip_mtp4_input = allow_hip_handoff && async_hip_mtp4_input && strcmp(async_hip_mtp4_input, "1") == 0;
     const bool allow_hip_mtp4_return = allow_hip_handoff && async_hip_mtp4_return && strcmp(async_hip_mtp4_return, "1") == 0;
@@ -4342,13 +4421,30 @@ ggml_backend_sched_t ggml_backend_sched_new(
             (allow_hip_handoff && measure_hip && strcmp(measure_hip, "1") == 0);
     bool cuda_vulkan = false;
     bool cuda_hip = false;
+    bool verify_trace_pair = false;
+    const bool check_hip_pair = allow_hip_batch || allow_hip_wait_skip || allow_hip_shared ||
+            allow_hip_mtp4_shared || allow_hip_timing || allow_hip_mtp4_input || allow_hip_mtp4_return;
     for (int src = 0; src < n_backends; ++src) {
         for (int dst = src + 1; dst < n_backends; ++dst) {
             cuda_vulkan |= ggml_backend_sched_is_cuda_vulkan_pair(backends[src], backends[dst]);
-            if (allow_hip_batch || allow_hip_wait_skip || allow_hip_shared || allow_hip_mtp4_shared || allow_hip_timing ||
-                    allow_hip_mtp4_input || allow_hip_mtp4_return) {
-                cuda_hip |= ggml_backend_sched_is_cuda_pair(backends[src], backends[dst], "ROCm");
+            if (check_hip_pair || allow_verify_trace) {
+                const bool pair = ggml_backend_sched_is_cuda_pair(backends[src], backends[dst], "ROCm");
+                cuda_hip |= check_hip_pair && pair;
+                verify_trace_pair |= allow_verify_trace && pair;
             }
+        }
+    }
+    if (verify_trace_pair) {
+        auto * trace = new (std::nothrow) ggml_backend_hip_verify_trace(verify_trace_path);
+        if (trace && trace->rows) {
+            trace->backend_names.reserve(n_backends);
+            for (int i = 0; i < n_backends; ++i) {
+                trace->backend_names.emplace_back(ggml_backend_name(backends[i]));
+            }
+            sched->hip_verify_trace = trace;
+        } else {
+            delete trace;
+            GGML_LOG_WARN("HIP verify stage trace: interval buffer allocation failed\n");
         }
     }
     cuda_vulkan = cuda_vulkan && placement && *placement;
@@ -4485,6 +4581,32 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (auto * trace = sched->hip_verify_trace) {
+        if (trace->count) {
+            FILE * file = fopen(trace->path, "a");
+            if (file) {
+                if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0) {
+                    fputs("scheduler,graph,split,backend,stage,start_us,end_us\n", file);
+                }
+                for (size_t i = 0; i < trace->count; ++i) {
+                    const auto & row = trace->rows[i];
+                    const char * backend = row.backend < 0 ? "host" : trace->backend_names[row.backend].c_str();
+                    fprintf(file, "%p,%llu,%d,%s,%s,%lld,%lld\n", (void *) sched,
+                            (unsigned long long) row.graph, row.split, backend, row.stage,
+                            (long long) row.start_us, (long long) row.end_us);
+                }
+                const bool failed = ferror(file);
+                if (fclose(file) != 0 || failed) {
+                    GGML_LOG_WARN("HIP verify stage trace: incomplete write to %s\n", trace->path);
+                }
+            } else {
+                GGML_LOG_WARN("HIP verify stage trace: could not open %s\n", trace->path);
+            }
+        }
+        GGML_LOG_INFO("HIP verify stage trace: graphs=%llu rows=%zu dropped=%zu path=%s\n",
+                (unsigned long long) trace->graphs, trace->count, trace->dropped, trace->path);
+        delete trace;
     }
     if (sched->shared_input_pending) {
         ggml_backend_synchronize(sched->shared_input.vk);
@@ -4703,6 +4825,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+    auto * trace = sched->target_mtp_verify_three ? sched->hip_verify_trace : nullptr;
+    ggml_backend_hip_verify_stage stage{trace, trace ? trace->graphs + 1 : 0, -1, -1};
+    stage.next("graph_allocate");
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -4716,6 +4841,17 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_alloc = true;
 
     return true;
+}
+
+int64_t ggml_backend_sched_hip_verify_stage_time(ggml_backend_sched_t sched) {
+    return sched && sched->hip_verify_trace ? ggml_time_us() : 0;
+}
+
+void ggml_backend_sched_hip_verify_stage_record(ggml_backend_sched_t sched, const char * stage, int64_t start, bool before_compute) {
+    if (start && sched && sched->hip_verify_trace) {
+        auto * trace = sched->hip_verify_trace;
+        trace->record(trace->graphs + before_compute, -1, -1, stage, start, ggml_time_us());
+    }
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

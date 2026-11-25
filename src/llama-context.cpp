@@ -2138,6 +2138,8 @@ static constexpr uint32_t mtp_draft_graph_cache_max_tokens = 8;
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
         bool profile, bool draft_cache_eligible) {
+    auto * stage_sched = target_mtp_verify_width == 3 && ubatch.n_tokens == 3 ? sched.get() : nullptr;
+    const int64_t stage_prepare = ggml_backend_sched_hip_verify_stage_time(stage_sched);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2208,6 +2210,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ~scheduler_verify_four_scope() { if (sched) { ggml_backend_sched_set_target_mtp_verify_four(sched, previous); } }
     } verify_four{verify_sched, verify_sched && ggml_backend_sched_set_target_mtp_verify_four(verify_sched,
             mtp_verify_four_enabled && target_mtp_verify_width == 4 && ubatch.n_tokens == 4)};
+    ggml_backend_sched_hip_verify_stage_record(stage_sched, "context_prepare", stage_prepare, true);
 
     if (draft_cache ? reuse : can_reuse()) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2228,7 +2231,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+            const int64_t stage_build = ggml_backend_sched_hip_verify_stage_time(stage_sched);
             auto * gf = model.build_graph(gparams);
+            ggml_backend_sched_hip_verify_stage_record(stage_sched, "graph_build", stage_build, true);
             if (!gf) {
                 LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
                 ret = GGML_STATUS_FAILED;
@@ -2254,15 +2259,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const int64_t stage_inputs = ggml_backend_sched_hip_verify_stage_time(stage_sched);
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        ggml_backend_sched_hip_verify_stage_record(stage_sched, "graph_inputs", stage_inputs, true);
     }
 
     ggml_status status = GGML_STATUS_FAILED;
+    const int64_t stage_prefetch_setup = ggml_backend_sched_hip_verify_stage_time(stage_sched);
+    int64_t stage_prefetch_finish = 0;
     {
         struct prefetch_scope {
             llama_moe_cache * cache;
@@ -2297,8 +2304,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (prefetch.cache) {
             prefetch.cache->begin_next_router_prefetch(sched.get(), res->t_next_router, res->t_next_router_scores);
         }
+        ggml_backend_sched_hip_verify_stage_record(stage_sched, "router_prefetch_setup", stage_prefetch_setup, true);
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
+        stage_prefetch_finish = ggml_backend_sched_hip_verify_stage_time(stage_sched);
     }
+    ggml_backend_sched_hip_verify_stage_record(stage_sched, "router_prefetch_finish", stage_prefetch_finish, false);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2596,6 +2606,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
         LLAMA_LOG_ERROR("%s: %zu-position MTP verification is unavailable\n", __func__, batch_inp.tokens.size());
         return -1;
     }
+    auto * stage_sched = target_mtp_verify_width == 3 ? sched.get() : nullptr;
+    const int64_t stage_decode_prepare = ggml_backend_sched_hip_verify_stage_time(stage_sched);
+    int64_t stage_decode_outputs = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2865,8 +2878,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
                 }
             }
         }
+        ggml_backend_sched_hip_verify_stage_record(stage_sched, "decode_prepare", stage_decode_prepare, true);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
                 decode_profile && n_tokens_all == 1, !prefill && n_tokens_all <= mtp_draft_graph_cache_max_tokens);
+        stage_decode_outputs = ggml_backend_sched_hip_verify_stage_time(stage_sched);
         expert_trace.success = res != nullptr;
 
         if (!res) {
@@ -3132,6 +3147,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
     mtp_first_draft_ready = first_draft_ready;
     mtp_first_draft_row = deferred_draft_row;
+    ggml_backend_sched_hip_verify_stage_record(stage_sched, "decode_output_enqueue", stage_decode_outputs, false);
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();

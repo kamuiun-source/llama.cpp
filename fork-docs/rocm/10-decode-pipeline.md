@@ -426,6 +426,21 @@ Expert tupleの4種の実サイズをrocprofのコピー記録から照合した
 
 全体の平均を詰める観点では、RTXの量子化行列ベクトル積をモデルの投影・量子型別に照合するのが次の切り分けになる。第4問の遅れを詰める場合はExpert H2Dの転送量・上位層を追う。GPU間の受け渡し計時外の非活動9.167 msのうち3.415 msはホストの同期APIに含まれ、残りの内訳は今回の区間情報では特定していない。解析スクリプトとJSONはGit外の `/home/t-saka/rocm-hip-mapped-return-ab-20261125/adopted/`。
 
+##### 受け渡し計時外の9.167 msを再集計
+
+上と同じ273回の本体検証で、両GPUのカーネル、DMA、コピー用GPUカーネルの和集合を引き、GPU間受け渡し計時内も除いた区間を使用。CUDA/HIPのAPIと重なる時間を下表の順で割り当て、入れ子のAPIの重複を除いた。APIの時間は各呼び出し全体ではなく、該当の空白と重なった部分。
+
+| 区分 | ms/実3位置検証 |
+| --- | ---: |
+| 同期API（うち `hipStreamSynchronize` 3.340） | 3.415 |
+| 起動・Graph実行管理API（うち `cudaGraphLaunch` 2.567） | 2.858 |
+| 転送・memsetのAPI | 0.400 |
+| イベント・デバイス切り替えとその他API | 0.150 |
+| CUDA/HIP API外 | 2.343 |
+| 合計 | 9.167 |
+
+元の計測はMI50→RTXの直接書き込みを有効にした時点。最新のRTX→MI50直接書き込みやSplit-Kの採用後の値とは別。CPUで何をしていたかはAPI外の区間だけでは特定できず、スケジューラ内の時刻もあわせて記録する。解析スクリプトとJSONはGit外の `/home/t-saka/rocm-verify-idle-20261125/`。
+
 #### RTXの量子化投影を集計する
 
 LinuxのAda向けビルドで `GGML_CUDA_MMVQ_TRACE=1` を指定すると、RTXのdense MMVQのNVTXに重み名・出力名・量子型・テンソル形状・起動形状が出る。Nsight Systemsは `--trace=cuda,nvtx --cuda-graph-trace=node` で起動時から採取し、SQLiteへエクスポートする。CUDA Graphは再生を継続する。再キャプチャ時だけ実行グラフを作り直し、古いノードIDへの誤対応を防ぐ。通常の速度比較ではこのフラグを外す。
