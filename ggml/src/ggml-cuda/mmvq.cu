@@ -72,7 +72,8 @@ struct mmvq_launch_trace {
     char label[768];
 
     mmvq_launch_trace(const ggml_cuda_kernel_launch_params & params, int cols, bool fusion,
-                     bool small_k, bool halve_iters, bool hc_reuse = false, int row_groups = 1) : stream(params.stream) {
+                     bool small_k, bool halve_iters, bool hc_reuse = false, int row_groups = 1,
+                     const char * hc_down_stage = nullptr) : stream(params.stream) {
         if (!tensors) {
             return;
         }
@@ -82,14 +83,15 @@ struct mmvq_launch_trace {
         constexpr auto shape = [](const ggml_tensor * tensor, int i) { return static_cast<long long>(tensor->ne[i]); };
         std::snprintf(label, sizeof(label),
             "mmvq_launch dst=\"%s\" weight=\"%s\" quant=%s weight_ne=%lldx%lldx%lldx%lld src_ne=%lldx%lldx%lldx%lld dst_ne=%lldx%lldx%lldx%lld"
-            " grid=%ux%ux%u block=%ux%ux%u smem=%zu cols=%d fusion=%d small_k=%d halve_iters=%d hc_reuse=%d row_groups=%d",
+            " grid=%ux%ux%u block=%ux%ux%u smem=%zu cols=%d fusion=%d small_k=%d halve_iters=%d hc_reuse=%d row_groups=%d%s%s",
             dst->name, weight->name, ggml_type_name(weight->type),
             shape(weight, 0), shape(weight, 1), shape(weight, 2), shape(weight, 3),
             shape(src, 0), shape(src, 1), shape(src, 2), shape(src, 3),
             shape(dst, 0), shape(dst, 1), shape(dst, 2), shape(dst, 3),
             params.block_nums.x, params.block_nums.y, params.block_nums.z,
             params.block_dims.x, params.block_dims.y, params.block_dims.z, params.shmem,
-            cols, fusion, small_k, halve_iters, hc_reuse, row_groups);
+            cols, fusion, small_k, halve_iters, hc_reuse, row_groups,
+            hc_down_stage ? " hc_down_stage=" : "", hc_down_stage ? hc_down_stage : "");
         nvtxRangePushA(label);
     }
 
@@ -742,7 +744,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
-          bool hc_reuse = false, int row_groups = 1>
+          bool hc_reuse = false, int row_groups = 1, int split_k = 1>
 __launch_bounds__(row_groups*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -770,6 +772,8 @@ static __global__ void mul_mat_vec_q(
     const     int group = row_groups == 1 ? 0 : threadIdx.z;
     const     int row0 = rows_per_cuda_block*(row_groups*blockIdx.x + group);
     const     int blocks_per_row_x = ncols_x / qk;
+    const     int k_first = split_k == 1 ? 0 : blockIdx.z * blocks_per_row_x / split_k;
+    const     int k_end = split_k == 1 ? blocks_per_row_x : (blockIdx.z + 1) * blocks_per_row_x / split_k;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
@@ -787,7 +791,11 @@ static __global__ void mul_mat_vec_q(
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
-    sample_dst = blockIdx.z;
+    sample_dst = split_k == 1 ? blockIdx.z : 0;
+    if constexpr (split_k != 1) {
+        static_assert(hc_reuse && type == GGML_TYPE_Q8_0 && ncols_dst == 3 && row_groups == 1);
+        dst += blockIdx.z * stride_sample_dst;
+    }
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -865,7 +873,7 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = k_first + tid / (qi/vdr); kbx < k_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -877,7 +885,7 @@ static __global__ void mul_mat_vec_q(
             // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
             constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
             const int kbx_pf = kbx + pf_dist*blocks_per_iter;
-            if (kbx_pf < blocks_per_row_x) {
+            if (kbx_pf < k_end) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
@@ -1027,6 +1035,22 @@ static __global__ void mul_mat_vec_q(
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
     }
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static constexpr int hc_down_split_k_parts = 4;
+
+static __global__ void hc_down_split_k_reduce(const float * partial, float * dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float sum = partial[i];
+#pragma unroll
+        for (int part = 1; part < hc_down_split_k_parts; ++part) {
+            sum += partial[part * n + i];
+        }
+        dst[i] = sum;
+    }
+}
+#endif
 
 #ifdef GGML_USE_HIP
 static __device__ __forceinline__ void iq3_xxs_dot_shared_tokens(
@@ -2142,13 +2166,47 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool hc_down_split_k = [] {
+        const char * value = std::getenv("GGML_CUDA_HC_DOWN_SPLIT_K");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool fixed_mtp_three = [] {
+        const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const bool hc_down_width3 =
+            (hc_down_split_k
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+             || mmvq_current_trace
+#endif
+            ) && fixed_mtp_three && !ids && !fusion && src0->type == GGML_TYPE_Q8_0 && device.cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            ne00 == 10240 && ne01 == 320 && ne11 == 3 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+            ggml_is_contiguous(dst) && ggml_cuda_hc_projection_for_weight(src0->name) == GGML_CUDA_HC_DOWN;
+#endif
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        const auto quantize = [&] {
+            quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        };
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+        if (mmvq_current_trace && hc_down_width3) {
+            const ggml_cuda_kernel_launch_params params(
+                    dim3((ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne11, ne12 * ne13),
+                    dim3(CUDA_QUANTIZE_BLOCK_SIZE), 0, stream);
+            const mmvq_launch_trace trace(params, ne11, false, false, false, false, 1, "quantize");
+            quantize();
+        } else
+#endif
+        {
+            quantize();
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -2198,6 +2256,35 @@ void ggml_cuda_mul_mat_vec_q(
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (hc_down_split_k && hc_down_width3) {
+        const int n = ne01 * ne11;
+        ggml_cuda_pool_alloc<float> partial(ctx.pool(), n * hc_down_split_k_parts);
+        auto dims = calc_launch_params<GGML_TYPE_Q8_0>(3, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
+        dims.first.z = hc_down_split_k_parts;
+        {
+            const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            const mmvq_launch_trace trace(params, 3, false, false, false, true, 1, "partial");
+#endif
+            ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, 3, false, false, false, true, 1, hc_down_split_k_parts>, params,
+                src0->data, src1_q8_1.get(), nullptr, fusion_local, partial.get(), uint32_t(ne00), make_uint3(0, 0, 0),
+                uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(n), uint32_t(0));
+        }
+        {
+            constexpr int threads = 128;
+            const ggml_cuda_kernel_launch_params params(dim3((n + threads - 1) / threads), dim3(threads), 0, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            const mmvq_launch_trace trace(params, 3, false, false, false, true, 1, "reduce");
+#endif
+            ggml_cuda_kernel_launch(hc_down_split_k_reduce, params, partial.get(), dst_d, n);
+        }
+        static const bool logged = (GGML_LOG_INFO("CUDA HC down split-K applied: Q8_0 K=10240 rows=320 tokens=3 splits=%d\n",
+                hc_down_split_k_parts), true);
+        GGML_UNUSED(logged);
+        return;
+    }
+
     static const bool hc_up_pair = [] {
         const char * value = std::getenv("GGML_CUDA_HC_UP_PAIR");
         return value && std::strcmp(value, "1") == 0;
@@ -2210,7 +2297,6 @@ void ggml_cuda_mul_mat_vec_q(
         const char * value = std::getenv("GGML_CUDA_HC_UP_REUSE");
         return value && std::strcmp(value, "1") == 0;
     }();
-    const auto & device = ggml_cuda_info().devices[ctx.device];
     if ((hc_down_reuse || hc_up_reuse) && !ids && !fusion && src0->type == GGML_TYPE_Q8_0 &&
             device.cc == GGML_CUDA_CC_ADA_LOVELACE && (ne11 == 2 || (ne11 == 3 && ggml_cuda_hc_mtp_three_enabled())) &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
@@ -2228,7 +2314,8 @@ void ggml_cuda_mul_mat_vec_q(
                 dims.second.z = row_groups;
                 const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
 #ifdef GGML_CUDA_HAVE_MMVQ_TRACE
-                const mmvq_launch_trace trace(params, ncols, false, false, false, true, row_groups);
+                const mmvq_launch_trace trace(params, ncols, false, false, false, true, row_groups,
+                        down && ncols == 3 ? "dot" : nullptr);
 #endif
                 ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, ncols, false, false, false, true, row_groups>, params,
                     src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
