@@ -9,6 +9,45 @@
 #include <cstdlib>
 #include <cstring>
 
+static ggml_tensor * qwen4exp_merge_qkv_gate(llama_model_loader & ml, const std::string & name,
+        ggml_tensor *& qkv, ggml_tensor * gate) {
+    if (ml.files.empty() || !qkv || !gate || qkv->type != GGML_TYPE_Q6_K || gate->type != GGML_TYPE_Q6_K ||
+            qkv->ne[0] != 2560 || gate->ne[0] != 2560 || qkv->ne[1] != 10240 || gate->ne[1] != 6144 ||
+            !ggml_is_matrix(qkv) || !ggml_is_matrix(gate) || !ggml_is_contiguous(qkv) || !ggml_is_contiguous(gate) ||
+            qkv->data || gate->data || qkv->view_src || gate->view_src) {
+        return nullptr;
+    }
+    for (auto & [key, ctx] : ml.ctx_map) {
+        const auto dev = ggml_backend_buft_get_device(key.buft);
+        if (key.lazy || !dev || key.buft != ggml_backend_dev_buffer_type(dev) ||
+                ggml_get_tensor(ctx.get(), qkv->name) != qkv || ggml_get_tensor(ctx.get(), gate->name) != gate) {
+            continue;
+        }
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        using is_ada_t = bool (*)(ggml_backend_dev_t);
+        const auto is_ada = reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 ?
+                reinterpret_cast<is_ada_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_is_ada")) : nullptr;
+        if (!is_ada || !is_ada(dev)) {
+            return nullptr;
+        }
+
+        // The loader reads each GGUF tensor into its original named view of a single allocation.
+        auto * backing = qkv;
+        const size_t gate_offset = ggml_nbytes(qkv);
+        qkv = ggml_dup_tensor(ctx.get(), backing);
+        ggml_set_name(qkv, backing->name);
+        qkv->view_src = backing;
+        gate->view_src = backing;
+        gate->view_offs = gate_offset;
+        backing->ne[1] += gate->ne[1];
+        backing->nb[2] = backing->nb[1] * backing->ne[1];
+        backing->nb[3] = backing->nb[2];
+        ggml_set_name(backing, name.c_str());
+        return backing;
+    }
+    return nullptr;
+}
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -177,6 +216,10 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
+    const char * qkv_gate_merge = std::getenv("GGML_CUDA_QKV_GATE_MERGE");
+    const bool merge_qkv_gate = qkv_gate_merge && std::strcmp(qkv_gate_merge, "1") == 0;
+    int n_merged_qkv_gate = 0;
+
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
@@ -277,6 +320,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         } else {
             create_merged(LLM_TENSOR_ATTN_QKV_GATE, LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_GATE, n_embd, key_dim * 2 + value_dim, value_dim,
                     layer.wqkv_z, layer.wqkv, layer.wqkv_gate);
+            if (merge_qkv_gate && !layer.wqkv_z) {
+                layer.wqkv_z = qwen4exp_merge_qkv_gate(ml, tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", il).str(), layer.wqkv, layer.wqkv_gate);
+                n_merged_qkv_gate += layer.wqkv_z != nullptr;
+            }
             layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, flags);
@@ -307,6 +354,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     for (int il = 0; il < n_layer; ++il) {
         load_block(il, trunk_flags);
+    }
+    if (n_merged_qkv_gate && !ml.no_alloc) {
+        LLAMA_LOG_INFO("CUDA Q6_K QKV/gate merge: prepared %d layers\n", n_merged_qkv_gate);
     }
 
     // the MTP block: one full-attention QSA layer fed by [enorm(e) ; hnorm(h)_s] -> eh_proj per hc stream
@@ -704,10 +754,24 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    if (model.layers[il].wqkv_z) {
+    const auto & layer = model.layers[il];
+    const bool runtime_merged = layer.wqkv_z && layer.wqkv;
+    const auto has_precision_override = [&](const ggml_tensor * weight) {
+        return prec_policy && (prec_policy->prec_acc.count(weight) || prec_policy->prec_src1.count(weight));
+    };
+    const bool use_runtime_merge = runtime_merged && ubatch.n_tokens == 3 && n_seqs == 1 &&
+            input->type == GGML_TYPE_F32 && ggml_is_contiguous(input) &&
+            loras->empty() && !layer.wqkv_s && !layer.wqkv_gate_s &&
+            !has_precision_override(layer.wqkv) && !has_precision_override(layer.wqkv_gate) && !has_precision_override(layer.wqkv_z) &&
+            (!hdmd || (!hdmd->rot.count(layer.wqkv) && !hdmd->rot.count(layer.wqkv_gate)));
+    if (layer.wqkv_z && (!runtime_merged || use_runtime_merge)) {
         // qkv and z read the same input: one matmul, then the qkv rows and the z rows
-        ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        ggml_tensor * qkvz = build_lora_mm(layer.wqkv_z, input);
         cb(qkvz, "linear_attn_qkvz", il);
+        if (use_runtime_merge) {
+            static const bool logged = (LLAMA_LOG_INFO("CUDA Q6_K QKV/gate merge: selected width-3 projection\n"), true);
+            GGML_UNUSED(logged);
+        }
 
         const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
         const int64_t n_qkv = qkvz->ne[0] - n_z;
@@ -721,11 +785,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
         return { qkv_mixed, z };
     }
 
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * qkv_mixed = build_lora_mm(layer.wqkv, input, layer.wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_tensor * z = build_lora_mm(layer.wqkv_gate, input, layer.wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };

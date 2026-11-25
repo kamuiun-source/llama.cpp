@@ -7585,6 +7585,14 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_is_ada") == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE;
+        };
+    }
+#endif
 #ifdef GGML_USE_HIP
     if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
         return (void *) ggml_hip_gfx906_set_lds_modes;
