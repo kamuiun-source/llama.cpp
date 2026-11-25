@@ -1604,6 +1604,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_src      (params.h_nextn_src),
     mtp_vocab_head   (params.mtp_vocab_head),
     mtp_vocab_ids    (params.mtp_vocab_ids),
+    mtp_vocab_extra_head(params.mtp_vocab_extra_head),
+    mtp_vocab_extra_bias(params.mtp_vocab_extra_bias),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

@@ -287,7 +287,10 @@ public:
     uint32_t graph_max_nodes() const;
     uint32_t n_ubatch_prefill() const;
     uint32_t n_ubatch_reserve() const;
-    bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr; }
+    bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr && !mtp_vocab_request; }
+    bool mtp_request_vocab_enabled() const { return bool(mtp_vocab_request); }
+    void mtp_request_vocab_begin(const std::vector<llama_token> & prompt);
+    void mtp_request_vocab_prepare(const std::vector<llama_token> & prompt, llama_token last, bool greedy);
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -424,10 +427,28 @@ private:
     std::vector<swap_info> output_swaps;
 
     void init_mtp_vocab_subset();
+    void update_mtp_request_vocab();
     ggml_context_ptr mtp_vocab_ctx;
     ggml_backend_buffer_ptr mtp_vocab_buffer;
     ggml_tensor * mtp_vocab_head = nullptr;
     ggml_tensor * mtp_vocab_ids = nullptr;
+    struct mtp_request_vocab_state {
+        ggml_tensor * extra_head = nullptr;
+        ggml_tensor * extra_bias = nullptr;
+        std::vector<llama_token> special;
+        std::vector<llama_token> selected;
+        std::vector<llama_token> uploaded;
+        size_t published_rows = SIZE_MAX;
+        unsigned rounds_since_update = 0;
+        unsigned max_misses = 8;
+        bool dirty = false;
+        bool active = false;
+        size_t requests = 0, compact_rounds = 0, full_rounds = 0;
+        size_t last_miss_rounds = 0, window_miss_rounds = 0;
+        size_t updates = 0, row_copies = 0, peak_extra_rows = 0;
+        int64_t update_us = 0;
+    };
+    std::unique_ptr<mtp_request_vocab_state> mtp_vocab_request;
 
     ggml_backend_sched_ptr sched;
     bool mtp_verify_three_enabled = false;

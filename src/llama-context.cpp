@@ -726,12 +726,18 @@ static std::vector<int64_t> llama_read_mtp_vocab(const char * path, int64_t n_vo
     return ids;
 }
 
+static constexpr size_t mtp_request_vocab_extra = 1024;
+static constexpr unsigned mtp_request_vocab_window = 32;
+static constexpr unsigned mtp_request_vocab_update_rounds = 8;
+
 void llama_context::init_mtp_vocab_subset() {
     if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         return;
     }
     const char * path = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
     const char * stats = std::getenv("LLAMA_MTP_DRAFT_VOCAB_STATS");
+    const char * request_flag = std::getenv("LLAMA_MTP_DRAFT_VOCAB_REQUEST");
+    const bool request = request_flag && std::strcmp(request_flag, "1") == 0;
     uint32_t prefix = 0;
     if (const char * value = std::getenv("LLAMA_MTP_DRAFT_VOCAB_PREFIX")) {
         const char * end = value + std::strlen(value);
@@ -740,10 +746,16 @@ void llama_context::init_mtp_vocab_subset() {
             throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX must be 0 or a positive integer smaller than the vocabulary size");
         }
     }
+    if (request && path && *path) {
+        throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_REQUEST cannot be combined with LLAMA_MTP_DRAFT_VOCAB");
+    }
     if (prefix > 0 && path && *path) {
         throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX and LLAMA_MTP_DRAFT_VOCAB cannot both select a subset");
     }
     auto * source = model.output;
+    if (request && prefix == 0) {
+        prefix = 98304;
+    }
     if (prefix == 0 && (!path || !*path)) {
         if (stats && std::strcmp(stats, "1") == 0) {
             LLAMA_LOG_INFO("mtp_draft_vocab: enabled=0 full_rows=%u subset_rows=0 full_head_bytes=%zu subset_head_bytes=0 buffer_bytes=0 full_head_retained=1 target_full_vocab=1\n",
@@ -758,10 +770,37 @@ void llama_context::init_mtp_vocab_subset() {
              source->type != GGML_TYPE_BF16 && source->type != GGML_TYPE_F32) ||
             (model.output_s && ggml_nelements(model.output_s) != 1) ||
             !model.hdmd.rot.empty() || !model.hdmd.inv.empty()) {
+        if (request) {
+            LLAMA_LOG_WARN("MTP request vocabulary: incompatible model output head, using full vocabulary\n");
+            return;
+        }
         throw std::runtime_error("MTP draft vocabulary requires a contiguous QWEN4EXP single-head Q8_0/F16/BF16/F32 output with scalar scale and no Hadamard folding");
     }
     if (prefix > 0 && (model.split_mode() == LLAMA_SPLIT_MODE_ROW || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR)) {
+        if (request) {
+            LLAMA_LOG_WARN("MTP request vocabulary: split output head, using full vocabulary\n");
+            return;
+        }
         throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_PREFIX requires a non-split output head (split mode none or layer)");
+    }
+    auto * buft = ggml_backend_buffer_get_type(source->buffer);
+    unsigned max_misses = 8;
+    if (request) {
+        auto * dev = ggml_backend_buft_get_device(buft);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (prefix + mtp_request_vocab_extra >= model.vocab.n_tokens() || cparams.n_seq_max != 1 ||
+                !reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 ||
+                buft != ggml_backend_dev_buffer_type(dev)) {
+            LLAMA_LOG_WARN("MTP request vocabulary: invalid capacity or placement, using full vocabulary\n");
+            return;
+        }
+        if (const char * value = std::getenv("LLAMA_MTP_DRAFT_VOCAB_MAX_MISSES")) {
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, max_misses);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || max_misses > mtp_request_vocab_window) {
+                throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB_MAX_MISSES must be in [0, 32]");
+            }
+        }
     }
     std::vector<int64_t> ids;
     if (prefix > 0) {
@@ -770,18 +809,53 @@ void llama_context::init_mtp_vocab_subset() {
     } else {
         ids = llama_read_mtp_vocab(path, model.vocab.n_tokens());
     }
-    mtp_vocab_ctx.reset(ggml_init({2 * ggml_tensor_overhead() + 1024, nullptr, true}));
+    mtp_vocab_ctx.reset(ggml_init({(request ? 4 : 2) * ggml_tensor_overhead() + 1024, nullptr, true}));
     if (!mtp_vocab_ctx) {
+        if (request) {
+            LLAMA_LOG_WARN("MTP request vocabulary: metadata allocation failed, using full vocabulary\n");
+            return;
+        }
         throw std::runtime_error("MTP draft vocabulary metadata allocation failed");
     }
     mtp_vocab_head = prefix > 0
         ? ggml_view_2d(mtp_vocab_ctx.get(), source, source->ne[0], prefix, source->nb[1], 0)
         : ggml_new_tensor_2d(mtp_vocab_ctx.get(), source->type, source->ne[0], ids.size());
-    mtp_vocab_ids = ggml_new_tensor_1d(mtp_vocab_ctx.get(), GGML_TYPE_I64, ids.size());
+    mtp_vocab_ids = ggml_new_tensor_1d(mtp_vocab_ctx.get(), GGML_TYPE_I64, ids.size() + (request ? mtp_request_vocab_extra : 0));
     ggml_set_name(mtp_vocab_head, "mtp_vocab_subset.weight");
     ggml_set_name(mtp_vocab_ids, "mtp_vocab_subset.global_ids");
-    auto * buft = ggml_backend_buffer_get_type(source->buffer);
-    if (prefix > 0) {
+    if (request) {
+        if (ggml_backend_view_init(mtp_vocab_head) != GGML_STATUS_SUCCESS) {
+            mtp_vocab_head = mtp_vocab_ids = nullptr;
+            mtp_vocab_ctx.reset();
+            LLAMA_LOG_WARN("MTP request vocabulary: prefix view failed, using full vocabulary\n");
+            return;
+        }
+        auto * extra_head = ggml_new_tensor_2d(mtp_vocab_ctx.get(), source->type, source->ne[0], mtp_request_vocab_extra);
+        auto * extra_bias = ggml_new_tensor_1d(mtp_vocab_ctx.get(), GGML_TYPE_F32, mtp_request_vocab_extra);
+        ggml_set_name(extra_head, "mtp_vocab_subset.extra_weight");
+        ggml_set_name(extra_bias, "mtp_vocab_subset.extra_bias");
+        ggml_tensor * tensors[] = {mtp_vocab_ids, extra_head, extra_bias};
+        mtp_vocab_buffer.reset(ggml_backend_buft_alloc_buffer_n(buft, tensors, 3));
+        if (!mtp_vocab_buffer) {
+            mtp_vocab_head = mtp_vocab_ids = nullptr;
+            mtp_vocab_ctx.reset();
+            LLAMA_LOG_WARN("MTP request vocabulary: extra storage allocation failed, using full vocabulary\n");
+            return;
+        }
+        mtp_vocab_request = std::make_unique<mtp_request_vocab_state>();
+        auto & state = *mtp_vocab_request;
+        state.extra_head = extra_head;
+        state.extra_bias = extra_bias;
+        state.max_misses = max_misses;
+        state.uploaded.assign(mtp_request_vocab_extra, LLAMA_TOKEN_NULL);
+        state.selected.reserve(mtp_request_vocab_extra);
+        for (uint32_t id = prefix; id < model.vocab.n_tokens(); ++id) {
+            if (model.vocab.is_eog(id) || llama_token(id) == model.vocab.token_bos()) {
+                state.special.push_back(id);
+            }
+        }
+        ggml_backend_tensor_memset(extra_head, 0, 0, ggml_nbytes(extra_head));
+    } else if (prefix > 0) {
         if (ggml_backend_view_init(mtp_vocab_head) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("MTP draft vocabulary prefix view initialization failed");
         }
@@ -816,12 +890,144 @@ void llama_context::init_mtp_vocab_subset() {
     LLAMA_LOG_INFO("mtp_draft_vocab: enabled=1 full_rows=%u subset_rows=%zu full_head_bytes=%zu subset_head_bytes=%zu buffer_bytes=%zu full_head_retained=1 target_full_vocab=1 backend=%s mode=%s\n",
             model.vocab.n_tokens(), ids.size(), ggml_nbytes(source), ggml_nbytes(mtp_vocab_head),
             ggml_backend_buffer_get_size(mtp_vocab_buffer.get()), ggml_backend_buffer_name(mtp_vocab_buffer.get()),
-            prefix > 0 ? "prefix" : "file");
+            request ? "request" : prefix > 0 ? "prefix" : "file");
+    if (request) {
+        LLAMA_LOG_INFO("mtp_draft_vocab_request: base_rows=%u extra_capacity=%zu max_misses=%u window=%u refresh_rounds=%u\n",
+                prefix, mtp_request_vocab_extra, max_misses, mtp_request_vocab_window, mtp_request_vocab_update_rounds);
+    }
+}
+
+static void mtp_request_vocab_add(std::vector<llama_token> & rows, uint32_t prefix, uint32_t vocab, llama_token id) {
+    if (id >= 0 && uint32_t(id) >= prefix && uint32_t(id) < vocab && rows.size() < mtp_request_vocab_extra &&
+            std::find(rows.begin(), rows.end(), id) == rows.end()) {
+        rows.push_back(id);
+    }
+}
+
+void llama_context::mtp_request_vocab_begin(const std::vector<llama_token> & prompt) {
+    auto & state = *mtp_vocab_request;
+    state.selected.clear();
+    state.active = false;
+    state.dirty = true;
+    state.rounds_since_update = 0;
+    ++state.requests;
+    const uint32_t prefix = mtp_vocab_head->ne[1];
+    const uint32_t vocab = model.vocab.n_tokens();
+    for (auto id : state.special) {
+        mtp_request_vocab_add(state.selected, prefix, vocab, id);
+    }
+    for (auto it = prompt.rbegin(); it != prompt.rend() && state.selected.size() < mtp_request_vocab_extra; ++it) {
+        mtp_request_vocab_add(state.selected, prefix, vocab, *it);
+    }
+}
+
+void llama_context::update_mtp_request_vocab() {
+    auto & state = *mtp_vocab_request;
+    const int64_t start = ggml_time_us();
+    const size_t prefix = mtp_vocab_head->ne[1];
+    const size_t stride = model.output->nb[1];
+    std::vector<ggml_tensor> from, to;
+    from.reserve(state.selected.size());
+    to.reserve(state.selected.size());
+    for (size_t i = 0; i < state.selected.size(); ++i) {
+        const auto id = state.selected[i];
+        if (id == state.uploaded[i]) {
+            continue;
+        }
+        auto src = *model.output;
+        auto dst = *state.extra_head;
+        src.ne[1] = dst.ne[1] = 1;
+        src.nb[2] = src.nb[3] = dst.nb[2] = dst.nb[3] = stride;
+        src.data = static_cast<char *>(src.data) + size_t(id) * stride;
+        dst.data = static_cast<char *>(dst.data) + i * stride;
+        from.push_back(src);
+        to.push_back(dst);
+        state.uploaded[i] = id;
+    }
+    if (from.empty() && state.published_rows == state.selected.size()) {
+        state.dirty = false;
+        return;
+    }
+    std::vector<const ggml_tensor *> srcs;
+    std::vector<ggml_tensor *> dsts;
+    srcs.reserve(from.size());
+    dsts.reserve(to.size());
+    for (size_t i = 0; i < from.size(); ++i) {
+        srcs.push_back(&from[i]);
+        dsts.push_back(&to[i]);
+    }
+
+    // Every scatter slot needs a unique in-range ID, even when its logit is masked out.
+    std::vector<int64_t> ids(state.selected.begin(), state.selected.end());
+    ids.reserve(mtp_request_vocab_extra);
+    for (size_t id = prefix; ids.size() < mtp_request_vocab_extra; ++id) {
+        if (std::find(state.selected.begin(), state.selected.end(), id) == state.selected.end()) {
+            ids.push_back(id);
+        }
+    }
+    std::vector<float> bias(ids.size(), -std::numeric_limits<float>::infinity());
+    std::fill_n(bias.begin(), state.selected.size(), 0.0f);
+
+    // A previous draft or catch-up may still be reading these persistent buffers.
+    synchronize();
+    ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), srcs.size());
+    ggml_backend_tensor_set(mtp_vocab_ids, ids.data(), prefix * sizeof(int64_t), ids.size() * sizeof(int64_t));
+    ggml_backend_tensor_set(state.extra_bias, bias.data(), 0, bias.size() * sizeof(float));
+    state.dirty = false;
+    state.published_rows = state.selected.size();
+    state.row_copies += from.size();
+    state.peak_extra_rows = std::max(state.peak_extra_rows, state.selected.size());
+    ++state.updates;
+    state.update_us += ggml_time_us() - start;
+}
+
+void llama_context::mtp_request_vocab_prepare(const std::vector<llama_token> & prompt, llama_token last, bool greedy) {
+    auto & state = *mtp_vocab_request;
+    if (!greedy || !loras->empty() || !state.requests) {
+        state.active = false;
+        ++state.full_rounds;
+        return;
+    }
+    const uint32_t prefix = mtp_vocab_head->ne[1];
+    const uint32_t vocab = model.vocab.n_tokens();
+    const size_t recent = std::min<size_t>(prompt.size(), mtp_request_vocab_window - 1);
+    if (++state.rounds_since_update >= mtp_request_vocab_update_rounds || state.dirty) {
+        const size_t previous = state.selected.size();
+        mtp_request_vocab_add(state.selected, prefix, vocab, last);
+        for (size_t i = 0; i < recent; ++i) {
+            mtp_request_vocab_add(state.selected, prefix, vocab, prompt[prompt.size() - 1 - i]);
+        }
+        if (state.dirty || previous != state.selected.size()) {
+            update_mtp_request_vocab();
+        }
+        state.rounds_since_update = 0;
+    }
+    const auto missing = [&](llama_token id) {
+        return id >= 0 && uint32_t(id) >= prefix && uint32_t(id) < vocab &&
+                std::find(state.selected.begin(), state.selected.end(), id) == state.selected.end();
+    };
+    const bool last_missing = missing(last);
+    unsigned misses = last_missing;
+    for (size_t i = prompt.size() - recent; i < prompt.size(); ++i) {
+        misses += missing(prompt[i]);
+    }
+    state.active = !last_missing && misses <= state.max_misses;
+    state.compact_rounds += state.active;
+    state.full_rounds += !state.active;
+    state.last_miss_rounds += last_missing;
+    state.window_miss_rounds += misses > state.max_misses;
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (mtp_vocab_request) {
+        const auto & state = *mtp_vocab_request;
+        LLAMA_LOG_INFO("mtp_draft_vocab_request: requests=%zu compact_rounds=%zu full_rounds=%zu last_miss_rounds=%zu"
+                " window_miss_rounds=%zu updates=%zu uploaded_rows=%zu peak_extra_rows=%zu update_ms=%.3f\n",
+                state.requests, state.compact_rounds, state.full_rounds, state.last_miss_rounds, state.window_miss_rounds,
+                state.updates, state.row_copies, state.peak_extra_rows, state.update_us / 1000.0);
+    }
     mtp_draft_graph_cache_reset();
     if (mtp_draft_graph_cache2 || mtp_draft_graph_cache_switches != 0) {
         LLAMA_LOG_INFO("MTP draft graph cache2: switches=%" PRIu64 " hits=%" PRIu64 "\n",
@@ -3633,6 +3839,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    const bool use_mtp_vocab = !mtp_vocab_request || (mtp_vocab_request->active && loras->empty());
     return {
         /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
@@ -3652,8 +3859,10 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
-        /*.mtp_vocab_head =*/ mtp_vocab_head,
-        /*.mtp_vocab_ids  =*/ mtp_vocab_ids,
+        /*.mtp_vocab_head =*/ use_mtp_vocab ? mtp_vocab_head : nullptr,
+        /*.mtp_vocab_ids  =*/ use_mtp_vocab ? mtp_vocab_ids : nullptr,
+        /*.mtp_vocab_extra_head =*/ use_mtp_vocab && mtp_vocab_request ? mtp_vocab_request->extra_head : nullptr,
+        /*.mtp_vocab_extra_bias =*/ use_mtp_vocab && mtp_vocab_request ? mtp_vocab_request->extra_bias : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -5844,6 +6053,18 @@ int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batc
 
 bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
     return ctx->mtp_vocab_subset_enabled();
+}
+
+bool llama_mtp_request_vocab_enabled(const llama_context * ctx) {
+    return ctx->mtp_request_vocab_enabled();
+}
+
+void llama_mtp_request_vocab_begin(llama_context * ctx, const std::vector<llama_token> & prompt) {
+    ctx->mtp_request_vocab_begin(prompt);
+}
+
+void llama_mtp_request_vocab_prepare(llama_context * ctx, const std::vector<llama_token> & prompt, llama_token last, bool greedy) {
+    ctx->mtp_request_vocab_prepare(prompt, last, greedy);
 }
 
 int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {

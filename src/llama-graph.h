@@ -815,6 +815,8 @@ struct llm_graph_params {
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
     ggml_tensor * mtp_vocab_head = nullptr;
     ggml_tensor * mtp_vocab_ids = nullptr;
+    ggml_tensor * mtp_vocab_extra_head = nullptr;
+    ggml_tensor * mtp_vocab_extra_bias = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -918,6 +920,8 @@ struct llm_graph_params {
             h_nextn_src   == other.h_nextn_src   &&
             mtp_vocab_head == other.mtp_vocab_head &&
             mtp_vocab_ids == other.mtp_vocab_ids &&
+            mtp_vocab_extra_head == other.mtp_vocab_extra_head &&
+            mtp_vocab_extra_bias == other.mtp_vocab_extra_bias &&
             target_mtp_verify_three == other.target_mtp_verify_three &&
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
@@ -1109,6 +1113,8 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_src;
     ggml_tensor * mtp_vocab_head;
     ggml_tensor * mtp_vocab_ids;
+    ggml_tensor * mtp_vocab_extra_head;
+    ggml_tensor * mtp_vocab_extra_bias;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

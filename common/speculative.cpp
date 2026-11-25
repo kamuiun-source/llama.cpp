@@ -1578,6 +1578,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool auto_draft_row_lazy = false;
     bool fixed_three_pending_requested = false;
     bool fixed_four_pending_requested = false;
+    bool request_vocab = false;
     bool multi_draft_device_pending = false;
     bool multi_draft_pending_host_valid = true;
     size_t multi_draft_pending_fallbacks = 0;
@@ -1703,6 +1704,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_get_model(ctx_tgt) != llama_get_model(ctx_dft) &&
                 is_qwen4exp(llama_get_model(ctx_tgt)) && is_qwen4exp(llama_get_model(ctx_dft));
         const bool two_draft_candidate = multi_draft_candidate && n_max == 2 && llama_supports_mtp_verify_three(ctx_tgt);
+        request_vocab = two_draft_candidate && mode && std::strcmp(mode, "1") == 0 &&
+                !this->params.probabilistic && this->params.p_min == 0.0f && llama_mtp_request_vocab_enabled(ctx_dft);
         auto_draft_row_metrics = two_draft_candidate && mode && std::strcmp(mode, "auto") == 0;
         auto_draft_row_lazy = auto_draft_row_metrics && lazy && std::strcmp(lazy, "1") == 0;
         const char * pending = std::getenv("LLAMA_MTP_AUTO_DEVICE_PENDING");
@@ -1832,6 +1835,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (reuse_draft_anchor) {
             discard_mtp_anchor(seq_id);
+        }
+        if (request_vocab) {
+            llama_mtp_request_vocab_begin(params.ctx_dft, prompt);
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
@@ -2061,6 +2067,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const bool multi_draft_pending_row = multi_draft_device_pending && ensure_pending_device_row();
             if (multi_draft_device_pending && !multi_draft_pending_row && !multi_draft_pending_host_valid) {
                 continue;
+            }
+            if (request_vocab) {
+                // The server's draft prompt ends before any speculative candidates are appended.
+                static const llama_tokens no_prompt;
+                llama_mtp_request_vocab_prepare(ctx_dft, dp.prompt ? *dp.prompt : no_prompt, dp.id_last,
+                        dp.prompt && dp.temp == 0.0f && !dp.result_q);
             }
             n_drafting++;
             drafting[seq_id] = true;

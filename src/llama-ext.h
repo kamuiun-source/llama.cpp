@@ -16,6 +16,9 @@
 LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API int32_t llama_process_mtp_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API bool llama_mtp_vocab_subset_enabled(const struct llama_context * ctx);
+LLAMA_API bool llama_mtp_request_vocab_enabled(const struct llama_context * ctx);
+LLAMA_API void llama_mtp_request_vocab_begin(struct llama_context * ctx, const std::vector<llama_token> & prompt);
+LLAMA_API void llama_mtp_request_vocab_prepare(struct llama_context * ctx, const std::vector<llama_token> & prompt, llama_token last, bool greedy);
 enum class llama_mtp_draft_row { normal, eager, lazy };
 
 struct llama_mtp_draft_row_stats {

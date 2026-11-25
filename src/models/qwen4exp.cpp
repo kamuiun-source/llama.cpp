@@ -735,7 +735,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
         if (!loras->empty()) {
             throw std::runtime_error("MTP draft vocabulary does not support output LoRA adapters");
         }
-        cur = build_lora_mm(mtp_vocab_head, cur, model.output_s);
+        auto * input = cur;
+        cur = build_lora_mm(mtp_vocab_head, input, model.output_s);
+        if (mtp_vocab_extra_head) {
+            auto * extra = build_lora_mm(mtp_vocab_extra_head, input, model.output_s);
+            cur = ggml_concat(ctx0, cur, ggml_add(ctx0, extra, mtp_vocab_extra_bias), 0);
+        }
         const int64_t count = cur->ne[1];
         auto * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, model.vocab.n_tokens(), count), -INFINITY);
         cur = ggml_set_rows(ctx0, logits, ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], count),
