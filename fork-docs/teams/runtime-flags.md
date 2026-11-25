@@ -34,6 +34,7 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `GGML_VK_SKIP_EMPTY_POOL_RESET` | `0` | Vulkanの空コマンドプールのリセット省略。ウォーム後の両順で改善を確認できず、Fence再利用は維持。 |
 | `GGML_VK_MTP_ROUTED_GATE_UP_PAIR` | `0` | IQ2_S・IQ3_XXSの2位置重み共有。dispatch削減を確認したがウォーム後のDecode速度が低下。 |
 | `LLAMA_MTP_DRAFT_VOCAB` | 未設定 | 語彙縮小。日本語では受理率を維持し、コードでは受理率低下とDecode時間増加。 |
+| `LLAMA_MTP_DRAFT_VOCAB_REQUEST=1` | 未設定 | 固定3幅の検証ブランチ専用。会話からドラフト語彙を追加する。試作の5問では生成速度が低下。ベース語彙は `LLAMA_MTP_DRAFT_VOCAB_PREFIX` で指定。[計測](../research/mtp3-efficiency-20261125.md#固定5問の実機比較) |
 | `LLAMA_EXPERT_RTX_COLD_SLOTS` | 未設定 | RTXへの非駐Expert分担は保留。 |
 | `GGML_CUDA_HC_MIX_FUSE`、`GGML_CUDA_HC_SCALE_SILU_FUSE`、`GGML_CUDA_HC_UP_PAIR` | 未設定 | 旧HC実験。採用済みのdown/up/injectと区別する。 |
 

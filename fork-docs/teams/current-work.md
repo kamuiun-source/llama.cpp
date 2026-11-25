@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- 固定3幅の会話追記型ドラフト語彙を `codex/rocm-mtp3-request-vocab` で試作。固定5問で全語彙47.12 tok/s（保存済み）、196,608語＋会話46.04、98,304語＋会話45.94。ドラフトは4.19→3.74 / 3.19 ms/検証に短縮し、本体検証は276→287 / 295回に増えた。両条件とも応答中のスワップアウト0。既定OFF。[実装条件と比較](../research/mtp3-efficiency-20261125.md#固定5問の実機比較)
+
 - 2026-11-25に `codex/rocm-castagna-port` の `74f3efc85` までを `codex/rocm-integrated-test` に統合した。固定3幅の通常起動は[採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)を参照。RTXのQKV/gate結合は既定OFF。
 
 - RTXのQ6_K QKV/gate結合を `GGML_CUDA_QKV_GATE_MERGE=1` で試作。固定3幅・正式採用設定・5問を2回測り、全640生成ID・本文・MTP358/549は前回と一致。合算47.50 tok/s（過去の3回合算47.38）、本体検証42.40 ms（同42.56）。既定OFF。[実測と適用条件](../rocm/10-decode-pipeline.md#q6_kのqkvとgateをまとめる試作)
