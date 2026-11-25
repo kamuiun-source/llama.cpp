@@ -2692,6 +2692,9 @@ struct llama_moe_cache::impl {
             finish_next_prefetch();
         }
         auto * prediction = (*next_prefetch_predictions)[il];
+        if (ggml_backend_sched_flush_deferred_router(sched, prediction) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("could not submit the deferred next Router graph");
+        }
         auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
         GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
         next_prefetch_routes predicted;

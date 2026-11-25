@@ -1265,6 +1265,12 @@ struct ggml_backend_sched_split {
     uint64_t mapped_hip_input_uid;
     uint64_t mapped_hip_input_after_shared_uid;
     ggml_tensor * mapped_hip_input;
+    int next_router_begin;
+    uint64_t next_router_uid;
+    uint64_t without_router_uid;
+    uint64_t without_router_mapped_uid;
+    uint64_t without_router_after_shared_uid;
+    uint64_t without_router_after_shared_mapped_uid;
     uint64_t carry_plan_uid;
     ggml_tensor * carry_plan_node;
     int carry_plan_end;
@@ -1478,6 +1484,15 @@ struct ggml_backend_sched {
     void * callback_copy_early_user_data;
     bool capture_host_copies;
     bool measure_expert_copy_wait;
+    bool defer_next_router;
+    size_t next_router_plans;
+    size_t next_router_deferred;
+    size_t next_router_early;
+    struct deferred_router {
+        ggml_backend_t backend = nullptr;
+        const ggml_backend_sched_split * target = nullptr;
+        ggml_cgraph graph = {};
+    } * active_deferred_router;
     ggml_backend_t deferred_expert_copy_backend;
     int64_t deferred_expert_copy_start_us;
     size_t expert_copy_wait_before;
@@ -1848,6 +1863,64 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
+    }
+}
+
+static bool ggml_backend_sched_is_cuda_pair(ggml_backend_t src, ggml_backend_t dst, const char * peer);
+
+static void ggml_backend_sched_plan_next_router(ggml_backend_sched_t sched, ggml_backend_sched_split & split,
+        ggml_backend_sched_split & expert, const ggml_backend_graph_optimize_params & opt) {
+    auto * cuda = sched->backends[split.backend_id];
+    auto * hip = sched->backends[expert.backend_id];
+    if (split.has_custom || expert.has_custom || !expert.graph.n_nodes ||
+            strncmp(ggml_backend_name(cuda), "CUDA", 4) != 0 || !ggml_backend_sched_is_cuda_pair(cuda, hip, "ROCm")) {
+        return;
+    }
+    constexpr int n_router_nodes = 5;
+    auto & graph = split.graph;
+    for (int i = 1; i + n_router_nodes <= graph.n_nodes; ++i) {
+        auto ** nodes = graph.nodes + i;
+        auto * logits = nodes[0];
+        auto * probs = nodes[1];
+        auto * order = nodes[2];
+        auto * ranks = nodes[3];
+        auto * ids = nodes[4];
+        if (logits->op != GGML_OP_MUL_MAT || strncmp(logits->name, "ffn_next_router_logits-", 23) != 0 ||
+                logits->type != GGML_TYPE_F32 || logits->ne[1] != 3 || !ggml_is_matrix(logits) ||
+                !logits->src[0] || logits->src[0]->type != GGML_TYPE_F32 ||
+                !logits->src[1] || logits->src[1]->type != GGML_TYPE_F32 ||
+                probs->op != GGML_OP_SOFT_MAX || probs->src[0] != logits ||
+                order->op != GGML_OP_ARGSORT || order->src[0] != probs ||
+                ranks->op != GGML_OP_VIEW || ranks->view_src != order ||
+                ids->op != GGML_OP_CONT || ids->src[0] != ranks || ids->type != GGML_TYPE_I32 ||
+                !ggml_is_matrix(ids) || ids->ne[1] != 3 || !(ids->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                strncmp(ids->name, "ffn_next_router_topk-", 21) != 0) {
+            continue;
+        }
+        // This chain must be a side output with no graph consumers.
+        bool exclusive = ggml_node_get_use_count(&graph, i + n_router_nodes - 1) == 0;
+        for (int j = 0; j < n_router_nodes - 1; ++j) {
+            exclusive &= ggml_node_get_use_count(&graph, i + j) == 1;
+        }
+        if (!exclusive) {
+            continue;
+        }
+        auto * until = expert.graph.nodes[expert.graph.n_nodes - 1];
+        // Keep CUDA scratch and the activation backing allocation live until the HIP dispatch.
+        for (int j = 0; j < n_router_nodes; ++j) {
+            opt.add_alloc_dep(opt.user_data, nodes[j], until);
+        }
+        auto * activation = logits->src[1];
+        opt.add_alloc_dep(opt.user_data, activation->view_src ? activation->view_src : activation, until);
+        std::rotate(nodes, nodes + n_router_nodes, graph.nodes + graph.n_nodes);
+        split.next_router_begin = graph.n_nodes - n_router_nodes;
+        split.next_router_uid = ggml_graph_next_uid();
+        split.without_router_uid = ggml_graph_next_uid();
+        split.without_router_mapped_uid = ggml_graph_next_uid();
+        split.without_router_after_shared_uid = ggml_graph_next_uid();
+        split.without_router_after_shared_mapped_uid = ggml_graph_next_uid();
+        ++sched->next_router_plans;
+        return;
     }
 }
 
@@ -2274,6 +2347,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             split->shared_prefix = {};
             split->after_shared = {};
         }
+        split->next_router_begin = 0;
         split->carry_plan_uid = 0;
         split->carry_plan_node = nullptr;
         split->carry_plan_end = 0;
@@ -2289,6 +2363,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     split->has_custom |= params.fun == sched->custom_dispatch;
                 }
             }
+        }
+    }
+
+    if (sched->defer_next_router && sched->target_mtp_verify_three && !sched->profile.enabled && !sched->callback_eval) {
+        for (int i = 0; i + 1 < sched->n_splits; ++i) {
+            ggml_backend_sched_plan_next_router(sched, sched->splits[i], sched->splits[i + 1], opt_params);
         }
     }
 
@@ -4000,6 +4080,28 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
     return true;
 }
 
+static enum ggml_status ggml_backend_sched_run_deferred_router(ggml_backend_sched_t sched, bool early) {
+    auto * pending = sched->active_deferred_router;
+    const auto status = ggml_backend_graph_compute_async(pending->backend, &pending->graph);
+    pending->target = nullptr;
+    if (status == GGML_STATUS_SUCCESS) {
+        if (early) {
+            ++sched->next_router_early;
+        } else {
+            ++sched->next_router_deferred;
+        }
+    }
+    return status;
+}
+
+enum ggml_status ggml_backend_sched_flush_deferred_router(ggml_backend_sched_t sched, const ggml_tensor * ids) {
+    auto * pending = sched->active_deferred_router;
+    if (pending && pending->target && pending->graph.nodes[pending->graph.n_nodes - 1] == ids) {
+        return ggml_backend_sched_run_deferred_router(sched, true);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -4038,9 +4140,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct after_submit_scope {
         ggml_backend_sched_t sched;
         ggml_backend_sched::after_submit pending;
-        ~after_submit_scope() { sched->active_after_submit = nullptr; }
-    } after_submit{sched, {}};
+        ggml_backend_sched::deferred_router router;
+        ~after_submit_scope() {
+            sched->active_after_submit = nullptr;
+            sched->active_deferred_router = nullptr;
+        }
+    } after_submit{sched, {}, {}};
     sched->active_after_submit = &after_submit.pending;
+    sched->active_deferred_router = &after_submit.router;
     ggml_backend_sched_hip_return hip_return;
     ggml_backend_sched_mapped_hip_input mapped_input;
     const ggml_tensor * shared_return_input = nullptr;
@@ -4244,6 +4351,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        ggml_cgraph without_router;
+        uint64_t without_router_mapped_uid = 0;
+        bool without_router_after_shared = false;
         auto compute = [&](struct ggml_cgraph * graph) {
             const bool trace = sched->trace_handoff_graph != 0;
             const int64_t submit_start_us = profile.enabled || trace ? ggml_time_us() : 0;
@@ -4295,8 +4405,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     graph == &split->graph && routed_split_id == split_id && split_id + 1 < sched->n_splits;
             auto & pinned = sched->hip_handoff;
             enum ggml_status mapped_status;
-            const bool after_shared = graph == &split->after_shared;
-            const uint64_t mapped_input_uid = after_shared ? split->mapped_hip_input_after_shared_uid :
+            const bool after_shared = graph == &split->after_shared ||
+                    (graph == &without_router && without_router_after_shared);
+            const uint64_t mapped_input_uid = graph == &without_router ? without_router_mapped_uid :
+                    after_shared ? split->mapped_hip_input_after_shared_uid :
                     graph == &split->graph ? split->mapped_hip_input_uid : 0;
             if (mapped_input_uid && !profile.enabled &&
                     !sched->callback_eval && !split->has_custom && routed_split_id == split_id) {
@@ -4427,6 +4539,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             main_graph = &after_carry;
         }
         if (!sched->callback_eval) {
+            const bool after_shared = main_graph == &split->after_shared;
+            const int main_nodes = main_graph->n_nodes - (split->graph.n_nodes - split->next_router_begin);
+            const bool defer_router = split->next_router_begin && sched->target_mtp_verify_three && !profile.enabled &&
+                    !after_submit.router.target && routed_split_id == split_id && !graph_readback && !upload.compute &&
+                    (main_graph == &split->graph || after_shared) && main_nodes > 0;
+            if (defer_router) {
+                without_router = ggml_graph_view(main_graph, 0, main_nodes);
+                without_router.uid = after_shared ? split->without_router_after_shared_uid : split->without_router_uid;
+                without_router_mapped_uid = after_shared ? (split->mapped_hip_input_after_shared_uid ?
+                        split->without_router_after_shared_mapped_uid : 0) :
+                        (split->mapped_hip_input_uid ? split->without_router_mapped_uid : 0);
+                without_router_after_shared = after_shared;
+                main_graph = &without_router;
+            }
             if (sched->before_split_submit) {
                 stage.next("before_submit_callback");
                 sched->before_split_submit(sched->before_split_submit_user_data);
@@ -4435,6 +4561,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = dispatch(main_graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (after_submit.router.target == split) {
+                stage.next("deferred_router_submit");
+                ec = ggml_backend_sched_run_deferred_router(sched, false);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
+            if (defer_router) {
+                auto & pending = after_submit.router;
+                pending.backend = split_backend;
+                pending.target = split + 1;
+                pending.graph = ggml_graph_view(&split->graph, split->next_router_begin, split->graph.n_nodes);
+                pending.graph.uid = split->next_router_uid;
             }
             if (after_submit.pending.split == split) {
                 stage.next("after_submit_callback");
@@ -4614,6 +4754,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+    const char * defer_next_router = getenv("GGML_SCHED_HIP_MTP3_DEFER_NEXT_ROUTER");
+    sched->defer_next_router = sched->async_hip_input && defer_next_router && strcmp(defer_next_router, "1") == 0 &&
+            !(graph_opt && atoi(graph_opt) == 1);
     const char * rtx_slots = getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
     sched->overlap_shared = sched->n_copies == 1 && cuda_vulkan &&
             !(graph_opt && atoi(graph_opt) == 1) && !(rtx_slots && atoi(rtx_slots) > 0);
@@ -4902,6 +5045,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("packed HIP MTP3 mapped input: producers=%zu copies=%zu bytes=%zu reader_busy=%zu mapped=%d\n",
                 sched->mapped_hip_input_producers, stats.mapped_input_copies, stats.mapped_input_bytes,
                 sched->mapped_hip_input_busy, sched->hip_handoff.cuda_mapped != nullptr);
+    }
+    if (sched->defer_next_router) {
+        GGML_LOG_INFO("packed HIP MTP3 deferred next Router: plans=%zu after_expert=%zu early=%zu\n",
+                sched->next_router_plans, sched->next_router_deferred, sched->next_router_early);
     }
     if (sched->measure_expert_copy_wait) {
         GGML_LOG_INFO("packed HIP MTP3 Expert callback wait: before=%zu moved=%zu after_plan=%zu fallback=%zu before_ms=%.3f deferred_ms=%.3f cpu_before_wait_ms=%.3f\n",
