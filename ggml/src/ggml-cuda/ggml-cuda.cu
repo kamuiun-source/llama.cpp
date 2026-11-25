@@ -6649,7 +6649,7 @@ struct ggml_backend_cuda_device_context {
 };
 
 #ifndef GGML_USE_MUSA
-static bool ggml_backend_cuda_register_writable_host_flags(ggml_backend_dev_t dev, void * buffer, size_t size, unsigned flags) {
+static bool ggml_backend_cuda_register_writable_host_flags(ggml_backend_dev_t dev, void * buffer, size_t size, unsigned flags, bool warn = true) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return false;
     }
@@ -6657,8 +6657,10 @@ static bool ggml_backend_cuda_register_writable_host_flags(ggml_backend_dev_t de
     ggml_cuda_set_device(ctx->device);
     const auto err = cudaHostRegister(buffer, size, flags);
     if (err != cudaSuccess) {
-        GGML_LOG_WARN("%s: %s writable host registration failed: %s\n",
-                __func__, ggml_backend_dev_name(dev), cudaGetErrorString(err));
+        if (warn) {
+            GGML_LOG_WARN("%s: %s writable host registration failed: %s\n",
+                    __func__, ggml_backend_dev_name(dev), cudaGetErrorString(err));
+        }
         (void) cudaGetLastError();
         return false;
     }
@@ -6673,7 +6675,7 @@ static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, voi
 static bool ggml_backend_hip_register_mapped_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
     auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
     return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_VEGA20 &&
-            ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, hipHostRegisterPortable | hipHostRegisterMapped);
+            ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, hipHostRegisterPortable | hipHostRegisterMapped, false);
 }
 
 static void * ggml_backend_hip_get_host_mapping(ggml_backend_dev_t dev, void * buffer) {

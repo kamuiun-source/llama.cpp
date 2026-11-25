@@ -1447,7 +1447,6 @@ struct ggml_backend_sched {
     bool async_hip_input;
     bool async_hip_mtp4_input;
     bool async_hip_return;
-    bool mapped_hip_return;
     bool async_hip_mtp4_return;
     ggml_backend_sched_hip_handoff_stats hip_mtp4_return_stats;
     ggml_backend_t hip_async_input_pending;
@@ -2333,7 +2332,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         auto & split = sched->splits[i];
         split.graph.uid = ggml_graph_next_uid();
         split.mapped_hip_return_uid = 0;
-        if (!sched->mapped_hip_return || !sched->target_mtp_verify_three || split.graph.n_nodes < 2 ||
+        if (!sched->async_hip_return || !sched->target_mtp_verify_three || split.graph.n_nodes < 2 ||
                 i + 1 == sched->n_splits) {
             continue;
         }
@@ -2498,7 +2497,7 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_writable_host"));
         pinned.unreg[i] = reinterpret_cast<ggml_backend_unregister_writable_host_t>(
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_writable_host"));
-        const auto reg_mapped = i == 1 && sched->mapped_hip_return ?
+        const auto reg_mapped = i == 1 && sched->async_hip_return ?
                 reinterpret_cast<ggml_backend_register_writable_host_t>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_register_mapped_host")) : nullptr;
         const bool mapped = pinned.unreg[i] && reg_mapped && reg_mapped(owners[i], data, capacity);
@@ -2527,9 +2526,6 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
     pinned.data = data;
     GGML_LOG_INFO("packed HIP MTP3 dual-pinned handoff: registered %zu bytes with %s and %s\n",
             capacity, ggml_backend_dev_name(owners[0]), ggml_backend_dev_name(owners[1]));
-    if (sched->mapped_hip_return && !pinned.hip_mapped) {
-        GGML_LOG_WARN("packed HIP MTP3 mapped return: unavailable, using D2H\n");
-    }
     return data;
 }
 
@@ -4172,7 +4168,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
-    const char * mapped_hip_return = getenv("GGML_SCHED_HIP_MAPPED_RETURN");
     const char * async_hip_mtp4_return = getenv("GGML_SCHED_HIP_MTP4_ASYNC_RETURN");
     const bool allow_hip_handoff = placement && *placement && sched->n_copies == 1;
     const bool allow_hip_batch = allow_hip_handoff && batch_hip && strcmp(batch_hip, "1") == 0;
@@ -4214,12 +4209,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->async_hip_return = sched->dual_pinned_hip_handoff;
         if (!sched->async_hip_return) {
             GGML_LOG_WARN("packed HIP MTP3 async return requires dual-pinned handoff\n");
-        }
-    }
-    if (mapped_hip_return && strcmp(mapped_hip_return, "1") == 0) {
-        sched->mapped_hip_return = sched->async_hip_return;
-        if (!sched->mapped_hip_return) {
-            GGML_LOG_WARN("packed HIP MTP3 mapped return requires async HIP return and dual-pinned handoff\n");
         }
     }
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
@@ -4466,11 +4455,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         const auto & stats = sched->hip_handoff_stats[1];
         GGML_LOG_INFO("packed HIP MTP3 async return: copies=%zu bytes=%zu d2h_enqueue_ms=%.3f\n",
                 stats.async_return_copies, stats.async_return_bytes, stats.return_enqueue_us / 1000.0);
-    }
-    if (sched->mapped_hip_return) {
-        const auto & stats = sched->hip_handoff_stats[1];
-        GGML_LOG_INFO("packed HIP MTP3 mapped return: copies=%zu bytes=%zu\n",
-                stats.mapped_return_copies, stats.mapped_return_bytes);
+        if (stats.mapped_return_copies) {
+            GGML_LOG_INFO("packed HIP MTP3 mapped return: copies=%zu bytes=%zu\n",
+                    stats.mapped_return_copies, stats.mapped_return_bytes);
+        }
     }
     if (sched->async_hip_mtp4_return && sched->hip_mtp4_return_stats.ops) {
         const auto & stats = sched->hip_mtp4_return_stats;
