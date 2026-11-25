@@ -4754,9 +4754,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
     const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
-    const char * defer_next_router = getenv("GGML_SCHED_HIP_MTP3_DEFER_NEXT_ROUTER");
-    sched->defer_next_router = sched->async_hip_input && defer_next_router && strcmp(defer_next_router, "1") == 0 &&
-            !(graph_opt && atoi(graph_opt) == 1);
+    sched->defer_next_router = sched->async_hip_input && !(graph_opt && atoi(graph_opt) == 1);
     const char * rtx_slots = getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
     sched->overlap_shared = sched->n_copies == 1 && cuda_vulkan &&
             !(graph_opt && atoi(graph_opt) == 1) && !(rtx_slots && atoi(rtx_slots) > 0);

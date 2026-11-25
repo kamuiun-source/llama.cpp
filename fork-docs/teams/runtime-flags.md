@@ -20,7 +20,7 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `codex/rocm-integrated-test` の通常起動では、既存の共有ピン留め・非同期入力と戻りに `GGML_SCHED_HIP_SHARED_OVERLAP=1` を追加する。対応する固定3幅では、Shared Expert先行発行を使う層でもMI50カーネルによる共有RAM読み込みとRTXへの非同期H2Dが自動適用される。Router先行D2Hは廃止。試作専用フラグの名前と成績は計測メモに残す。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動) · [4条件の結果](../rocm/10-decode-pipeline.md#routerの先行d2hと戻り側h2dの非同期化)
 
-`GGML_SCHED_HIP_MTP3_DEFER_NEXT_ROUTER=1` は、固定3幅で次層Router予測を現層MI50のExpertグラフ投入後に発行する。通常起動で明示的にONにする。コードの既定値と個別比較は `0`。[追加2回の実測](../rocm/10-decode-pipeline.md#次層routerのon追加計測と採用)
+既存の非同期HIP入力を使う対象の固定3幅では、次層Router予測を現層MI50のExpertグラフ投入後に自動で発行する。試作フラグは廃止した。[追加2回の実測](../rocm/10-decode-pipeline.md#次層routerのon追加計測と採用)
 
 ## Windows Vulkan・高速固定3幅の採用設定
 
