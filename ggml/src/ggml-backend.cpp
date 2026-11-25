@@ -1334,6 +1334,8 @@ using ggml_backend_unregister_writable_host_t = void (*)(ggml_backend_dev_t, voi
 using ggml_backend_hip_graph_mapped_return_t = bool (*)(ggml_backend_t, ggml_cgraph *, uint64_t, void *, enum ggml_status *);
 using ggml_backend_cuda_graph_mapped_hc_input_t = bool (*)(ggml_backend_t, ggml_cgraph *, uint64_t, const ggml_tensor *, void *, enum ggml_status *);
 
+using ggml_backend_hip_mapped_input_blit_t = bool (*)(ggml_backend_t, ggml_tensor *, const void *);
+
 struct ggml_backend_sched_dual_pinned {
     void * allocation;
     uint8_t * data;
@@ -1513,6 +1515,9 @@ struct ggml_backend_sched {
     bool trace_hip_handoff_wait;
     bool async_hip_input;
     bool mapped_hip_input;
+    ggml_backend_hip_mapped_input_blit_t hip_mapped_input_blit;
+    size_t hip_mapped_input_read_eligible;
+    size_t hip_mapped_input_read_applied;
     ggml_backend_hip_verify_trace * hip_verify_trace;
     size_t mapped_hip_input_producers;
     size_t mapped_hip_input_busy;
@@ -3494,7 +3499,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         handoff.source_wait([&] { ggml_backend_synchronize(src_backend); });
         handoff.destination_wait([&] { ggml_backend_synchronize(dst_backend); });
         if (sched->hip_async_input_pending == dst_backend) {
-            // The existing destination wait drains the previous H2D reader of the dedicated slab.
+            // The destination wait drains the previous H2D or mapped read from the dedicated slab.
             sched->hip_async_input_pending = nullptr;
         }
         if (upload.compute) {
@@ -3521,7 +3526,18 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     if (async_input) {
         sched->hip_async_input_pending = dst_backend;
         handoff.write([&] {
+            const auto & slab = sched->hip_handoff;
+            const bool eligible = sched->hip_mapped_input_blit && mirrored >= 0 && sched->target_mtp_verify_three &&
+                    slab.hip_mapped && mapped_input.data == slab.cuda_input_data && offsets[mirrored] == 0;
             for (int i = 0; i < count; ++i) {
+                if (i == mirrored && eligible) {
+                    ++sched->hip_mapped_input_read_eligible;
+                    const auto * hip_input = slab.hip_mapped + (slab.cuda_input_data - slab.data);
+                    if (sched->hip_mapped_input_blit(dst_backend, dsts[i], hip_input)) {
+                        ++sched->hip_mapped_input_read_applied;
+                        continue;
+                    }
+                }
                 const auto * data = i == mirrored ? mapped_input.data : staging + data_offsets[i];
                 ggml_backend_tensor_set_async(dst_backend, dsts[i], data, offsets[i], sizes[i]);
             }
@@ -4468,6 +4484,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->mapped_hip_input = ggml_backend_sched_can_map_hip_input(ggml_backend_get_device(backends[i]));
         }
     }
+    const char * mapped_input_read = getenv("GGML_SCHED_HIP_MAPPED_INPUT_READ");
+    if (sched->mapped_hip_input && mapped_input_read && strcmp(mapped_input_read, "1") == 0) {
+        for (int i = 0; i < n_backends; ++i) {
+            if (strncmp(ggml_backend_name(backends[i]), "ROCm", 4) == 0) {
+                const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i]));
+                sched->hip_mapped_input_blit = reinterpret_cast<ggml_backend_hip_mapped_input_blit_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_mapped_input_blit"));
+                break;
+            }
+        }
+    }
     if (cuda_hip && async_hip_return && strcmp(async_hip_return, "1") == 0) {
         sched->async_hip_return = sched->dual_pinned_hip_handoff;
         if (!sched->async_hip_return) {
@@ -4761,6 +4788,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("packed HIP MTP3 mapped input: producers=%zu copies=%zu bytes=%zu reader_busy=%zu mapped=%d\n",
                 sched->mapped_hip_input_producers, stats.mapped_input_copies, stats.mapped_input_bytes,
                 sched->mapped_hip_input_busy, sched->hip_handoff.cuda_mapped != nullptr);
+    }
+    if (sched->hip_mapped_input_blit) {
+        GGML_LOG_INFO("packed HIP MTP3 mapped input read: blit eligible=%zu applied=%zu bytes=%zu mapped=%d\n",
+                sched->hip_mapped_input_read_eligible, sched->hip_mapped_input_read_applied,
+                sched->hip_mapped_input_read_applied * (2560 * 3 * sizeof(float)), sched->hip_handoff.hip_mapped != nullptr);
     }
     if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
         const auto & stats = sched->hip_mtp4_input_stats;

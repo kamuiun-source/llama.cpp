@@ -6731,6 +6731,30 @@ static bool ggml_backend_hip_register_mapped_host(ggml_backend_dev_t dev, void *
             ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, hipHostRegisterPortable | hipHostRegisterMapped, false);
 }
 
+static __global__ void hip_mapped_activation_blit(const float4 * src, float4 * dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    dst[i] = src[i];
+}
+
+static bool ggml_backend_hip_mapped_input_blit(ggml_backend_t backend, ggml_tensor * dst, const void * mapped) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_VEGA20 ||
+            dst->type != GGML_TYPE_F32 || dst->ne[0] != 2560 || dst->ne[1] != 3 ||
+            dst->ne[2] != 1 || dst->ne[3] != 1 || !ggml_is_contiguous(dst) ||
+            reinterpret_cast<uintptr_t>(dst->data) % sizeof(float4) || reinterpret_cast<uintptr_t>(mapped) % sizeof(float4)) {
+        return false;
+    }
+
+    constexpr int threads = 128;
+    constexpr int vectors = 2560 * 3 / 4;
+    static_assert(vectors % threads == 0, "mapped input blit must launch exactly one thread per vector");
+    ggml_cuda_set_device(ctx->device);
+    hip_mapped_activation_blit<<<vectors / threads, threads, 0, ctx->stream()>>>(
+            static_cast<const float4 *>(mapped), static_cast<float4 *>(dst->data));
+    CUDA_CHECK(hipGetLastError());
+    return true;
+}
+
 static void * ggml_backend_hip_get_host_mapping(ggml_backend_dev_t dev, void * buffer) {
     auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
     ggml_cuda_set_device(ctx->device);
@@ -7695,6 +7719,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #if defined(GGML_USE_HIP) && defined(__linux__)
     if (strcmp(name, "ggml_backend_hip_register_mapped_host") == 0) {
         return (void *)ggml_backend_hip_register_mapped_host;
+    }
+    if (strcmp(name, "ggml_backend_hip_mapped_input_blit") == 0) {
+        return (void *)ggml_backend_hip_mapped_input_blit;
     }
     if (strcmp(name, "ggml_backend_hip_get_host_mapping") == 0) {
         return (void *)ggml_backend_hip_get_host_mapping;
