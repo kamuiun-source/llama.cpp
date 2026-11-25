@@ -67,5 +67,5 @@ inline void server_refresh_cuda_mmvq_modes(llama_context * target, llama_context
             {"Q6_K=off", "Q6_K=signed", "Q6_K=reuse"}, q6_k_invalid, target, draft);
     server_refresh_cuda_mmvq_mode(hc_up_path, "Q8_0 HC up",
             "ggml_backend_cuda_get_q8_0_hc_up_mode", "ggml_backend_cuda_set_q8_0_hc_up_mode",
-            {"HC_UP=off", "HC_UP=warp"}, hc_up_invalid, target, draft);
+            {"HC_UP=off", "HC_UP=warp", "HC_UP=packed"}, hc_up_invalid, target, draft);
 }

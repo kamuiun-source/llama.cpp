@@ -1,13 +1,14 @@
 #pragma once
 
-#include "vecdotq.cuh"
+#include "q8-0-hc-up-packed.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static constexpr int hc_up_warps_per_block = 4;
 
+template <bool packed>
 __launch_bounds__(hc_up_warps_per_block * ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void hc_up_q8_0_warp(
-        const block_q8_0 * weights, const block_q8_1 * activations, float * dst,
+        const block_q8_0 * weights, hc_up_packed_weights packed_weights, const block_q8_1 * activations, float * dst,
         int stride_col_y, int stride_col_dst) {
     constexpr int width = ggml_cuda_get_physical_warp_size();
     constexpr int lanes_per_quant = QI8_0 / VDR_Q8_0_Q8_1_MMVQ;
@@ -25,10 +26,16 @@ static __global__ void hc_up_q8_0_warp(
         const auto * x = activations + col * stride_col_y;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const auto * w = weights + (row + r) * blocks_per_row;
-            float sum = vec_dot_q8_0_q8_1(w, x + first_block, first_block, iqs);
+            const int base = (row + r) * blocks_per_row;
+            const auto dot = [&](int block) {
+                if constexpr (packed) {
+                    return hc_up_dot_packed(packed_weights, base + block, iqs, x[block]);
+                }
+                return vec_dot_q8_0_q8_1(weights + base, x + block, block, iqs);
+            };
+            float sum = dot(first_block);
             if (tail_block < blocks_per_row) {
-                const float tail = vec_dot_q8_0_q8_1(w, x + tail_block, tail_block, iqs);
+                const float tail = dot(tail_block);
                 // Match the rounded addition of the second warp's shared partial.
                 sum = __fadd_rn(sum, tail);
             }

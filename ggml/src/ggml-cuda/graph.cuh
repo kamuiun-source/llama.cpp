@@ -61,6 +61,9 @@ struct ggml_cuda_graph {
 #elif !defined(GGML_USE_MUSA)
     int q6_k_mmvq_mode = -1;
     int q8_0_hc_up_mode = -1;
+    bool hc_up_pack_target = false;
+    bool hc_up_packed = false;
+    uint64_t hc_up_pack_epoch = 0;
 #endif
     struct node_properties {
         ggml_tensor node;

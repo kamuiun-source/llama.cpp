@@ -2344,19 +2344,33 @@ void ggml_cuda_mul_mat_vec_q(
             ggml_cuda_q8_0_hc_up::configured() && ggml_cuda_hc_projection_for_weight(src0->name) == GGML_CUDA_HC_UP) {
         const int mode = ggml_cuda_q8_0_hc_up::get_mode();
         ggml_cuda_q8_0_hc_up::dispatched = true;
-        static std::atomic<int> last_mode{-1};
-        if (last_mode.load(std::memory_order_relaxed) != mode &&
-                last_mode.exchange(mode, std::memory_order_relaxed) != mode) {
-            GGML_LOG_INFO("CUDA Ada Q8_0 HC up dispatch: cols=3 mode=%s\n", mode == 1 ? "warp" : "off");
+        const bool pack_candidate = std::strcmp(src0->name, "blk.0.hc_attn_up.weight") == 0;
+        ggml_cuda_q8_0_hc_up::pack_target_seen |= pack_candidate;
+        const bool pack_target = mode == 2 && pack_candidate;
+        const auto packed = pack_target ? ggml_cuda_prepare_hc_up_packed(ctx, src0) : hc_up_packed_weights{};
+        if (mode != 2 || pack_target) {
+            const int effective = packed.quants ? 2 : mode > 0 ? 1 : 0;
+            static std::atomic<int> last_mode{-1};
+            if (last_mode.load(std::memory_order_relaxed) != effective &&
+                    last_mode.exchange(effective, std::memory_order_relaxed) != effective) {
+                GGML_LOG_INFO("CUDA Ada Q8_0 HC up dispatch: cols=3 mode=%s\n",
+                        effective == 2 ? "packed" : effective == 1 ? "warp" : "off");
+            }
         }
-        if (mode == 1) {
+        if (mode == 1 || pack_target) {
             const ggml_cuda_kernel_launch_params params(
                     dim3(ne01 / (2 * hc_up_warps_per_block)), dim3(device.warp_size, hc_up_warps_per_block), 0, stream);
 #ifdef GGML_CUDA_HAVE_MMVQ_TRACE
             const mmvq_launch_trace trace(params, 3, false, false, false);
 #endif
-            ggml_cuda_kernel_launch(hc_up_q8_0_warp, params, static_cast<const block_q8_0 *>(src0->data),
-                    reinterpret_cast<const block_q8_1 *>(src1_q8_1.get()), dst_d, int(s11), int(s1));
+            const auto * activation = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());
+            if (packed.quants) {
+                ggml_cuda_q8_0_hc_up::dispatched_packed = true;
+                ggml_cuda_kernel_launch(hc_up_q8_0_warp<true>, params, nullptr, packed, activation, dst_d, int(s11), int(s1));
+            } else {
+                ggml_cuda_kernel_launch(hc_up_q8_0_warp<false>, params, static_cast<const block_q8_0 *>(src0->data),
+                        packed, activation, dst_d, int(s11), int(s1));
+            }
             return;
         }
     }

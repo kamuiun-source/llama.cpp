@@ -3,6 +3,7 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <atomic>
 #include <cstdlib>
+#include <cstdint>
 
 namespace ggml_cuda_q8_0_hc_up {
 
@@ -16,13 +17,16 @@ inline bool configured() {
 
 inline std::atomic<int> active_mode{0};
 inline thread_local bool dispatched = false;
+inline thread_local bool pack_target_seen = false;
+inline thread_local bool dispatched_packed = false;
+inline std::atomic<uint64_t> pack_epoch{0};
 
 inline int get_mode() {
     return active_mode.load(std::memory_order_relaxed);
 }
 
 inline void set_mode(int requested) {
-    if (requested == 0 || requested == 1) {
+    if (requested >= 0 && requested <= 2) {
         active_mode.store(requested, std::memory_order_relaxed);
     }
 }
