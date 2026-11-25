@@ -590,6 +590,8 @@ ONで生成+1.43%、本体検証−0.55 ms/回。ONの残り5,372件は昇格の
 
 生成速度の差は追加3回で+0.13%、全5回で+0.65%。追加試行のログはGit外の `/home/t-saka/rocm-expert-callback-wait-repeat-20261125/`。採用版は試作専用フラグを廃止し、既存の `GGML_SCHED_HIP_ASYNC_INPUT=1` を使う適格な固定3幅で自動適用する。
 
+`458d50f26` の増分ビルドで試作フラグを環境から除き、固定5問を再実行した。待ちの移動12,912件（選定後7,540件）、フォールバック0。出力とMTP採用366/532が比較時と一致し、生成51.46 tok/s、本体検証39.93 ms/回。ビルドとサーバーは終了コード0。ログは追加試行ディレクトリの `adopted/`。この変更を `codex/rocm-integrated-test` に統合する。
+
 #### RTXの量子化投影を集計する
 
 LinuxのAda向けビルドで `GGML_CUDA_MMVQ_TRACE=1` を指定すると、RTXのdense MMVQのNVTXに重み名・出力名・量子型・テンソル形状・起動形状が出る。Nsight Systemsは `--trace=cuda,nvtx --cuda-graph-trace=node` で起動時から採取し、SQLiteへエクスポートする。CUDA Graphは再生を継続する。再キャプチャ時だけ実行グラフを作り直し、古いノードIDへの誤対応を防ぐ。通常の速度比較ではこのフラグを外す。
