@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- 固定3幅でSplit-K＋YALIS補正を同時ONにして5問を3回。48.06、48.14、48.35 tok/s、平均48.18（保存済み全OFF47.12、Split-K単独48.23）。3回ともSplit-K単独と全出力・MTP366/532が一致し、応答中スワップアウト0。[同時ONの計測](../research/mtp3-efficiency-20261125.md#split-kとyalis補正を同時にon)
+
 - `codex/rocm-mtp3-verify-optimizations` で固定3幅の3試作を各単独で実モデル確認。基準47.12 tok/sに対し、本体GPU greedy 47.41（全出力・採用一致、2.98 MBの検証D2H消失）、HC down split-K 48.23（採用数が変化、当該カーネルは約0.08 ms/検証増）、YALIS補正46.96（全出力・採用一致、先読みヒット5,947件のまま）。3フラグとも既定OFF。[計測とログ](../research/mtp3-efficiency-20261125.md#検証ブランチの実装順)
 
 - 固定3幅の本体検証の公開実装を調査。RTXトレースでは、273回すべてに全語彙logit 2,979,840 BのD2Hがあり、転送本体は平均0.223 ms/検証。最初の候補は本体の既存 `--backend-sampling`。カーネルではQ8_0 HC down、Expert転送では正規Routerを維持したYALISの代表出力補正が候補。[一次資料と比較条件](../research/mtp3-efficiency-20261125.md#固定3幅の本体検証を短くする公開実装)
