@@ -20,6 +20,8 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `codex/rocm-mi50-mapped-input-read` の通常起動では、`GGML_SCHED_HIP_SHARED_OVERLAP=1` と `GGML_SCHED_HIP_MAPPED_INPUT_READ=1` をあわせて指定する。既存の共有ピン留め・非同期受け渡しと組み合わせ、Shared Expert先行発行を使う層でもMI50カーネルによる共有RAM読み込みを採用する。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動)
 
+同ブランチのRTX Router先行D2Hは `GGML_SCHED_HIP_MTP3_EARLY_ROUTER_D2H=1`、戻り側RTXへの非同期H2Dは `GGML_SCHED_HIP_MTP3_ASYNC_RETURN_H2D=1` で試す。どちらも既定OFF。[4条件の結果](../rocm/10-decode-pipeline.md#routerの先行d2hと戻り側h2dの非同期化)
+
 ## Windows Vulkan・高速固定3幅の採用設定
 
 | 対象 | 設定 |

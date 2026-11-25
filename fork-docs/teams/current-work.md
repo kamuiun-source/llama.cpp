@@ -11,6 +11,7 @@
 - `codex/rocm-mi50-mapped-input-read` でMI50のカーネルが共有RAMの活性値をVRAMへ取り込む試作。固定3幅・Shared Expert先行発行OFFの両順4回で生成48.61→49.71 tok/s（+2.28%）、本体検証42.81→41.77 ms。ONは各12,912件の活性値H2Dを置き換え、全回の640生成ID・本文・MTP採用366/532が一致。既定OFF。[試作と計測](../rocm/10-decode-pipeline.md#mi50のカーネルで共有ramから活性値を読む試作)
 - 上記の読み込みとShared Expert先行発行を同じ層で併用可能にした。両方ONの固定5問×2回で、各回の48層すべてでMI50の読み込み、うち45層でShared Expert先行発行も動作。生成は修正前50.22 tok/s（1回）に対し修正後50.85 tok/s（2回合算）、出力・MTP採用366/532も一致。[併用の確認](../rocm/10-decode-pipeline.md#shared-expert先行発行との併用)
 - 同じ層での併用を通常起動に採用。対象ブランチの固定3幅では共有RAM読み込みとShared Expert先行発行を両方ONにする。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動)
+- 採用状態でRouter先行D2Hと戻り側のRTX非同期H2Dを4条件比較。基準50.81、両方ON 51.24、先行D2Hのみ50.76、戻りH2Dのみ51.29 tok/s。全4回で出力・採用数・両方の既存経路は一致。試作2つは既定OFF。[4条件の結果](../rocm/10-decode-pipeline.md#routerの先行d2hと戻り側h2dの非同期化)
 
 - 固定3幅でShared Expert先行発行だけをOFF→ON→ON→OFF。生成は48.62→49.96 tok/s、本体検証42.77→41.50 ms、全回の640生成ID・本文・MTP採用366/532は一致。先行発行12,105件でRTX→MI50直接書き込みが外れ、直接書き込みは12,912→807件に減少。MI50→RTXの直接書き込みは維持。採用設定の変更は保留。[比較と併用条件](../rocm/10-decode-pipeline.md#直接書き込み採用後の固定5問で再比較)
 
