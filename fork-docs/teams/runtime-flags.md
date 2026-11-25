@@ -14,6 +14,8 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。統合ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
 
+`GGML_CUDA_HC_DOWN_SPLIT_K=1` はRTXの固定3位置・Q8_0 HC downで採用。4分割した部分和のFP32加算順が変わり、丸め差で温度0でも出力文言・MTP採用数が変動し得る。従来経路との比較時は `0` を指定する。[採用結果](../rocm/10-decode-pipeline.md#rtxのhc-down-split-kの採用)
+
 ## Windows Vulkan・高速固定3幅の採用設定
 
 | 対象 | 設定 |

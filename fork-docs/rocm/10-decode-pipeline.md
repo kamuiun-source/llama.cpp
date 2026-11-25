@@ -211,6 +211,7 @@ docker run --rm --gpus all \
   -e GGML_CUDA_CONCAT_SMALL=1 \
   -e GGML_CUDA_UNARY_MUL_BCAST=1 \
   -e GGML_CUDA_GDN_GATED_NORM=1 \
+  -e GGML_CUDA_HC_DOWN_SPLIT_K=1 \
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
   -e GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1 \
   -e GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1 \
@@ -232,7 +233,25 @@ Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を�
 
 SSMとGDNの融合を含む統合版では、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
+RTXのQ8_0 HC downは `GGML_CUDA_HC_DOWN_SPLIT_K=1` を通常起動に加える。比較時は `0` を指定してサーバーを再起動する。**FP32の加算順の違いによる丸め差で、温度0でも生成文言、出力トークン数、MTP採用数が変わる場合がある。** 厳密な出力照合では、比較元と同じSplit-K設定に揃える。[採用の実測と数値差](#rtxのhc-down-split-kの採用)
+
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
+
+##### RTXのHC down Split-Kの採用
+
+Qwen3.8 Flash Nextの固定3位置で、CUDA Adaの `Q8_0` HC down（内積長10,240、出力320）のK方向を4分割し、FP32部分和を固定順で合算する。同じ重み・入力量子化を使う。FP32では加算順が変わると丸め結果がわずかに変わり、上位logitが僅差の箇所で選択トークンが入れ替わり得る。今回のON/OFFは第1問の61番目で出力が分かれた。最初の差分におけるlogitの順位変化は個別に計測していない。同一設定の2回では全出力IDと本文が一致した。
+
+同一ビルド `aebc8fe6d`・固定3幅・生成上限512・コンテキスト4096で、固定5問をON→OFF→ON→OFF。全20問が自然終了し、応答中のスワップアウトは0。Split-K単独を採用した。
+
+| 指標 | OFF | ON |
+| --- | ---: | ---: |
+| 生成 tok/s（各2回） | 46.59 / 46.50 | 48.96 / 48.96 |
+| 平均生成 tok/s | 46.54 | 48.96 |
+| MTP採用率 | 58.7% | 63.4% |
+| 本体検証回数 / 100トークン | 45.86 | 43.90 |
+| 5問での生成数 / 生成秒 | 1,147 / 24.64 | 1,237 / 25.26 |
+
+今回の5問は生成速度が+5.2%。ONの回答が90トークン長く、5問の生成は約0.62秒延びた。別のNsight計測ではHC downの対象カーネルは0.99→1.07 ms/検証。生成速度の差には、出力とMTP採用数が変わった影響が含まれる。[検証ブランチの比較記録](https://github.com/kamuiun-source/llama.cpp/blob/25226112d11af69c207b60fa8791e75ce88add74/fork-docs/research/mtp3-efficiency-20261125.md#split-kの生成上限512-onoff交互比較)
 
 ##### 統合後の移植版を固定5問で確認
 
@@ -754,6 +773,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | 短い非連続行のconcat | `GGML_CUDA_CONCAT_SMALL` | `1` | `1` | `0` |
 | SSMのsoftplusと係数乗算の融合 | `GGML_CUDA_UNARY_MUL_BCAST` | `1` | `1` | `0` |
 | GDNのRMS正規化とsigmoidゲートの融合 | `GGML_CUDA_GDN_GATED_NORM` | `1` | `1` | `0` |
+| RTXのQ8_0 HC down Split-K | `GGML_CUDA_HC_DOWN_SPLIT_K` | `1` | `1` | `0` |
 | MI50のIQ2_S・IQ3_XXS符号復号 | `GGML_HIP_GFX906_IQ_SIGN_DECODE` | `1` | `1` | `0` |
 | MI50のIQ2_S Q8_1入力共有 | `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT` | `1` | `1`（LDS・4行がOFFのとき発動） | `0` |
 | MI50のIQ4_NL down復号短縮 | `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE` | `1` | `1` | `0` |
