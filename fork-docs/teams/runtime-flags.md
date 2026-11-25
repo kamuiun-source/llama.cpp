@@ -66,3 +66,7 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` | 未設定（通常） / `1`（詳細比較） | 試作ON/OFF両方に層ごとのホスト時刻を出す。GPU時刻はrocprofで照合する。 |
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
+
+### 実ミス1件のCPU処理
+
+`codex/rocm-single-miss-cpu` の試作。サーバー起動時に `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` にモードファイルのパスを渡し、内容を `SINGLE_MISS_CPU=on` または `SINGLE_MISS_CPU=off` にするとリクエスト間で反映される。既定OFF。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ONの56.02 tok/sに対し再実行OFFは56.78 tok/s。[計測](../rocm/09-single-bank-mtp3.md#実ミス1件のexpertをcpuで計算する試作)

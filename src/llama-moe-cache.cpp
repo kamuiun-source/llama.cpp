@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-model.h"
 #include "llama-rtx-expert.h"
+#include "llama-single-miss-cpu.h"
 #include "../ggml/src/ggml-backend-mtp.h"
 
 #include "ggml-cpp.h"
@@ -381,6 +382,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         ggml_tensor * cold_slot_map = nullptr;
         ggml_tensor * slot_map_cpu = nullptr; // looked up in place of slot_map by the graphs with a CPU part, if cpu_share > 0, its data is not used
+        bool single_miss_cpu = false;
         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         std::vector<int32_t> packed_scratch; // original expert ID per scratch slot, -1 if empty
@@ -415,6 +417,7 @@ struct llama_moe_cache::impl {
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
+    std::unique_ptr<llama_single_miss_cpu> single_miss_cpu;
     llama_expert_placement * placement;
     std::unique_ptr<const llama_expert_placement, void (*)(const llama_expert_placement *)> placement_owner{
         nullptr, [](const llama_expert_placement * p) { p->context_in_use.store(false); },
@@ -815,6 +818,9 @@ struct llama_moe_cache::impl {
                 throw std::runtime_error("packed expert scratch slots are already in use by another context");
             }
             placement_owner.reset(placement);
+            if (placement->hip_single_miss_cpu && model.arch == LLM_ARCH_QWEN4EXP && n_expert_used == 10) {
+                single_miss_cpu = std::make_unique<llama_single_miss_cpu>();
+            }
             const char * pair_overlap = std::getenv("LLAMA_MTP_PAIR_EXPERT_OVERLAP");
             if (!mtp_verify_three_enabled && n_expert_used == mtp_pair_experts && pair_overlap && std::strcmp(pair_overlap, "1") == 0) {
                 mtp_pair_histograms.resize(layers.size());
@@ -834,6 +840,11 @@ struct llama_moe_cache::impl {
             }
             for (size_t il = 0; il < placement->maps.size(); ++il) {
                 auto & l = layers.at(il);
+                const auto & weights = model.layers.at(il);
+                l.single_miss_cpu = single_miss_cpu && weights.ffn_gate_exps && weights.ffn_up_exps && weights.ffn_down_exps &&
+                        !weights.ffn_gate_exps_b && !weights.ffn_up_exps_b && !weights.ffn_down_exps_b &&
+                        !weights.ffn_gate_exps_s && !weights.ffn_up_exps_s && !weights.ffn_down_exps_s &&
+                        model.hparams.swiglu_clamp_exp[il] <= 1e-6f;
                 l.ig = 0;
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
@@ -3576,6 +3587,47 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+            if (l.single_miss_cpu && fixed_three && !use_waves && !early && !profile && sched) {
+                int32_t expert = -1;
+                for (const int32_t id : ids) {
+                    if (slots[id] >= 0 || next_prefetch_slot(il, id) >= 0) {
+                        continue;
+                    }
+                    if (expert >= 0 && id != expert) {
+                        expert = -1;
+                        break;
+                    }
+                    expert = id;
+                }
+                const float * activation;
+                const float * router_weights;
+                if (expert >= 0 && ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights)) {
+                    ++single_miss_cpu->eligible;
+                    std::array<const ggml_tensor *, 3> planes{};
+                    for (const auto * w : l.experts) {
+                        if (std::strstr(w->name, ".ffn_gate_exps.weight")) {
+                            planes[0] = w;
+                        } else if (std::strstr(w->name, ".ffn_up_exps.weight")) {
+                            planes[1] = w;
+                        } else if (std::strstr(w->name, ".ffn_down_exps.weight")) {
+                            planes[2] = w;
+                        }
+                    }
+                    unsigned mask = 0;
+                    const int64_t cpu_start = ggml_time_us();
+                    if (single_miss_cpu->compute(planes, map.host[expert], expert, ids.data(), activation, router_weights, mask)) {
+                        ggml_backend_sched_set_hip_single_miss_result(sched, single_miss_cpu->weighted.data(), mask);
+                        // The last tuple is initialized to zero and is outside all scratch and promotion ranges.
+                        slots[expert] = llama_expert_profile::n_resident + placement->n_slots;
+                        ++single_miss_cpu->applied;
+                        for (int t = 0; t < 3; ++t) {
+                            single_miss_cpu->positions += (mask >> t) & 1;
+                        }
+                        single_miss_cpu->avoided_bytes += placement->tuples[il].stride;
+                    }
+                    single_miss_cpu->compute_us += ggml_time_us() - cpu_start;
+                }
+            }
             std::array<int32_t, llama_expert_profile::n_experts> rtx_slots;
             size_t n_rtx = 0;
             size_t rtx_bytes = 0;
@@ -4142,6 +4194,11 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP promotions: promotions=%zu evictions=%zu writeback_bytes=%zu\n",
                         packed_promotions, packed_promotions, packed_writeback_bytes);
             }
+        }
+        if (single_miss_cpu) {
+            LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f\n",
+                    single_miss_cpu->eligible, single_miss_cpu->applied, single_miss_cpu->positions,
+                    single_miss_cpu->avoided_bytes, single_miss_cpu->compute_us / 1000.0);
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;

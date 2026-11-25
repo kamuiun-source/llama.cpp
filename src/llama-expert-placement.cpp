@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model-loader.h"
+#include "llama-single-miss-cpu.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -114,7 +115,8 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
     }()), hip_tuple_dma([] {
         const char * value = std::getenv("LLAMA_EXPERT_HIP_TUPLE_DMA");
         return value && std::strcmp(value, "1") == 0;
-    }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_four ? 4 : hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
+    }()), hip_single_miss_cpu(hip_tuple_dma && hip_mtp_verify_three && !hip_mtp_verify_four &&
+            !overlap && llama_single_miss_cpu_configured()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_four ? 4 : hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
         const bool small = value && std::strcmp(value, "1") == 0;
@@ -211,7 +213,7 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
     auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1],
-            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots));
+            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots + int(hip_single_miss_cpu)));
     auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
@@ -362,7 +364,7 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
         auto & tuple = tuples[il];
         tuple.stride = (sizes[il] + alignments[il] - 1) / alignments[il] * alignments[il];
         tuple.host = ggml_new_tensor_1d(tuple_host_ctx.get(), GGML_TYPE_I8, (n_experts - n_resident) * tuple.stride);
-        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots) * tuple.stride);
+        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots + int(hip_single_miss_cpu)) * tuple.stride);
         ggml_format_name(tuple.host, "expert_tuple_host.%d", il);
         ggml_format_name(tuple.device, "expert_tuple_bank.%d", il);
     }

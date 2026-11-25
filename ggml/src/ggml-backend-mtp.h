@@ -3,6 +3,10 @@
 #include "ggml-backend.h"
 
 extern "C" {
+GGML_API void ggml_backend_sched_set_hip_single_miss_cpu(bool enabled);
+GGML_API bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched,
+        const float ** activation, const float ** weights);
+GGML_API void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched, const float * result, unsigned mask);
 GGML_API enum ggml_status ggml_backend_sched_flush_deferred_router(ggml_backend_sched_t sched, const struct ggml_tensor * ids);
 GGML_API bool ggml_backend_sched_set_target_mtp_verify_four(ggml_backend_sched_t sched, bool enabled);
 GGML_API int64_t ggml_backend_sched_hip_verify_stage_time(ggml_backend_sched_t sched);

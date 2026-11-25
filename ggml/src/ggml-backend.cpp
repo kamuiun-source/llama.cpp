@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <new>
 #include <string>
@@ -1320,7 +1321,24 @@ struct ggml_backend_sched_host_copies {
     };
     entry entries[GGML_SCHED_MAX_SPLIT_INPUTS];
     size_t count = 0;
+    const float * single_miss_activation = nullptr;
+    const ggml_tensor * single_miss_activation_dst = nullptr;
+    const ggml_tensor * single_miss_weights_dst = nullptr;
+    float single_miss_weights[30];
 };
+
+struct ggml_backend_sched_single_miss {
+    const ggml_backend_sched_split * destination = nullptr;
+    const ggml_tensor * output = nullptr;
+    const float * result = nullptr;
+    unsigned mask = 0;
+};
+
+static std::atomic<bool> hip_single_miss_cpu_enabled{false};
+
+void ggml_backend_sched_set_hip_single_miss_cpu(bool enabled) {
+    hip_single_miss_cpu_enabled.store(enabled, std::memory_order_relaxed);
+}
 
 using ggml_backend_cuda_get_shared_input_t = bool (*)(ggml_backend_t, const ggml_tensor * const *,
         ggml_backend_buffer_t, void *, const size_t *, const size_t *, const size_t *, size_t);
@@ -1502,6 +1520,7 @@ struct ggml_backend_sched {
     int64_t expert_copy_wait_before_us;
     int64_t expert_copy_wait_after_us;
     int64_t expert_copy_cpu_before_wait_us;
+    ggml_backend_sched_single_miss * active_single_miss;
     const ggml_backend_sched_host_copies * active_host_copies;
     const ggml_backend_sched_split * active_copy_split;
     struct after_submit {
@@ -3137,6 +3156,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             handoff.destination_wait([&] { ggml_backend_synchronize(split_backend); });
         }
         if (use_hip_return) {
+            auto * correction = sched->active_single_miss;
+            if (correction && correction->destination == split && correction->output == input && correction->result) {
+                // Both GPU readers and writers of this return slot have completed.
+                auto * output = reinterpret_cast<float *>(hip_return->data);
+                for (int t = 0; t < 3; ++t) {
+                    if (correction->mask & (1u << t)) {
+                        for (int j = 0; j < 2560; ++j) {
+                            const int i = t * 2560 + j;
+                            output[i] += correction->result[i];
+                        }
+                    }
+                }
+                *correction = {};
+            }
             handoff.read_start_us = hip_return->enqueue_start_us;
             handoff.read_end_us = hip_return->enqueue_end_us;
             bool async_h2d = false;
@@ -3728,6 +3761,27 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         ggml_backend_sched_record_hip_handoff(sched, src_backend, count, bytes, pinned != nullptr, handoff,
                 async_input, false, mtp4_input, false, mirrored >= 0 ? sizes[mirrored] : 0);
     }
+    if (mirrored >= 0 && host_copies && sched->target_mtp_verify_three &&
+            hip_single_miss_cpu_enabled.load(std::memory_order_relaxed) &&
+            sizes[mirrored] == 2560 * 3 * sizeof(float) && offsets[mirrored] == 0 &&
+            srcs[mirrored]->type == GGML_TYPE_F32 && srcs[mirrored]->ne[0] == 2560 && ggml_is_contiguous(srcs[mirrored])) {
+        host_copies->single_miss_activation = reinterpret_cast<const float *>(mapped_input.data);
+        host_copies->single_miss_activation_dst = dsts[mirrored];
+        for (int i = 0; i < count; ++i) {
+            const auto * t = srcs[i];
+            if (t->type == GGML_TYPE_F32 && t->ne[0] == 1 && t->ne[1] == 10 && t->ne[2] == 3 &&
+                    t->ne[3] == 1 && ggml_is_contiguous(t) && offsets[i] == 0 &&
+                    sizes[i] == sizeof(host_copies->single_miss_weights) &&
+                    strncmp(t->name, "ffn_moe_weights", 15) == 0) {
+                if (host_copies->single_miss_weights_dst) {
+                    host_copies->single_miss_weights_dst = nullptr;
+                    break;
+                }
+                host_copies->single_miss_weights_dst = dsts[i];
+                memcpy(host_copies->single_miss_weights, input_payload(i), sizes[i]);
+            }
+        }
+    }
     for (int i = 0; i < count; ++i) {
         if (auto * entry = ggml_backend_sched_host_copy_entry(host_copies, src_backend, dst_backend, srcs[i])) {
             if (upload.compute) {
@@ -4037,7 +4091,7 @@ static void ggml_backend_sched_drain_hip_async_input(ggml_backend_sched_t sched)
 }
 
 static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, ggml_backend_sched_hip_return & pending,
-        ggml_backend_sched_split & routed, ggml_backend_sched_split & next) {
+        ggml_backend_sched_split & routed, ggml_backend_sched_split & next, bool wait_for_reuse = true) {
     if (pending.source || next.n_inputs != 1) {
         return false;
     }
@@ -4070,7 +4124,9 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
     if (!pinned) {
         return false;
     }
-    ggml_backend_sched_wait_hip_return_h2d(sched);
+    if (wait_for_reuse) {
+        ggml_backend_sched_wait_hip_return_h2d(sched);
+    }
     pending.input = input;
     pending.copy = copy;
     pending.data = pinned + shared_host_capacity * (1 + (sched->async_hip_input || sched->async_hip_mtp4_input));
@@ -4078,6 +4134,65 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
     pending.enqueue_end_us = 0;
     pending.mapped = false;
     return true;
+}
+
+bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, const float ** activation, const float ** weights) {
+    if (!sched || !hip_single_miss_cpu_enabled.load(std::memory_order_relaxed) || !sched->active_single_miss ||
+            !sched->async_hip_return || !sched->target_mtp_verify_three || sched->target_mtp_verify_four ||
+            sched->profile.enabled || sched->callback_eval || sched->n_copies != 1) {
+        return false;
+    }
+    const auto * copies = sched->active_host_copies;
+    const auto * split = sched->active_copy_split;
+    if (!copies || !copies->single_miss_activation || !copies->single_miss_weights_dst || !split ||
+            split->has_custom || split + 1 == sched->splits + sched->n_splits || sched->active_single_miss->result) {
+        return false;
+    }
+
+    const ggml_tensor * matmuls[3] = {};
+    const ggml_tensor * glu = nullptr;
+    const ggml_tensor * weighted = nullptr;
+    int count = 0;
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const auto * node = split->graph.nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            if (count == 3) {
+                return false;
+            }
+            matmuls[count++] = node;
+        } else if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU) {
+            glu = node;
+        } else if (node->op == GGML_OP_MUL && node->src[1] == copies->single_miss_weights_dst) {
+            weighted = node;
+        }
+    }
+    int host_weights = 0;
+    auto & routed = sched->splits[split - sched->splits];
+    for (int i = 0; i < routed.n_inputs; ++i) {
+        auto * input = routed.inputs[i];
+        host_weights += ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)];
+    }
+    ggml_backend_sched_hip_return pending;
+    if (count != 3 || host_weights != 1 || !glu || !weighted ||
+            matmuls[0]->src[1] != copies->single_miss_activation_dst ||
+            matmuls[1]->src[1] != copies->single_miss_activation_dst ||
+            matmuls[2]->src[1] != glu || weighted->src[0] != matmuls[2] ||
+            !((glu->src[0] == matmuls[0] && glu->src[1] == matmuls[1]) ||
+              (glu->src[0] == matmuls[1] && glu->src[1] == matmuls[0])) ||
+            !ggml_backend_sched_prepare_hip_return(sched, pending, routed, sched->splits[split - sched->splits + 1], false)) {
+        return false;
+    }
+
+    *activation = copies->single_miss_activation;
+    *weights = copies->single_miss_weights;
+    return true;
+}
+
+void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched, const float * result, unsigned mask) {
+    auto * correction = sched->active_single_miss;
+    const auto * destination = sched->active_copy_split + 1;
+    GGML_ASSERT(correction && !correction->result && result && mask > 0 && mask < 8 && destination->n_inputs == 1);
+    *correction = {destination, destination->inputs[0], result, mask};
 }
 
 static enum ggml_status ggml_backend_sched_run_deferred_router(ggml_backend_sched_t sched, bool early) {
@@ -4141,13 +4256,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched_t sched;
         ggml_backend_sched::after_submit pending;
         ggml_backend_sched::deferred_router router;
+        ggml_backend_sched_single_miss single_miss;
         ~after_submit_scope() {
             sched->active_after_submit = nullptr;
             sched->active_deferred_router = nullptr;
+            sched->active_single_miss = nullptr;
         }
-    } after_submit{sched, {}, {}};
+    } after_submit{sched, {}, {}, {}};
     sched->active_after_submit = &after_submit.pending;
     sched->active_deferred_router = &after_submit.router;
+    sched->active_single_miss = &after_submit.single_miss;
     ggml_backend_sched_hip_return hip_return;
     ggml_backend_sched_mapped_hip_input mapped_input;
     const ggml_tensor * shared_return_input = nullptr;
@@ -4279,6 +4397,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     profile.device_to_device_us += copy_us;
                 }
             }
+        }
+        if (after_submit.single_miss.destination == split) {
+            GGML_LOG_ERROR("packed HIP MTP3 single CPU miss: expected pinned return was not consumed\n");
+            return GGML_STATUS_FAILED;
         }
         if (mapped_input.destination == split) {
             mapped_input.wait();
