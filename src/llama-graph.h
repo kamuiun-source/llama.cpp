@@ -845,6 +845,8 @@ struct llm_graph_params {
     bool target_mtp_verify_packed = false;
     bool trace_next_router = false;
     int next_router_score_mode = 0;
+    bool next_router_calibrate = false;
+    bool next_router_yalis = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -928,6 +930,8 @@ struct llm_graph_params {
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
             next_router_score_mode == other.next_router_score_mode &&
+            next_router_calibrate == other.next_router_calibrate &&
+            next_router_yalis == other.next_router_yalis &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -998,6 +1002,7 @@ public:
     std::vector<ggml_tensor *> t_layer_inp;
     std::vector<ggml_tensor *> t_next_router;
     std::vector<ggml_tensor *> t_next_router_scores;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> t_yalis_samples;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1104,6 +1109,9 @@ struct llm_graph_context {
     const llama_moe_cache        * moe_cache;
     const bool target_mtp_verify_three;
     const bool target_mtp_verify_packed;
+    const int next_router_score_mode;
+    const bool next_router_calibrate;
+    const bool next_router_yalis;
 
     const llama_prec_policy * prec_policy;
 
@@ -1276,6 +1284,8 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
+
+    void build_next_router_prediction(ggml_tensor * cur, int il, ggml_tensor * correction = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU

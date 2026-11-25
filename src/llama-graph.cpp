@@ -1431,6 +1431,7 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
     t_next_router.clear();
     t_next_router_scores.clear();
+    t_yalis_samples.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1596,6 +1597,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     target_mtp_verify_three(params.target_mtp_verify_three),
     target_mtp_verify_packed(params.target_mtp_verify_packed),
+    next_router_score_mode(params.next_router_score_mode),
+    next_router_calibrate(params.next_router_calibrate),
+    next_router_yalis(params.next_router_yalis),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2437,6 +2441,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    if (next_router_yalis && il + 1 < n_layer) {
+        auto * table = moe_cache->next_router_yalis_table(il);
+        auto * ids = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
+        auto * scores = ggml_get_rows(ctx0, table, ids);
+        scores = ggml_reshape_3d(ctx0, scores, n_expert, n_expert_used, n_tokens);
+        scores = ggml_mul(ctx0, scores, weights);
+        scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
+        scores = ggml_sum_rows(ctx0, scores);
+        auto * correction = ggml_reshape_2d(ctx0, scores, n_expert, n_tokens);
+        cb(correction, "ffn_next_router_yalis_correction", il + 1);
+        build_next_router_prediction(cur, il, correction);
+    }
+
     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
     ggml_build_forward_expand(gf, cur);
 
@@ -2724,6 +2741,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
+    if (next_router_calibrate && il + 1 < n_layer) {
+        GGML_ASSERT(size_t(il) == res->t_yalis_samples.size());
+        res->t_yalis_samples.emplace_back(selected_experts, experts);
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, fast_three ? "ffn_moe_weighted_mtp_three" : "ffn_moe_weighted", il);
@@ -2770,6 +2792,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+void llm_graph_context::build_next_router_prediction(ggml_tensor * cur, int il, ggml_tensor * correction) const {
+    auto * logits = ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, cur);
+    if (correction) {
+        logits = ggml_add(ctx0, logits, correction);
+    }
+    cb(logits, "ffn_next_router_logits", il + 1);
+    auto * probs = ggml_soft_max(ctx0, logits);
+    cb(probs, "ffn_next_router_probs", il + 1);
+    auto * ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, next_router_score_mode == 2 ? 20 : n_expert_used));
+    cb(ids, "ffn_next_router_topk", il + 1);
+    // Keep these IDs live until the trace reads them after graph execution.
+    ggml_set_output(ids);
+    ggml_build_forward_expand(gf, ids);
+    res->t_next_router.push_back(ids);
+    if (next_router_score_mode) {
+        auto * scores = next_router_score_mode == 2 ? probs : logits;
+        ggml_set_output(scores);
+        res->t_next_router_scores.push_back(scores);
+    }
 }
 
 llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(

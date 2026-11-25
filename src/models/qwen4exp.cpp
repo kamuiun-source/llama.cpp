@@ -593,22 +593,8 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                 il);
         cur = ffn_mix.cur;
 
-        if (params.trace_next_router && il + 1 < n_layer) {
-            auto * logits = ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, cur);
-            cb(logits, "ffn_next_router_logits", il + 1);
-            auto * probs = ggml_soft_max(ctx0, logits);
-            cb(probs, "ffn_next_router_probs", il + 1);
-            auto * ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, params.next_router_score_mode == 2 ? 20 : n_expert_used));
-            cb(ids, "ffn_next_router_topk", il + 1);
-            // Keep these IDs live until the trace reads them after graph execution.
-            ggml_set_output(ids);
-            ggml_build_forward_expand(gf, ids);
-            res->t_next_router.push_back(ids);
-            if (params.next_router_score_mode) {
-                auto * scores = params.next_router_score_mode == 2 ? probs : logits;
-                ggml_set_output(scores);
-                res->t_next_router_scores.push_back(scores);
-            }
+        if (params.trace_next_router && !params.next_router_yalis && il + 1 < n_layer) {
+            build_next_router_prediction(cur, il);
         }
 
         cur = build_layer_ffn(cur, il);
@@ -643,6 +629,23 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (params.next_router_calibrate) {
+        // Append sampling after the ordinary graph, including Expert reduction and the LM head.
+        ggml_build_forward_expand(gf, cur);
+        for (size_t il = 0; il < res->t_yalis_samples.size(); ++il) {
+            auto & sample = res->t_yalis_samples[il];
+            sample.first = ggml_cont(ctx0, sample.first);
+            auto * down = ggml_reshape_2d(ctx0, sample.second, n_embd, n_expert_used * n_tokens);
+            sample.second = ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, down);
+            cb(sample.first, "ffn_yalis_sample_ids", il);
+            cb(sample.second, "ffn_yalis_sample_scores", il);
+            ggml_set_output(sample.first);
+            ggml_set_output(sample.second);
+            ggml_build_forward_expand(gf, sample.first);
+            ggml_build_forward_expand(gf, sample.second);
+        }
+    }
 }
 
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :

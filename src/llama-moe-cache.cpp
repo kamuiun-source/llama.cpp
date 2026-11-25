@@ -566,6 +566,21 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr packed_staging;
     ggml_backend_ptr hip_upload_backend;
     static constexpr int next_prefetch_slots = 8;
+    static constexpr uint32_t yalis_max_rounds = 64;
+    static constexpr uint32_t yalis_min_rounds = 16;
+    static constexpr uint32_t yalis_sample_stride = 4;
+    static constexpr uint32_t yalis_min_observations = 2;
+    static constexpr uint64_t yalis_magic = 0x3153494c41594747;
+    std::string yalis_calibration_path;
+    uint64_t yalis_input_width = 0;
+    uint64_t yalis_fingerprint = 0;
+    uint32_t yalis_rounds = 0;
+    uint32_t yalis_round_attempts = 0;
+    std::vector<uint32_t> yalis_counts;
+    std::vector<float> yalis_sums;
+    ggml_context_ptr yalis_ctx;
+    ggml_backend_buffer_ptr yalis_buffer;
+    std::vector<ggml_tensor *> yalis_tables;
     ggml_backend_ptr next_prefetch_backend;
     ggml_context_ptr next_prefetch_ctx;
     ggml_context_ptr next_prefetch_views;
@@ -1083,6 +1098,7 @@ struct llama_moe_cache::impl {
                     throw std::runtime_error("HIP next Router prefetch requires Qwen4EXP packed MTP3 tuple DMA with dynamic residency. Disable split Expert overlap.");
                 }
                 init_next_prefetch();
+                init_next_router_yalis(model);
             }
             const char * rtx_slots_env = std::getenv("LLAMA_EXPERT_RTX_COLD_SLOTS");
             if (rtx_slots_env && std::strcmp(rtx_slots_env, "0") != 0) {
@@ -1433,6 +1449,7 @@ struct llama_moe_cache::impl {
         // The context synchronizes its backends before destroying the cache.
         finish_async_demand();
         finish_next_prefetch();
+        write_next_router_calibration();
         wait_hip_cold_upload();
         finish_hip_mtp_promotion();
         GGML_ASSERT(!pending_writeback);
@@ -2336,6 +2353,217 @@ struct llama_moe_cache::impl {
             ggml_backend_synchronize(hip_upload_backend.get());
             const uint64_t us = ggml_time_us() - start;
             packed_wait_us += us;
+        }
+    }
+
+    uint64_t next_router_fingerprint(const llama_model & model, size_t layer_count) const {
+        uint64_t hash = 14695981039346656037ull;
+        const auto add = [&](const uint8_t * bytes, size_t count) {
+            for (size_t i = 0; i < count; ++i) {
+                hash = (hash ^ bytes[i]) * 1099511628211ull;
+            }
+        };
+        add(reinterpret_cast<const uint8_t *>(model.name.data()), model.name.size());
+        std::vector<uint8_t> raw;
+        for (size_t il = 0; il < layer_count; ++il) {
+            const auto * router = model.layers[il + 1].ffn_gate_inp;
+            raw.resize(ggml_nbytes(router));
+            ggml_backend_tensor_get(router, raw.data(), 0, raw.size());
+            add(raw.data(), raw.size());
+
+            // Include a deterministic sample of the packed Expert weights and their format.
+            const auto & layer = layers[il];
+            for (const auto * weight : layer.experts) {
+                const auto type = uint8_t(weight->type);
+                add(&type, 1);
+            }
+            const auto & tuple = placement->tuples[il];
+            const auto * data = static_cast<const uint8_t *>(tuple.host->data);
+            add(data, std::min<size_t>(ggml_nbytes(tuple.host), 1024));
+        }
+        return hash;
+    }
+
+    void init_next_router_yalis(const llama_model & model) {
+        const char * calibrate = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_CALIBRATE");
+        const char * load = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_YALIS");
+        if ((!calibrate || !*calibrate) && (!load || !*load)) {
+            return;
+        }
+        if (calibrate && *calibrate && load && *load) {
+            throw std::runtime_error("expert Router calibration and correction are mutually exclusive");
+        }
+        const size_t model_layers = model.hparams.n_layer();
+        if (model_layers < 2 || model_layers > placement->maps.size() || model.hparams.n_expert != next_prefetch_experts) {
+            throw std::runtime_error("expert Router correction requires packed 512-Expert Qwen4EXP");
+        }
+        const size_t layer_count = model_layers - 1;
+        const auto * router = model.layers[1].ffn_gate_inp;
+        if (!router || !router->buffer) {
+            throw std::runtime_error("expert Router correction cannot access the model Router");
+        }
+        yalis_input_width = router->ne[0];
+        const auto buft = ggml_backend_buffer_get_type(router->buffer);
+        const auto dev = ggml_backend_buft_get_device(buft);
+        const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            throw std::runtime_error("expert Router correction requires Router weights on CUDA");
+        }
+        for (size_t il = 0; il < layer_count; ++il) {
+            const auto * weight = model.layers[il + 1].ffn_gate_inp;
+            if (!weight || !weight->buffer || ggml_backend_buffer_get_type(weight->buffer) != buft ||
+                    weight->ne[0] != router->ne[0] || weight->ne[1] != next_prefetch_experts) {
+                throw std::runtime_error("expert Router correction requires one CUDA Router buffer type and consistent shapes");
+            }
+        }
+        yalis_fingerprint = next_router_fingerprint(model, layer_count);
+        constexpr size_t table_size = next_prefetch_experts * next_prefetch_experts;
+        if (calibrate && *calibrate) {
+            yalis_calibration_path = calibrate;
+            yalis_counts.resize(layer_count * next_prefetch_experts);
+            yalis_sums.resize(layer_count * table_size);
+            LLAMA_LOG_INFO("packed expert HIP next Router calibration: layers=%zu max_rounds=%u min_rounds=%u stride=%u output=%s\n",
+                    layer_count, yalis_max_rounds, yalis_min_rounds, yalis_sample_stride, calibrate);
+            return;
+        }
+
+        std::unique_ptr<FILE, decltype(&fclose)> file(fopen(load, "rb"), fclose);
+        const auto read = [&](void * data, size_t element_size, size_t count) {
+            if (!file || fread(data, element_size, count, file.get()) != count) {
+                throw std::runtime_error("could not read expert Router correction table");
+            }
+        };
+        // Header words: magic, layer count, Expert count, width, top-k, input width, model fingerprint, completed rounds.
+        std::array<uint64_t, 8> header;
+        read(header.data(), sizeof(header[0]), header.size());
+        if (header[0] != yalis_magic || header[1] != layer_count || header[2] != next_prefetch_experts ||
+                header[3] != next_prefetch_tokens || header[4] != next_prefetch_ranks || header[5] != yalis_input_width ||
+                header[6] != yalis_fingerprint || header[7] < yalis_min_rounds || header[7] > yalis_max_rounds) {
+            throw std::runtime_error("expert Router correction table does not match this model or calibration configuration");
+        }
+        yalis_ctx.reset(ggml_init({layer_count * ggml_tensor_overhead(), nullptr, true}));
+        if (!yalis_ctx) {
+            throw std::runtime_error("could not allocate expert Router correction metadata");
+        }
+        for (size_t il = 0; il < layer_count; ++il) {
+            auto * table = ggml_new_tensor_2d(yalis_ctx.get(), GGML_TYPE_F32, next_prefetch_experts, next_prefetch_experts);
+            ggml_format_name(table, "ffn_next_router_yalis.%zu", il);
+            yalis_tables.push_back(table);
+        }
+        yalis_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(yalis_ctx.get(), buft));
+        if (!yalis_buffer) {
+            throw std::runtime_error("could not allocate CUDA expert Router correction tables");
+        }
+        ggml_backend_buffer_set_usage(yalis_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        size_t covered = 0;
+        std::array<uint32_t, next_prefetch_experts> counts;
+        std::vector<float> values(table_size);
+        for (auto * table : yalis_tables) {
+            read(counts.data(), sizeof(counts[0]), counts.size());
+            read(values.data(), sizeof(values[0]), values.size());
+            uint64_t count_sum = 0;
+            for (uint32_t count : counts) {
+                covered += count >= yalis_min_observations;
+                count_sum += count;
+            }
+            if (count_sum != header[7] * next_prefetch_tokens * next_prefetch_ranks ||
+                    std::any_of(values.begin(), values.end(), [](float x) { return !std::isfinite(x); })) {
+                throw std::runtime_error("invalid expert Router correction samples or scores");
+            }
+            ggml_backend_tensor_set(table, values.data(), 0, ggml_nbytes(table));
+        }
+        if (fgetc(file.get()) != EOF || ferror(file.get())) {
+            throw std::runtime_error("invalid expert Router correction table size");
+        }
+        LLAMA_LOG_INFO("packed expert HIP next Router YALIS correction: enabled=1 layers=%zu covered=%zu/%zu rounds=%" PRIu64 "\n",
+                layer_count, covered, layer_count * next_prefetch_experts, header[7]);
+    }
+
+    void record_yalis_samples(const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & samples) {
+        GGML_ASSERT(!yalis_calibration_path.empty() && yalis_rounds < yalis_max_rounds &&
+                samples.size() == yalis_counts.size() / next_prefetch_experts);
+        next_prefetch_routes ids;
+        constexpr size_t routes = next_prefetch_tokens * next_prefetch_ranks;
+        std::vector<float> scores(routes * next_prefetch_experts);
+        for (size_t il = 0; il < samples.size(); ++il) {
+            const auto & [router_ids, projection] = samples[il];
+            GGML_ASSERT(router_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(router_ids) &&
+                    ggml_nbytes(router_ids) == routes * sizeof(ids[0]));
+            GGML_ASSERT(projection->type == GGML_TYPE_F32 && ggml_is_contiguous(projection) &&
+                    projection->ne[0] == next_prefetch_experts && ggml_nbytes(projection) == scores.size() * sizeof(float));
+            ggml_backend_tensor_get(router_ids, ids.data(), 0, routes * sizeof(ids[0]));
+            ggml_backend_tensor_get(projection, scores.data(), 0, scores.size() * sizeof(float));
+            for (size_t rank = 0; rank < routes; ++rank) {
+                const auto expert = ids[rank];
+                GGML_ASSERT(expert >= 0 && expert < next_prefetch_experts);
+                const size_t row = il * next_prefetch_experts + expert;
+                ++yalis_counts[row];
+                for (size_t j = 0; j < next_prefetch_experts; ++j) {
+                    yalis_sums[row * next_prefetch_experts + j] += scores[rank * next_prefetch_experts + j];
+                }
+            }
+        }
+        ++yalis_rounds;
+    }
+
+    void write_next_router_calibration() noexcept {
+        if (yalis_calibration_path.empty()) {
+            return;
+        }
+        if (yalis_rounds < yalis_min_rounds) {
+            LLAMA_LOG_WARN("expert Router calibration incomplete: collected %u of at least %u fixed-3 rounds\n",
+                    yalis_rounds, yalis_min_rounds);
+            return;
+        }
+        try {
+            const size_t layer_count = yalis_counts.size() / next_prefetch_experts;
+            constexpr size_t table_size = next_prefetch_experts * next_prefetch_experts;
+            const std::array<uint64_t, 8> header = {yalis_magic, layer_count, next_prefetch_experts,
+                    next_prefetch_tokens, next_prefetch_ranks, yalis_input_width, yalis_fingerprint, yalis_rounds};
+            const std::string temp_path = yalis_calibration_path + ".tmp";
+            std::unique_ptr<FILE, decltype(&fclose)> file(fopen(temp_path.c_str(), "wbx"), fclose);
+            if (!file) {
+                throw std::runtime_error("could not open temporary expert Router correction table");
+            }
+            try {
+                const auto write = [&](const void * data, size_t element_size, size_t count) {
+                    if (fwrite(data, element_size, count, file.get()) != count) {
+                        throw std::runtime_error("could not write expert Router correction table");
+                    }
+                };
+                write(header.data(), sizeof(header[0]), header.size());
+                size_t covered = 0;
+                for (size_t il = 0; il < layer_count; ++il) {
+                    auto * counts = yalis_counts.data() + il * next_prefetch_experts;
+                    auto * table = yalis_sums.data() + il * table_size;
+                    for (size_t expert = 0; expert < next_prefetch_experts; ++expert) {
+                        const uint32_t count = counts[expert];
+                        const float scale = count >= yalis_min_observations ? 1.0f / count : 0.0f;
+                        covered += scale > 0.0f;
+                        for (size_t j = 0; j < next_prefetch_experts; ++j) {
+                            float & x = table[expert * next_prefetch_experts + j];
+                            if (!std::isfinite(x)) {
+                                throw std::runtime_error("non-finite expert Router calibration score");
+                            }
+                            x *= scale;
+                        }
+                    }
+                    write(counts, sizeof(*counts), next_prefetch_experts);
+                    write(table, sizeof(*table), table_size);
+                }
+                if (fclose(file.release()) != 0 || std::rename(temp_path.c_str(), yalis_calibration_path.c_str()) != 0) {
+                    throw std::runtime_error("could not finalize expert Router correction table");
+                }
+                LLAMA_LOG_INFO("packed expert HIP next Router calibration complete: rounds=%u attempted=%u covered=%zu/%zu table=%s\n",
+                        yalis_rounds, yalis_round_attempts, covered, yalis_counts.size(), yalis_calibration_path.c_str());
+            } catch (...) {
+                file.reset();
+                std::remove(temp_path.c_str());
+                throw;
+            }
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("expert Router calibration: %s\n", err.what());
         }
     }
 
@@ -4255,6 +4483,19 @@ bool llama_moe_cache::next_router_trace_active() const {
             self.generation_trace_positions.size() == 3;
 }
 
+ggml_tensor * llama_moe_cache::next_router_yalis_table(int32_t il) const {
+    return size_t(il) < pimpl->yalis_tables.size() ? pimpl->yalis_tables[il] : nullptr;
+}
+
+bool llama_moe_cache::sample_next_router_calibration() {
+    return !pimpl->yalis_calibration_path.empty() && pimpl->yalis_rounds < impl::yalis_max_rounds &&
+            (pimpl->yalis_round_attempts++ % impl::yalis_sample_stride == 0);
+}
+
+void llama_moe_cache::record_next_router_calibration(const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & samples) {
+    pimpl->record_yalis_samples(samples);
+}
+
 bool llama_moe_cache::next_router_prefetch_enabled() const {
     return pimpl->next_prefetch_bank != nullptr;
 }
@@ -4495,6 +4736,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     if (pimpl->packed_staging) {
         const auto buffer = pimpl->packed_staging.get();
+        res[ggml_backend_buffer_get_type(buffer)] += ggml_backend_buffer_get_size(buffer);
+    }
+    if (pimpl->yalis_buffer) {
+        const auto buffer = pimpl->yalis_buffer.get();
         res[ggml_backend_buffer_get_type(buffer)] += ggml_backend_buffer_get_size(buffer);
     }
     if (pimpl->next_prefetch_buffer) {

@@ -2404,6 +2404,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed && target_mtp_verify_width == 3 &&
             !cparams.warmup && moe_cache && (moe_cache->next_router_trace_active() || moe_cache->next_router_prefetch_enabled());
     gparams.next_router_score_mode = gparams.trace_next_router ? moe_cache->next_router_score_mode() : 0;
+    gparams.next_router_calibrate = gparams.trace_next_router && moe_cache->sample_next_router_calibration();
+    gparams.next_router_yalis = gparams.trace_next_router && moe_cache->next_router_yalis_table(0);
     const auto rebind_graph = [&] {
         res = get_gf_res_prev();
         gparams.res = res;
@@ -2558,6 +2560,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     ret = GGML_STATUS_SUCCESS;
 
+    if (!res->t_yalis_samples.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->record_next_router_calibration(res->t_yalis_samples);
+    }
     if (!res->t_next_router.empty() && moe_cache->next_router_trace_active()) {
         ggml_backend_sched_synchronize(sched.get());
         for (size_t i = 0; i < res->t_next_router.size(); ++i) {
