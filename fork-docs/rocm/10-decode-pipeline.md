@@ -836,6 +836,21 @@ Astraの第一候補は、現行HC upの直前にある `SCALE → SiLU → Q8_1
 
 大きいQ6_K投影を狙う場合は、upstreamのfew-row MMQをまず独立した実形状のQKV・gateで比較する。upstreamの既定はQ6_Kで4列以上、Q8_0で5列以上。3列は限定した試験設定とし、入力のQ8_1変換を含め、実データと同じ重み巡回で測る。K=320のHC upは長さ条件を満たさない。DRAM読み出し量・実帯域・演算発行を測り、単体で差が出た投影だけを実モデルで評価する。FP32の加算順が変わり得るため、誤差とMTP採用数も確認する。[upstreamの実装と測定](https://github.com/ggml-org/llama.cpp/pull/31533) · [通常経路の条件](https://github.com/ggml-org/llama.cpp/blob/0fb8f157702702f33f4e018de8701b2569a1bc28/ggml/src/ggml-cuda/mmq-few.cu#L758-L791)
 
+###### RTX固定3幅のQ6_K few-row MMQ単体比較
+
+- 対象はRTX 4070 Tiのdense Q6_K QKV（内積長2,560・出力10,240）とgate（内積長2,560・出力6,144）の実3位置。重み形式はQ6_Kのまま、upstreamのINT8 Tensor Core経路を比較用に使う。upstreamの通常選択ではQ6_Kは4位置以上。[upstream #31533](https://github.com/ggml-org/llama.cpp/pull/31533)
+- 既存MMVQとfew-row MMQに同じ合成Q6_K重みとF32入力を与え、各方式固有のQ8_1変換から投影完了までのGPU時間を測る。各投影は別々に、L2容量を超える5枚の重みを巡回させて測定する。加算順が異なるので最大絶対誤差などを確認する。
+- 単体で再現して短縮した投影だけを実モデルへ入れ、固定3幅の生成速度とMTP採用数を比較する。
+
+上流 `0fb8f1577` のQ6_K経路を独立したCUDAベンチに取り出し、既存ライブラリのMMVQと、同じCUDAバッファ上の入力・重みで比較した。RTX 4070 TiのL2は48 MiB。5枚の重みはQKVで107.52 MB、gateで64.51 MB。CUDA Graphの再生をCUDAイベントで計測し、1区間30回、順序はMMVQ→few-row→few-row→MMVQ。入力量子化は計測に含み、重みのアップロードとGraphキャプチャは計測外。
+
+| 投影 | 既存MMVQ（µs、2区間平均） | few-row MMQ（µs、2区間平均） | 変化 |
+| --- | ---: | ---: | ---: |
+| QKV 2,560 × 10,240 | 50.219 | 52.461 | +4.47% |
+| gate 2,560 × 6,144 | 31.842 | 34.282 | +7.66% |
+
+両形状でfew-rowは全測定区間で遅かった。既存MMVQに対する正規化RMSEは最大0.0191%、最大絶対誤差は0.000627未満。合成入力のベンチを完走し、実モデルへの追加は見送った。単体コードはGit外の `/home/t-saka/rocm-rtx-q6k-few-mmq-20261125/`、実行結果は `/home/t-saka/rocm-rtx-q6k-int8-fewrows-20261125/run-both-shapes.log`。
+
 ###### HC up直前のQ8_1変換を融合する試作
 
 - 変更範囲はRTX Ada、固定3位置、Q8_0 HC upの内積長320・出力10,240。直前のScale・SiLU・Q8_1変換をまとめ、既存MMVQに渡す。Scale出力をinjectなどの別ノードも参照する場合はScaleを残し、条件を満たせばSiLUとQ8_1変換だけをまとめる。
