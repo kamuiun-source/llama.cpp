@@ -61,3 +61,16 @@
 別の98,304語のNsight実行で、RTXの1列 `mul_mat_vec_q` を出力行数とグリッドで分類した。全語彙出力は平均1.409 ms/起動（188回）。縮小時は先頭98,304行で0.564 ms、会話用の1,024行で0.007 ms（各413回、合計0.571 ms/候補）。値はウォームアップを含む取得全体で、連結・マスク・グローバルIDへの転記時間は含まない。プロファイラー付き実行の5問は通常の98,304語と生成IDが一致。トレースはGit外の `/home/t-saka/rocm-request-vocab-20261125/nsys-prefix-98304/runs/run01_request_98304/` に保存した。
 
 試作は `LLAMA_MTP_DRAFT_VOCAB_REQUEST=1` で有効化し、`LLAMA_MTP_DRAFT_VOCAB_PREFIX` でベース語彙数を指定する。今回の `LLAMA_MTP_DRAFT_VOCAB_MAX_MISSES=8` は既定値。採用設定には加えず既定OFF。実行ログはGit外の `/home/t-saka/rocm-request-vocab-20261125/runs/`。
+
+## 固定3幅の本体検証を短くする公開実装
+
+全語彙の通常実行は本体42.49 ms/検証。ここでは3位置と正規Routerを維持する案を優先する。42.49 msは通常実行、以下のカーネルと転送時間は別のプロファイル実行。重複する区間があるため単純には足せない。
+
+1. **RTX上で本体のgreedy選択を済ませる。** 保存済みNsightを再集計すると、実3位置の273検証すべてで、248,320語×3行のFP32 logitに相当する2,979,840 BのD2Hが各1本あった。合計60.888 ms、平均0.223 ms/検証。CPUの候補配列作成・走査や同期待ちはこの値に含まない。現行の本体には `--backend-sampling` とGPUの `greedy_argmax` があり、通常ベンチでは本体サンプラーを未指定。まず既存オプションを使い、採用列・本文を照合しながら、生logitに加えてサンプラー経由のlogit転送も消えたか確認する。現行の汎用サンプラーは採用IDを確認する前に候補列を用意するため、転送やCPU処理が残る場合は、greedy・確率出力なしの3位置だけで最高得点IDを使う分岐が次。全語彙投影自体は維持する。GPUでgreedy検証を行う実装例は[SGLang](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/eagle_worker_v2.py)。同モデルでGPUサンプリングを試した公開例は[170hx-qwen-flash](https://github.com/douyamv/170hx-qwen-flash/blob/main/next/docs/OPTIMIZATIONS.md)。
+2. **RTXのHC downを小さいグリッド向けにする。** 先行トレースではHCのQ8_0 up/downが合計2.09 ms/検証。現物のGGUFでdownはK=10,240・出力320、upは逆と確認した。170hxの `q8a` は重みのint8列とスケールを分け、長いKにsplit-Kを使う。downの3位置で既存MMVQと比較し、部分和の合算まで含める。ds4-qwenは2位置のHCで重みを共有する設計の参考になる。RTXの現行MMVQも3列をまとめているため、同じ再利用を追加するだけの案は避け、グリッド形状と帯域を測る。[170hx q8a](https://github.com/douyamv/170hx-qwen-flash/blob/main/next/docs/OPTIMIZATIONS.md) · [ds4-qwen](https://github.com/Anemll/ds4-qwen/blob/qwen3.8-flash-next/speed-bench/qwen38-mtp-decode.md)
+3. **MI50のExpert転送は、既存の次層先読みを基準にする。** 採用後のトレースで演算と重ならないExpert H2Dは9.106 ms/検証。YALISは現在層のルーター入力に、選択Expertごとの代表出力を重み付きで足して次層を予測する。既存の入力流用と差がある部分で、同じ8枠のまま採用前にトレース再生で比較できる。正規Routerを実行し、実ミス捕捉バイト数・余分なH2D・計算開始前に到着した分を数える。論文の最大14%は予測Expertを実際に使う近似方式も含むため、その値は見込みに使わない。[論文](https://arxiv.org/abs/2603.19289) · [YALISの公開実装](https://github.com/axonn-ai/yalis/tree/offload_prefetch)
+4. **長い履歴ならQSAのtop-kと疎なattentionを検討する。** Gufoの同モデルは選択マスクを一度で詰め、同じK/V行を複数のquery headで共有。32K、512選択ブロックの単体は1位置で40.3→30.4 µs、8位置で163.8→125.6 µs。固定3幅の公表値ではない。現行はプールキー再利用、`ggml_top_k` と疎な経路がある。32Kでindexer/top-k・選択展開・attentionを別に計時し、残っている処理だけを比較する。CUDAのtop-k実装はvLLMの決定的なradix版も参照できる。選択IDの集合と並び、境界の同点を照合する。[Gufo](https://github.com/gufo-org/gufo/blob/main/docs/internal/models/qwen3.8-flash-next/EXPERIMENTS.md) · [vLLM #55122](https://github.com/vllm-project/vllm/pull/55122)
+
+**論文の適用範囲。** HybridSpecは最初のMoE Routerで検証幅を決め、EVICTは事前に見積もった検証コストで候補列を短くする。幅を変えてもよい段階なら、現行autoに採用確率だけでなく実測したExpert H2Dコストを入れる案になる。固定3幅ではGDNの状態復元だけが該当し、HybridSpecのA100の2～3位置でのGDN単体改善は1.33～1.35倍。FlashInferに実際のMTP APIはあるが、現行トレースのGDN本体は0.290 ms/検証で、採用後の状態コピーを別に計らない限り優先度は低い。論文固有の公開リポジトリは確認できなかった。[HybridSpec](https://arxiv.org/abs/2611.04055) · [EVICT](https://arxiv.org/abs/2605.00342) · [FlashInfer GDN MTP API](https://docs.flashinfer.ai/generated/flashinfer.gdn_decode.gated_delta_rule_mtp.html)
+
+最初の比較は全ドラフト語彙・固定3幅で本体GPUサンプリングだけを変える。同じ約2.98 MBのコピーが消えたか、候補ごとの採用と最終出力、通常時の生成速度を見る。投影を変更する試作は固定の隠れ状態と重みで候補を選別し、効果が出た場合だけいつもの5問を実行する。
