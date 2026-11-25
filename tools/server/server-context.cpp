@@ -1154,6 +1154,7 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        llama_set_mtp_verify_sampler(ctx_tgt, nullptr);
 
         // clear alora start
         alora_invocation_start = -1;
@@ -2909,6 +2910,18 @@ private:
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+
+            static const bool mtp_verify_gpu_greedy = [] {
+                const char * flag = std::getenv("LLAMA_MTP_FIXED3_TARGET_GPU_GREEDY");
+                const char * fixed = std::getenv("LLAMA_MTP_VERIFY_THREE");
+                return flag && std::strcmp(flag, "1") == 0 && fixed && std::strcmp(fixed, "1") == 0;
+            }();
+            if (mtp_verify_gpu_greedy && spec && !task.params.sampling.backend_sampling && !mtp_logit_trace &&
+                    task.type == SERVER_TASK_TYPE_COMPLETION && common_speculative_n_max(spec.get()) == 2 &&
+                    common_sampler_can_verify_greedy_on_device(slot.smpl.get())) {
+                const bool enabled = llama_set_mtp_verify_sampler(ctx_tgt, common_sampler_get(slot.smpl.get()));
+                SLT_INF(slot, "MTP fixed3 target GPU greedy: enabled=%d\n", enabled);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());

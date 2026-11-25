@@ -305,6 +305,8 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    bool set_mtp_verify_sampler(llama_sampler * sampler);
+    bool mtp_verify_sampled_ids() const { return sampling.mtp_verify_sampled_ids; }
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -391,6 +393,13 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> mtp_verify_sampler{nullptr, llama_sampler_free};
+        bool mtp_verify_needs_reserve = false;
+        bool mtp_verify_sampled_ids = false;
+        ggml_tensor * mtp_verify_logits = nullptr;
+        size_t mtp_verify_id_rows = 0;
+        size_t mtp_verify_raw_bytes_saved = 0;
+        size_t mtp_verify_id_fallbacks = 0;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

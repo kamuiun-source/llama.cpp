@@ -819,6 +819,7 @@ struct llm_graph_params {
     ggml_tensor * mtp_vocab_extra_bias = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    bool sampler_ids_only = false;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -922,6 +923,7 @@ struct llm_graph_params {
             mtp_vocab_ids == other.mtp_vocab_ids &&
             mtp_vocab_extra_head == other.mtp_vocab_extra_head &&
             mtp_vocab_extra_bias == other.mtp_vocab_extra_bias &&
+            sampler_ids_only == other.sampler_ids_only &&
             target_mtp_verify_three == other.target_mtp_verify_three &&
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
@@ -1117,6 +1119,7 @@ struct llm_graph_context {
     ggml_tensor * mtp_vocab_extra_bias;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    const bool sampler_ids_only;
 
     const llm_graph_cb & cb_func;
 

@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-ext.h"
 
 #include "ggml.h"
 
@@ -603,6 +604,30 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+bool common_sampler_can_verify_greedy_on_device(const struct common_sampler * gsmpl) {
+    const auto & p = gsmpl->params;
+    if (gsmpl->grmr || gsmpl->rbudget || p.temp != 0.0f || p.dynatemp_range != 0.0f ||
+            p.n_probs != 0 || p.mirostat != 0 || p.samplers.empty() ||
+            p.samplers.back() != COMMON_SAMPLER_TYPE_TEMPERATURE) {
+        return false;
+    }
+    return std::all_of(p.samplers.begin(), p.samplers.end(), [&](common_sampler_type type) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE: return true;
+            case COMMON_SAMPLER_TYPE_TOP_P:       return p.top_p > 0.0f && p.top_p <= 1.0f;
+            case COMMON_SAMPLER_TYPE_MIN_P:       return p.min_p >= 0.0f && p.min_p < 1.0f;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: return p.top_n_sigma < 0.0f;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:   return p.typ_p >= 1.0f;
+            case COMMON_SAMPLER_TYPE_XTC:         return p.xtc_probability == 0.0f;
+            case COMMON_SAMPLER_TYPE_DRY:         return p.dry_multiplier == 0.0f;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                return p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f;
+            default: return false;
+        }
+    });
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -616,6 +641,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    if (llama_mtp_verify_sampled_ids(ctx)) {
+        id = llama_get_sampled_token_ith(ctx, idx);
+        if (id != LLAMA_TOKEN_NULL) {
+            GGML_ASSERT(!grmr && !rbudget);
+            gsmpl->cur.assign(1, {id, 0.0f, 1.0f});
+            cur_p = {gsmpl->cur.data(), 1, 0, true};
+            return id;
+        }
+    }
     gsmpl->set_logits(ctx, idx);
 
     // Check if a backend sampler has already sampled a token in which case we

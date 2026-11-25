@@ -1607,6 +1607,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_vocab_extra_head(params.mtp_vocab_extra_head),
     mtp_vocab_extra_bias(params.mtp_vocab_extra_bias),
     samplers         (params.samplers),
+    sampler_ids_only (params.sampler_ids_only),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -4692,6 +4693,16 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            if (sampler_ids_only && data.sampled) {
+                res->t_sampling_all.push_back(data.sampled);
+                if (active) {
+                    res->t_sampled[row] = data.sampled;
+                }
+                outs[1] = data.sampled;
+                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+                continue;
+            }
 
             if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
             if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }

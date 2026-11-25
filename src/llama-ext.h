@@ -15,6 +15,8 @@
 // Keep prompt accounting while using the normal decode microbatch capacity.
 LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API int32_t llama_process_mtp_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
+LLAMA_API bool llama_set_mtp_verify_sampler(struct llama_context * ctx, struct llama_sampler * sampler);
+LLAMA_API bool llama_mtp_verify_sampled_ids(const struct llama_context * ctx);
 LLAMA_API bool llama_mtp_vocab_subset_enabled(const struct llama_context * ctx);
 LLAMA_API bool llama_mtp_request_vocab_enabled(const struct llama_context * ctx);
 LLAMA_API void llama_mtp_request_vocab_begin(struct llama_context * ctx, const std::vector<llama_token> & prompt);
