@@ -3355,12 +3355,11 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    bool res = false;
-
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    bool res = graph->mapped_hc_output != cuda_ctx->mapped_hc_output || graph->mapped_hc_data != cuda_ctx->mapped_hc_data;
 
-    if (cgraph->uid != 0 &&
+    if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -3370,6 +3369,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+    graph->mapped_hc_output = cuda_ctx->mapped_hc_output;
+    graph->mapped_hc_data = cuda_ctx->mapped_hc_data;
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -6094,6 +6095,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__linux__)
+static bool ggml_backend_cuda_graph_mapped_hc_input(ggml_backend_t backend, ggml_cgraph * graph, uint64_t uid,
+        const ggml_tensor * producer, void * mapped, enum ggml_status * status) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->curr_stream_no != 0 || !ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+
+    // Keep the VRAM address for local consumers. The mirror address is part of the captured launch.
+    auto mapped_graph = *graph;
+    mapped_graph.uid = uid;
+    struct clear_mirror {
+        ggml_backend_cuda_context * ctx;
+        ~clear_mirror() { ctx->mapped_hc_output = nullptr; ctx->mapped_hc_data = nullptr; }
+    } clear{ctx};
+    ctx->mapped_hc_output = producer;
+    ctx->mapped_hc_data = static_cast<float *>(mapped);
+    *status = ggml_backend_cuda_graph_compute(backend, &mapped_graph);
+    return true;
+}
+#endif
+
 #if defined(GGML_USE_HIP) && defined(__linux__)
 static bool ggml_backend_hip_graph_mapped_return(ggml_backend_t backend, ggml_cgraph * graph, uint64_t uid,
                                                 void * mapped, enum ggml_status * status) {
@@ -6681,6 +6704,25 @@ static bool ggml_backend_cuda_register_writable_host_flags(ggml_backend_dev_t de
 static bool ggml_backend_cuda_register_writable_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
     return ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, cudaHostRegisterPortable);
 }
+
+#if !defined(GGML_USE_HIP) && defined(__linux__)
+static bool ggml_backend_cuda_register_mapped_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            ggml_backend_cuda_register_writable_host_flags(dev, buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped, false);
+}
+
+static void * ggml_backend_cuda_get_host_mapping(ggml_backend_dev_t dev, void * buffer) {
+    auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    ggml_cuda_set_device(ctx->device);
+    void * mapped = nullptr;
+    if (cudaHostGetDevicePointer(&mapped, buffer, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return mapped;
+}
+#endif
 
 #if defined(GGML_USE_HIP) && defined(__linux__)
 static bool ggml_backend_hip_register_mapped_host(ggml_backend_dev_t dev, void * buffer, size_t size) {
@@ -7637,6 +7679,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_writable_host") == 0) {
         return (void *)ggml_backend_cuda_unregister_writable_host;
+    }
+#endif
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__linux__)
+    if (strcmp(name, "ggml_backend_cuda_register_mapped_host") == 0) {
+        return (void *)ggml_backend_cuda_register_mapped_host;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_host_mapping") == 0) {
+        return (void *)ggml_backend_cuda_get_host_mapping;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_mapped_hc_input") == 0) {
+        return (void *)ggml_backend_cuda_graph_mapped_hc_input;
     }
 #endif
 #if defined(GGML_USE_HIP) && defined(__linux__)

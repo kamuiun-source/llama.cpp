@@ -100,11 +100,11 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+template <bool gated, bool mapped = false>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
-        float * dst,
+        float * dst, float * mirror,
         int64_t n_embd,
         int64_t hc,
         int64_t n_tokens,
@@ -142,7 +142,11 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float value = scale * sum;
+    dst[i0*sd0 + it*sd1] = value;
+    if constexpr (mapped) {
+        mirror[ir] = value;
+    }
 }
 
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
@@ -270,9 +274,10 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    float * mirror = dst == ctx.mapped_hc_output ? ctx.mapped_hc_data : nullptr;
+    auto kernel = mirror ? dsv4_hc_pre_f32<true, true> : gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+            (const float *) x->data, (const float *) weights->data, (float *) dst->data, mirror,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
