@@ -58,6 +58,8 @@ struct ggml_cuda_graph {
     int64_t last_used_time = 0;
 #ifdef GGML_USE_HIP
     int gfx906_lds_modes = -1;
+#elif !defined(GGML_USE_MUSA)
+    int q6_k_mmvq_mode = -1;
 #endif
     struct node_properties {
         ggml_tensor node;

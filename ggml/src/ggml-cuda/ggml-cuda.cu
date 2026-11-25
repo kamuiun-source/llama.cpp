@@ -6,6 +6,7 @@
 #include "ggml-cuda/common.cuh"
 #include "sync-telemetry.cuh"
 #include "ggml-cuda/graph.cuh"
+#include "ggml-cuda/q6-k-mmvq-mode.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -6021,6 +6022,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cuda_ctx->cuda_graphs.erase(it);
         }
     }
+#elif !defined(GGML_USE_MUSA)
+    const bool q6_k_managed = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            ggml_cuda_q6_k_mmvq::configured();
+    const int q6_k_mode = q6_k_managed ? ggml_cuda_q6_k_mmvq::get_mode() : -1;
+    if (q6_k_managed) {
+        const auto it = cuda_ctx->cuda_graphs.find(graph_key);
+        if (it != cuda_ctx->cuda_graphs.end() && it->second->q6_k_mmvq_mode >= 0 && it->second->q6_k_mmvq_mode != q6_k_mode) {
+            cuda_ctx->cuda_graphs.erase(it);
+        }
+    }
 #endif
 
     const bool graphs_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -6083,7 +6094,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (q6_k_managed) {
+        ggml_cuda_q6_k_mmvq::dispatched = false;
+    }
+#endif
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, nullptr, nullptr, components);
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (graphs_enabled && q6_k_managed && (!use_cuda_graph || cuda_graph_update_required)) {
+        cuda_ctx->cuda_graph(graph_key)->q6_k_mmvq_mode = ggml_cuda_q6_k_mmvq::dispatched ? q6_k_mode : -1;
+    }
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (sample && cudaEventRecord(sample->stop, telemetry_stream) != cudaSuccess) {
@@ -7654,6 +7675,12 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_get_q6_k_mmvq_signed") == 0) {
+        return (void *) ggml_cuda_q6_k_mmvq::get_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_q6_k_mmvq_signed") == 0) {
+        return (void *) ggml_cuda_q6_k_mmvq::set_mode;
+    }
     if (strcmp(name, "ggml_backend_cuda_is_ada") == 0) {
         return (void *)+[](ggml_backend_dev_t dev) {
             const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "q6-k-mmvq-signed.cuh"
 
 #include <cstdint>
 
@@ -625,6 +626,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
+template <bool signed_q6>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
@@ -641,9 +643,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
             const int vil = (vl[j] >> (4*i)) & 0x0F0F0F0F;
             const int vih = ((vh[j] >> (4*i)) << 4) & 0x30303030;
 
-            // (vil | vih) - 32 for each byte, the - 32 is done by the second dp4a
-            sumi = ggml_cuda_dp4a(vil | vih,  u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi); // SIMD dot product
-            sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi);
+            const int codes = vil | vih;
+            const int values = u[VDR_Q6_K_Q8_1_MMVQ*i + j];
+            if constexpr (signed_q6) {
+                sumi = ggml_cuda_dp4a(q6_k_mmvq_signed_bytes(codes), values, sumi);
+            } else {
+                // The second dot product subtracts 32 from every quantized lane.
+                sumi = ggml_cuda_dp4a(codes, values, sumi);
+                sumi = ggml_cuda_dp4a(0xE0E0E0E0, values, sumi);
+            }
         }
 
         sumf += d8[i] * (sumi * sc);
@@ -1071,6 +1079,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+template <bool signed_q6>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1102,7 +1111,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    return vec_dot_q6_K_q8_1_impl_mmvq<signed_q6>(vl, vh, u, scales, bq6_K->d, d8);
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2

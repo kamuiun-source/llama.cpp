@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "hc-fused.cuh"
+#include "q6-k-mmvq-mode.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -156,7 +157,7 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-template <bool packed_signs = false>
+template <bool packed_signs = false, bool signed_q6 = false>
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -172,7 +173,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1<signed_q6>;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1<packed_signs>;
@@ -744,7 +745,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
-          bool hc_reuse = false, int row_groups = 1, int split_k = 1>
+          bool hc_reuse = false, int row_groups = 1, int split_k = 1, bool signed_q6 = false>
 __launch_bounds__(row_groups*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -766,7 +767,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<false, signed_q6>(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int group = row_groups == 1 ? 0 : threadIdx.z;
@@ -2256,6 +2257,30 @@ void ggml_cuda_mul_mat_vec_q(
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q6_K && ncols_dst == 3 &&
+            ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+            device.cc == GGML_CUDA_CC_ADA_LOVELACE && ggml_cuda_q6_k_mmvq::configured()) {
+        const bool enabled = ggml_cuda_q6_k_mmvq::get_mode();
+        ggml_cuda_q6_k_mmvq::dispatched = true;
+        static std::atomic<int> last_mode{-1};
+        if (last_mode.load(std::memory_order_relaxed) != enabled &&
+                last_mode.exchange(enabled, std::memory_order_relaxed) != enabled) {
+            GGML_LOG_INFO("CUDA Ada Q6_K MMVQ dispatch: cols=3 mode=%s\n", enabled ? "signed" : "off");
+        }
+        if (enabled) {
+            const auto dims = calc_launch_params<GGML_TYPE_Q6_K>(3, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
+            const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            const mmvq_launch_trace trace(params, 3, false, false, false);
+#endif
+            ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q6_K, 3, false, false, false, false, 1, 1, true>, params,
+                src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
+                uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
+            return;
+        }
+    }
+
     if (hc_down_split_k && hc_down_width3) {
         const int n = ne01 * ne11;
         ggml_cuda_pool_alloc<float> partial(ctx.pool(), n * hc_down_split_k_parts);
