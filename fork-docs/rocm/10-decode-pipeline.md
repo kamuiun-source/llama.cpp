@@ -548,6 +548,14 @@ APIで再集計すると同期3.398 ms（うち `hipStreamSynchronize` 3.322）�
 
 採取時は `GGML_SCHED_HIP_VERIFY_STAGE_TRACE=/results/verify-host.csv` を指定する。計測後に `/results/verify-host.csv.flush` を作り、未キャッシュの短い追加リクエストを発行してからプロファイラーを停止する。この追加リクエストは集計範囲外。CSVはウォームアップを含む269グラフ・100,116行で、欠落報告は0。生ログはGit外の `/home/t-saka/rocm-verify-idle-attribution-20261125/retry02/capture-01/`、集計は上記解析ディレクトリの `current-outside-stages.json`。
 
+###### Expertコピーコールバック直前のMI50同期
+
+`ggml_backend_sched_compute_splits()` は活性値とルーター入力をMI50側に発行した後、ホスト常駐重みの処理を `ggml_backend_sched_copy_input()` に渡す。共通処理は入力領域の上書き保護のため宛先バックエンドを待ってから `sched_copy_experts` を呼ぶ。固定3幅の単一コピーでスケジューラのイベントがない場合、その待ちはMI50の計算ストリームの `hipStreamSynchronize` になる。直前に発行した現層の入力コピーもここで完了する。コールバック内のExpert転送完了待ちや、次のRTXスプリットがExpert演算結果を待つ同期は別箇所。
+
+上と同じ実3位置266検証について、ROCmの `host_weight_copy` 12,768区間の先頭5 µs以内に始まり、その区間内で終了した最初の `hipStreamSynchronize` を抽出した。12,180件で、API呼び出し全体は3.212 ms/検証。そのうち0.481 msはMI50のH2Dまたはコピー用カーネルと重なり、2.730 msは受け渡し計時外かつ両GPU・DMAが非活動の区間にあった。前節の重み準備内の同期API全体3.317 msのうち約82%。呼び出し位置はコード順と時刻で推定した。コールスタックは未取得で、古いビルドの時間を現行版の値に外挿しない。集計はGit外の `/home/t-saka/rocm-verify-idle-20261125/pre-callback-sync.json`。
+
+現行の正式採用設定の固定5問では、ルーターIDのホストコピー13,344件、MI50からのフォールバック読み戻し0。コールバックのCPU側でIDを読み、転送対象を選ぶ処理にはMI50の入力完了を待つ依存がない。入力領域やスロット表用のピン留め領域を再利用する前の保護と、別ストリームで投入するExpert転送の依存は残る。改修を試すなら、固定3幅の該当コールバックでホスト側のID取得・選定を先に行い、GPU側の依存は入力・領域再利用・別ストリーム間に分けて待ちを置く。後段への待ち移動も含め、現在の全採用設定で必要な完了待ちと生成速度を比較する。
+
 #### RTXの量子化投影を集計する
 
 LinuxのAda向けビルドで `GGML_CUDA_MMVQ_TRACE=1` を指定すると、RTXのdense MMVQのNVTXに重み名・出力名・量子型・テンソル形状・起動形状が出る。Nsight Systemsは `--trace=cuda,nvtx --cuda-graph-trace=node` で起動時から採取し、SQLiteへエクスポートする。CUDA Graphは再生を継続する。再キャプチャ時だけ実行グラフを作り直し、古いノードIDへの誤対応を防ぐ。通常の速度比較ではこのフラグを外す。
