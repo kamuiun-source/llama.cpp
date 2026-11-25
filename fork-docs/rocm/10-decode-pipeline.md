@@ -368,6 +368,38 @@ Expert tupleの4種の実サイズをrocprofのコピー記録から照合した
 
 全体の平均を詰める観点では、RTXの量子化行列ベクトル積をモデルの投影・量子型別に照合するのが次の切り分けになる。第4問の遅れを詰める場合はExpert H2Dの転送量・上位層を追う。GPU間の受け渡し計時外の非活動9.167 msのうち3.415 msはホストの同期APIに含まれ、残りの内訳は今回の区間情報では特定していない。解析スクリプトとJSONはGit外の `/home/t-saka/rocm-hip-mapped-return-ab-20261125/adopted/`。
 
+#### RTXの量子化投影を集計する
+
+LinuxのAda向けビルドで `GGML_CUDA_MMVQ_TRACE=1` を指定すると、RTXのdense MMVQのNVTXに重み名・出力名・量子型・テンソル形状・起動形状が出る。Nsight Systemsは `--trace=cuda,nvtx --cuda-graph-trace=node` で起動時から採取し、SQLiteへエクスポートする。CUDA Graphは再生を継続する。再キャプチャ時だけ実行グラフを作り直し、古いノードIDへの誤対応を防ぐ。通常の速度比較ではこのフラグを外す。
+
+```bash
+python3 fork-docs/scripts/report-rtx-mmvq.py "$run_dir/cuda.sqlite" "$run_dir/host-marks.csv" "$run_dir/session.json"
+```
+
+3位置の本体検証区間を応答時刻と位相マーカーで照合し、CUDA GraphのノードIDを元のノードまでたどる。直接起動はCUDA APIのcorrelation IDを使う。カーネルの形状もNVTXと照合し、対応付けられない分は別計上する。結果には投影・量子型・形状ごとの回数、1検証あたりの合計、1起動の中央値を出す。
+
+2026-11-25にRTX 4070 TiとMI50で、全採用設定ON・固定3幅・単一バンク・直接DMAの固定5問を同一ビルドで2回実行した。両回とも5問完走、640生成ID・本文・MTP採用358/549は通常版と一致。各273回の実3位置検証で、対象135,681カーネルすべてを照合した（Graph 133,185、直接起動2,496）。トレース時の生成は42.26、42.14 tok/sで、通常版の46.82 tok/sとは計測条件が異なる。 応答中のホスト・コンテナのスワップアウトは両回とも0。コンテナのスワップインは4,317ページ、3,117ページ。
+
+| RTXの対象（ms/検証） | 重みの形状 K × 出力行数 | 1回目 | 2回目 |
+| --- | --- | ---: | ---: |
+| MMVQ合計 | | 9.326 | 9.321 |
+| Q6_K合計 | | 6.696 | 6.694 |
+| Q8_0合計 | | 2.630 | 2.627 |
+| Q6_K `attn_qkv.weight`（35回/検証） | 2560 × 10240 | 1.754 | 1.753 |
+| Q6_K `output.weight`（1回/検証） | 2560 × 248320 | 1.120 | 1.120 |
+| Q6_K `attn_gate.weight`（35回/検証） | 2560 × 6144 | 1.044 | 1.044 |
+| Q6_K `ssm_out.weight`（36回/検証） | 6144 × 2560 | 1.031 | 1.031 |
+| Q6_K `attn_q.weight`（12回/検証） | 2560 × 12288 | 0.695 | 0.695 |
+| Q8_0のHC up/down 4投影合計 | 320 × 10240、10240 × 320 | 2.088 | 2.085 |
+
+Q6_KがMMVQの約72%。全対象が3列で、ブロックは32 × 4 × 1。Q6_Kの語彙出力は重み521.47 MBを1回約1.12 msで処理し、重みサイズを時間で割ると約466 GB/s。Q6_KのQKVとgateは約434 GB/s。RTX 4070 Tiの公称504 GB/sに近いが、これは論理量からの換算でDRAMカウンタの測定値ではない。[PNYの製品仕様](https://www.pny.com/file%20library/company/support/product%20brochures/geforce%20graphics/english/consumer-geforce-linecard-03-25-24.pdf)
+
+- **Q6_KのQKV・gateを優先。** 実モデルでは同じ入力から別々に投影し、合計約2.80 ms/検証。既存の結合重み経路があるため、同一量子型の層で重み行を結合してQ8_1入力量子化と起動を共通化する案を確認できる。重みの読み出し量は同じなので、削減対象は入力変換と起動。読み出しと復号の内訳は、QKV・語彙出力の実形状でDRAM/L2カウンタ、発行可能ワープ数、SASSを確認する。[Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/)
+- **Q6_K復号の再移植は不要。** upstream #30517は取り込み済み（`2744e48d1`）。RTX 4090のQ6_Kは公開表の1・2・4・8列でほぼ同速。3列で新しく試すなら、現行のオフセット補正用DP4Aを符号付き8ビットへの展開に置き換え、整数の結果とFP32の加算順を保ってSASSと実時間を比較する。とくに語彙出力で実DRAM帯域が上限に近ければ、復号短縮だけでの改善幅は小さい。[upstream #30517の実装と測定](https://github.com/ggml-org/llama.cpp/pull/30517)
+- **Q8_0はHCのupとdownを個別に試す。** 同じQwen3.8向けの公開CUDA実装には、Q8_0の重みとスケールを分離してロードを整列させ、少数トークンの長いKにsplit-Kを使う経路がある。公開測定は別GPU・別形状。今回ならK=10240で出力320、グリッド160のHC downが比較対象。K=320のHC upは別の起動形状で測る。[170hx-qwen-flashの最適化記録](https://github.com/douyamv/170hx-qwen-flash/blob/main/next/docs/OPTIMIZATIONS.md)
+
+両回のNsightレポート、SQLite、位相マーカー、サーバーログと集計JSONはGit外の `/home/t-saka/rocm-rtx-mmvq-20261125/retry01/`。
+
 #### MI50のカーネル時間を集計する
 
 既存のROCTx計測を使い、`host-marks.csv` とrocprofv3のマーカー、カーネル、メモリコピーのCSVを同じ計測ディレクトリに保存する。`verify_submit_3` の開始と `verify_sync_3` の終了の間を本体検証として集計する。プロンプトのプリフィル、RTXのカーネル、MTPドラフトを含めない。

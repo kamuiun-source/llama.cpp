@@ -3485,14 +3485,25 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     cudaGraph_t cuda_graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
-    if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
-    } else {
-        GGML_ASSERT(idx == graph->instances.size());
+    if (idx == graph->instances.size()) {
         graph->instances.emplace_back();
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx].handle, cuda_graph, nullptr, nullptr, 0));
+    }
+    auto & instance = graph->instances[idx];
+    if (instance.handle
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            && !ggml_cuda_mmvq_trace_enabled(cuda_ctx->device)
+#endif
+            ) {
+        ggml_cuda_graph_update_executable(instance, cuda_graph, cuda_ctx->device);
+    } else {
+        // An update may retain executable node IDs. Use the freshly captured IDs during MMVQ tracing.
+        if (instance.handle) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance.handle = nullptr;
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
-        graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
+        instance.clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
     }
     CUDA_CHECK(cudaGraphDestroy(cuda_graph));

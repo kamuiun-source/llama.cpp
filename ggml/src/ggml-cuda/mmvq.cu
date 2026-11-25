@@ -11,6 +11,118 @@
 #include <mutex>
 #include <type_traits>
 
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+#include <cupti_activity.h>
+#include <dlfcn.h>
+#include <nvtx3/nvToolsExt.h>
+
+bool ggml_cuda_mmvq_trace_enabled(int device) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_MMVQ_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_ADA_LOVELACE;
+}
+
+namespace {
+struct mmvq_trace_tensors {
+    const ggml_tensor * weight;
+    const ggml_tensor * src;
+    const ggml_tensor * dst;
+};
+
+thread_local const mmvq_trace_tensors * mmvq_current_trace = nullptr;
+
+struct mmvq_trace_scope {
+    mmvq_trace_tensors tensors;
+    const mmvq_trace_tensors * previous;
+
+    mmvq_trace_scope(int device, bool dense, const ggml_tensor * weight, const ggml_tensor * src, const ggml_tensor * dst)
+        : tensors{weight, src, dst}, previous(mmvq_current_trace) {
+        mmvq_current_trace = dense && ggml_cuda_mmvq_trace_enabled(device) ? &tensors : nullptr;
+    }
+
+    ~mmvq_trace_scope() { mmvq_current_trace = previous; }
+};
+
+static uint64_t mmvq_graph_node_id(cudaGraphNode_t node) {
+    static const auto get_id = [] {
+        auto * symbol = dlsym(RTLD_DEFAULT, "cuptiGetGraphNodeId");
+        if (!symbol) {
+            char soname[48];
+            std::snprintf(soname, sizeof(soname), "libcupti.so.%d", CUDART_VERSION / 1000);
+            // Keep the CUPTI library loaded for the cached function pointer.
+            auto * lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
+            if (lib) {
+                symbol = dlsym(lib, "cuptiGetGraphNodeId");
+            }
+        }
+        if (!symbol) {
+            GGML_LOG_WARN("CUDA MMVQ trace: cuptiGetGraphNodeId unavailable\n");
+        }
+        return reinterpret_cast<decltype(&cuptiGetGraphNodeId)>(symbol);
+    }();
+    uint64_t id = 0;
+    return get_id && get_id(node, &id) == CUPTI_SUCCESS ? id : 0;
+}
+
+struct mmvq_launch_trace {
+    const mmvq_trace_tensors * tensors = mmvq_current_trace;
+    cudaStream_t stream;
+    char label[768];
+
+    mmvq_launch_trace(const ggml_cuda_kernel_launch_params & params, int cols, bool fusion,
+                     bool small_k, bool halve_iters, bool hc_reuse = false, int row_groups = 1) : stream(params.stream) {
+        if (!tensors) {
+            return;
+        }
+        const auto * weight = tensors->weight;
+        const auto * src = tensors->src;
+        const auto * dst = tensors->dst;
+        constexpr auto shape = [](const ggml_tensor * tensor, int i) { return static_cast<long long>(tensor->ne[i]); };
+        std::snprintf(label, sizeof(label),
+            "mmvq_launch dst=\"%s\" weight=\"%s\" quant=%s weight_ne=%lldx%lldx%lldx%lld src_ne=%lldx%lldx%lldx%lld dst_ne=%lldx%lldx%lldx%lld"
+            " grid=%ux%ux%u block=%ux%ux%u smem=%zu cols=%d fusion=%d small_k=%d halve_iters=%d hc_reuse=%d row_groups=%d",
+            dst->name, weight->name, ggml_type_name(weight->type),
+            shape(weight, 0), shape(weight, 1), shape(weight, 2), shape(weight, 3),
+            shape(src, 0), shape(src, 1), shape(src, 2), shape(src, 3),
+            shape(dst, 0), shape(dst, 1), shape(dst, 2), shape(dst, 3),
+            params.block_nums.x, params.block_nums.y, params.block_nums.z,
+            params.block_dims.x, params.block_dims.y, params.block_dims.z, params.shmem,
+            cols, fusion, small_k, halve_iters, hc_reuse, row_groups);
+        nvtxRangePushA(label);
+    }
+
+    ~mmvq_launch_trace() {
+        if (!tensors) {
+            return;
+        }
+        nvtxRangePop();
+        cudaStreamCaptureStatus capture;
+        const cudaGraphNode_t * deps = nullptr;
+        size_t count = 0;
+        // The sole frontier node after this launch is the kernel just added to this stream.
+        if (cudaStreamGetCaptureInfo_v3(stream, &capture, nullptr, nullptr, &deps, nullptr, &count) != cudaSuccess ||
+                capture != cudaStreamCaptureStatusActive || count != 1) {
+            return;
+        }
+        cudaGraphNodeType type;
+        const auto node = deps[0];
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess || type != cudaGraphNodeTypeKernel) {
+            return;
+        }
+        const uint64_t id = mmvq_graph_node_id(node);
+        if (id) {
+            char mark[832];
+            std::snprintf(mark, sizeof(mark), "mmvq_graph_node graphNodeId=%llu %s",
+                    static_cast<unsigned long long>(id), label + sizeof("mmvq_launch ") - 1);
+            nvtxMarkA(mark);
+        }
+    }
+};
+} // namespace
+#endif
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
@@ -1329,6 +1441,9 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            const mmvq_launch_trace trace(launch_params, c_ncols_dst, true, small_k, halve_iters);
+#endif
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1340,6 +1455,9 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+    const mmvq_launch_trace trace(launch_params, c_ncols_dst, false, small_k, halve_iters);
+#endif
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1929,6 +2047,9 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+    const mmvq_trace_scope trace_scope(ctx.device, ids == nullptr, src0, src1, dst);
+#endif
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -2106,6 +2227,9 @@ void ggml_cuda_mul_mat_vec_q(
                 dims.first.x /= row_groups;
                 dims.second.z = row_groups;
                 const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+                const mmvq_launch_trace trace(params, ncols, false, false, false, true, row_groups);
+#endif
                 ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, ncols, false, false, false, true, row_groups>, params,
                     src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
                     uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
@@ -2176,6 +2300,9 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int64_t ne0 = dst->ne[0];
 
     int id = ggml_cuda_get_device();
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+    const mmvq_trace_scope trace_scope(id, true, src0, src1, dst);
+#endif
 
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into

@@ -2,6 +2,13 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__linux__) && CUDART_VERSION >= 12030
+#    if __has_include(<cupti_activity.h>) && __has_include(<nvtx3/nvToolsExt.h>)
+#        define GGML_CUDA_HAVE_MMVQ_TRACE
+bool ggml_cuda_mmvq_trace_enabled(int device);
+#    endif
+#endif
+
 #ifdef GGML_USE_HIP
 bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs);
 int ggml_hip_gfx906_lds_modes();
