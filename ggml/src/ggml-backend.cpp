@@ -2500,25 +2500,30 @@ static bool ggml_backend_sched_is_cuda_vulkan_pair(ggml_backend_t src, ggml_back
     return ggml_backend_sched_is_cuda_pair(src, dst, "Vulkan");
 }
 
-static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, ggml_backend_t src, ggml_backend_t dst) {
-    auto & pinned = sched->hip_handoff;
-    const bool from_cuda = strncmp(ggml_backend_name(src), "CUDA", 4) == 0;
-    const ggml_backend_dev_t owners[] = {
-        ggml_backend_get_device(from_cuda ? src : dst), ggml_backend_get_device(from_cuda ? dst : src),
-    };
-    if (pinned.tried) {
-        return owners[0] == pinned.owners[0] && owners[1] == pinned.owners[1] ? pinned.data : nullptr;
+static bool ggml_backend_sched_can_map_hip_input(ggml_backend_dev_t dev) {
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
     }
-    pinned.tried = true;
+    const auto is_ada = reinterpret_cast<bool (*)(ggml_backend_dev_t)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_is_ada"));
+    return is_ada && is_ada(dev) &&
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_mapped_host") &&
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_mapping") &&
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_mapped_hc_input");
+}
+
+static ggml_backend_sched_dual_pinned ggml_backend_sched_try_dual_pinned(
+        const ggml_backend_dev_t owners[2], size_t staging_capacity, bool mapped_input, bool mapped_return) {
+    ggml_backend_sched_dual_pinned pinned{};
     constexpr size_t alignment = 64 * 1024;
-    const size_t staging_capacity = shared_host_capacity *
-            (1 + (sched->async_hip_input || sched->async_hip_mtp4_input) +
-             (sched->async_hip_return || sched->async_hip_mtp4_return));
-    const size_t capacity = staging_capacity + (sched->mapped_hip_input ? shared_host_capacity : 0);
+    const size_t capacity = staging_capacity + (mapped_input ? shared_host_capacity : 0);
     auto * allocation = malloc(capacity + alignment - 1);
     if (!allocation) {
-        GGML_LOG_WARN("packed HIP MTP3 dual-pinned handoff: host allocation failed, using ordinary staging\n");
-        return nullptr;
+        if (!mapped_input) {
+            GGML_LOG_WARN("packed HIP MTP3 dual-pinned handoff: host allocation failed, using ordinary staging\n");
+        }
+        return {};
     }
     const auto base = reinterpret_cast<uintptr_t>(allocation);
     auto * data = reinterpret_cast<uint8_t *>((base + alignment - 1) & ~(alignment - 1));
@@ -2528,19 +2533,23 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_writable_host"));
         pinned.unreg[i] = reinterpret_cast<ggml_backend_unregister_writable_host_t>(
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_writable_host"));
-        const bool try_mapped = i == 0 ? sched->mapped_hip_input : sched->async_hip_return;
+        const bool try_mapped = i == 0 ? mapped_input : mapped_return;
         const auto reg_mapped = try_mapped ? reinterpret_cast<ggml_backend_register_writable_host_t>(
                 ggml_backend_reg_get_proc_address(reg, i == 0 ? "ggml_backend_cuda_register_mapped_host" :
                         "ggml_backend_hip_register_mapped_host")) : nullptr;
         const bool mapped = pinned.unreg[i] && reg_mapped && reg_mapped(owners[i], data, capacity);
-        if (!mapped && (!reg_host || !pinned.unreg[i] || !reg_host(owners[i], data, capacity))) {
-            GGML_LOG_WARN("packed HIP MTP3 dual-pinned handoff: %s registration unavailable, using ordinary staging\n",
-                    ggml_backend_dev_name(owners[i]));
+        // Retry with the original slab size before giving up either existing pinned path.
+        const bool require_mapping = mapped_input && (i == 0 || reg_mapped);
+        if (!mapped && (require_mapping || !reg_host || !pinned.unreg[i] || !reg_host(owners[i], data, capacity))) {
+            if (!mapped_input) {
+                GGML_LOG_WARN("packed HIP MTP3 dual-pinned handoff: %s registration unavailable, using ordinary staging\n",
+                        ggml_backend_dev_name(owners[i]));
+            }
             if (i == 1) {
                 pinned.unreg[0](owners[0], data);
             }
             free(allocation);
-            return nullptr;
+            return {};
         }
         pinned.owners[i] = owners[i];
         if (mapped) {
@@ -2548,19 +2557,24 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
             const auto get_mapping = reinterpret_cast<get_mapping_t>(
                     ggml_backend_reg_get_proc_address(reg, i == 0 ? "ggml_backend_cuda_get_host_mapping" :
                             "ggml_backend_hip_get_host_mapping"));
+            auto * mapping = get_mapping ? static_cast<uint8_t *>(get_mapping(owners[i], data)) : nullptr;
             if (i == 0) {
                 pinned.cuda_compute = reinterpret_cast<ggml_backend_cuda_graph_mapped_hc_input_t>(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_mapped_hc_input"));
-                if (get_mapping && pinned.cuda_compute) {
-                    pinned.cuda_mapped = static_cast<uint8_t *>(get_mapping(owners[i], data));
-                    pinned.cuda_input_data = data + staging_capacity;
-                }
+                pinned.cuda_mapped = pinned.cuda_compute ? mapping : nullptr;
+                pinned.cuda_input_data = data + staging_capacity;
             } else {
                 pinned.hip_compute = reinterpret_cast<ggml_backend_hip_graph_mapped_return_t>(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_graph_mapped_return"));
-                if (get_mapping && pinned.hip_compute) {
-                    pinned.hip_mapped = static_cast<uint8_t *>(get_mapping(owners[i], data));
+                pinned.hip_mapped = pinned.hip_compute ? mapping : nullptr;
+            }
+            if (require_mapping && !(i == 0 ? pinned.cuda_mapped : pinned.hip_mapped)) {
+                pinned.unreg[i](owners[i], data);
+                if (i == 1) {
+                    pinned.unreg[0](owners[0], data);
                 }
+                free(allocation);
+                return {};
             }
         }
     }
@@ -2568,7 +2582,29 @@ static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, 
     pinned.data = data;
     GGML_LOG_INFO("packed HIP MTP3 dual-pinned handoff: registered %zu bytes with %s and %s\n",
             capacity, ggml_backend_dev_name(owners[0]), ggml_backend_dev_name(owners[1]));
-    return data;
+    return pinned;
+}
+
+static uint8_t * ggml_backend_sched_get_dual_pinned(ggml_backend_sched_t sched, ggml_backend_t src, ggml_backend_t dst) {
+    auto & pinned = sched->hip_handoff;
+    const bool from_cuda = strncmp(ggml_backend_name(src), "CUDA", 4) == 0;
+    const ggml_backend_dev_t owners[] = {
+        ggml_backend_get_device(from_cuda ? src : dst), ggml_backend_get_device(from_cuda ? dst : src),
+    };
+    if (pinned.tried) {
+        return owners[0] == pinned.owners[0] && owners[1] == pinned.owners[1] ? pinned.data : nullptr;
+    }
+    const size_t staging_capacity = shared_host_capacity *
+            (1 + (sched->async_hip_input || sched->async_hip_mtp4_input) +
+             (sched->async_hip_return || sched->async_hip_mtp4_return));
+    if (sched->mapped_hip_input && ggml_backend_sched_can_map_hip_input(owners[0])) {
+        pinned = ggml_backend_sched_try_dual_pinned(owners, staging_capacity, true, sched->async_hip_return);
+    }
+    if (!pinned.data) {
+        pinned = ggml_backend_sched_try_dual_pinned(owners, staging_capacity, false, sched->async_hip_return);
+    }
+    pinned.tried = true;
+    return pinned.data;
 }
 
 static void ggml_backend_sched_record_hip_handoff(ggml_backend_sched_t sched, ggml_backend_t src,
@@ -4290,7 +4326,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
-    const char * mapped_hip_input = getenv("GGML_SCHED_HIP_MAPPED_INPUT");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
     const char * async_hip_mtp4_return = getenv("GGML_SCHED_HIP_MTP4_ASYNC_RETURN");
@@ -4330,10 +4365,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
             GGML_LOG_WARN("packed HIP MTP3 async input requires HIP input batching and dual-pinned handoff\n");
         }
     }
-    if (cuda_hip && mapped_hip_input && strcmp(mapped_hip_input, "1") == 0) {
-        sched->mapped_hip_input = sched->async_hip_input;
-        if (!sched->mapped_hip_input) {
-            GGML_LOG_WARN("packed HIP MTP3 mapped input requires async HIP input, batching and dual-pinned handoff\n");
+    if (sched->async_hip_input) {
+        for (int i = 0; i < n_backends && !sched->mapped_hip_input; ++i) {
+            sched->mapped_hip_input = ggml_backend_sched_can_map_hip_input(ggml_backend_get_device(backends[i]));
         }
     }
     if (cuda_hip && async_hip_return && strcmp(async_hip_return, "1") == 0) {
