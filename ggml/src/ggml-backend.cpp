@@ -1263,6 +1263,7 @@ struct ggml_backend_sched_split {
     uint64_t shared_plan_uid;
     uint64_t mapped_hip_return_uid;
     uint64_t mapped_hip_input_uid;
+    uint64_t mapped_hip_input_after_shared_uid;
     ggml_tensor * mapped_hip_input;
     uint64_t carry_plan_uid;
     ggml_tensor * carry_plan_node;
@@ -1520,6 +1521,7 @@ struct ggml_backend_sched {
     size_t hip_mapped_input_read_applied;
     ggml_backend_hip_verify_trace * hip_verify_trace;
     size_t mapped_hip_input_producers;
+    size_t mapped_hip_input_after_shared_producers;
     size_t mapped_hip_input_busy;
     bool async_hip_mtp4_input;
     bool async_hip_return;
@@ -2409,6 +2411,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split.graph.uid = ggml_graph_next_uid();
         split.mapped_hip_return_uid = 0;
         split.mapped_hip_input_uid = 0;
+        split.mapped_hip_input_after_shared_uid = 0;
         split.mapped_hip_input = nullptr;
         if (sched->mapped_hip_input && sched->target_mtp_verify_three && i + 1 < sched->n_splits) {
             const auto & next = sched->splits[i + 1];
@@ -3769,6 +3772,7 @@ static bool ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_back
         return split.shared_prefix.n_nodes != 0;
     }
     split.shared_plan_uid = split.graph.uid;
+    split.mapped_hip_input_after_shared_uid = 0;
     split.shared_prefix = {};
     constexpr const char routed_name[] = "ffn_moe_out-";
     if (strncmp(routed_out->name, routed_name, sizeof(routed_name) - 1) != 0 ||
@@ -3839,6 +3843,14 @@ static bool ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_back
     split.after_shared = ggml_graph_view(&split.graph, end + 1, split.graph.n_nodes);
     split.shared_prefix.uid = ggml_graph_next_uid();
     split.after_shared.uid = ggml_graph_next_uid();
+    if (hip && three && sched->hip_mapped_input_blit && split.mapped_hip_input) {
+        const auto * input = split.mapped_hip_input;
+        const auto * producer = input->view_src ? input->view_src : input;
+        const auto end_node = split.after_shared.nodes + split.after_shared.n_nodes;
+        if (std::find(split.after_shared.nodes, end_node, producer) != end_node) {
+            split.mapped_hip_input_after_shared_uid = ggml_graph_next_uid();
+        }
+    }
     return true;
 }
 
@@ -4190,7 +4202,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     graph == &split->graph && routed_split_id == split_id && split_id + 1 < sched->n_splits;
             auto & pinned = sched->hip_handoff;
             enum ggml_status mapped_status;
-            if (split->mapped_hip_input_uid && graph == &split->graph && !profile.enabled &&
+            const bool after_shared = graph == &split->after_shared;
+            const uint64_t mapped_input_uid = after_shared ? split->mapped_hip_input_after_shared_uid :
+                    graph == &split->graph ? split->mapped_hip_input_uid : 0;
+            if (mapped_input_uid && !profile.enabled &&
                     !sched->callback_eval && !split->has_custom && routed_split_id == split_id) {
                 auto & next = splits[split_id + 1];
                 auto * dst = sched->backends[next.backend_id];
@@ -4204,9 +4219,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // A reader still owns the slab. Keep the ordinary VRAM output and copy path.
                         ++sched->mapped_hip_input_busy;
                     } else if (ggml_backend_sched_get_dual_pinned(sched, split_backend, dst) && pinned.cuda_mapped &&
-                            pinned.cuda_compute(split_backend, graph, split->mapped_hip_input_uid, producer,
+                            pinned.cuda_compute(split_backend, graph, mapped_input_uid, producer,
                                 pinned.cuda_mapped + (pinned.cuda_input_data - pinned.data), &mapped_status)) {
                         ++sched->mapped_hip_input_producers;
+                        sched->mapped_hip_input_after_shared_producers += after_shared;
                         mapped_input.source = split_backend;
                         mapped_input.destination = &next;
                         mapped_input.input = input;
@@ -4790,9 +4806,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->mapped_hip_input_busy, sched->hip_handoff.cuda_mapped != nullptr);
     }
     if (sched->hip_mapped_input_blit) {
-        GGML_LOG_INFO("packed HIP MTP3 mapped input read: blit eligible=%zu applied=%zu bytes=%zu mapped=%d\n",
+        GGML_LOG_INFO("packed HIP MTP3 mapped input read: blit eligible=%zu applied=%zu bytes=%zu mapped=%d after_shared_producers=%zu\n",
                 sched->hip_mapped_input_read_eligible, sched->hip_mapped_input_read_applied,
-                sched->hip_mapped_input_read_applied * (2560 * 3 * sizeof(float)), sched->hip_handoff.hip_mapped != nullptr);
+                sched->hip_mapped_input_read_applied * (2560 * 3 * sizeof(float)), sched->hip_handoff.hip_mapped != nullptr,
+                sched->mapped_hip_input_after_shared_producers);
     }
     if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
         const auto & stats = sched->hip_mtp4_input_stats;
