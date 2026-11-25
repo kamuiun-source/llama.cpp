@@ -7,6 +7,7 @@
 #include "sync-telemetry.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/q6-k-mmvq-mode.cuh"
+#include "ggml-cuda/q8-0-hc-up-mode.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -6023,13 +6024,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #elif !defined(GGML_USE_MUSA)
-    const bool q6_k_managed = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
-            ggml_cuda_q6_k_mmvq::configured();
+    const bool ada = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE;
+    const bool q6_k_managed = ada && ggml_cuda_q6_k_mmvq::configured();
+    const bool hc_up_managed = ada && ggml_cuda_q8_0_hc_up::configured();
     const int q6_k_mode = q6_k_managed ? ggml_cuda_q6_k_mmvq::get_mode() : -1;
-    if (q6_k_managed) {
+    const int hc_up_mode = hc_up_managed ? ggml_cuda_q8_0_hc_up::get_mode() : -1;
+    if (q6_k_managed || hc_up_managed) {
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
-        if (it != cuda_ctx->cuda_graphs.end() && it->second->q6_k_mmvq_mode >= 0 && it->second->q6_k_mmvq_mode != q6_k_mode) {
-            cuda_ctx->cuda_graphs.erase(it);
+        if (it != cuda_ctx->cuda_graphs.end()) {
+            const auto & graph = *it->second;
+            if ((graph.q6_k_mmvq_mode >= 0 && graph.q6_k_mmvq_mode != q6_k_mode) ||
+                    (graph.q8_0_hc_up_mode >= 0 && graph.q8_0_hc_up_mode != hc_up_mode)) {
+                cuda_ctx->cuda_graphs.erase(it);
+            }
         }
     }
 #endif
@@ -6098,11 +6105,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (q6_k_managed) {
         ggml_cuda_q6_k_mmvq::dispatched = false;
     }
+    if (hc_up_managed) {
+        ggml_cuda_q8_0_hc_up::dispatched = false;
+    }
 #endif
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, nullptr, nullptr, components);
 #if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (graphs_enabled && q6_k_managed && (!use_cuda_graph || cuda_graph_update_required)) {
-        cuda_ctx->cuda_graph(graph_key)->q6_k_mmvq_mode = ggml_cuda_q6_k_mmvq::dispatched ? q6_k_mode : -1;
+    if (graphs_enabled && (q6_k_managed || hc_up_managed) && (!use_cuda_graph || cuda_graph_update_required)) {
+        auto * graph = cuda_ctx->cuda_graph(graph_key);
+        graph->q6_k_mmvq_mode = ggml_cuda_q6_k_mmvq::dispatched ? q6_k_mode : -1;
+        graph->q8_0_hc_up_mode = ggml_cuda_q8_0_hc_up::dispatched ? hc_up_mode : -1;
     }
 #endif
 
@@ -7675,6 +7687,12 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_get_q8_0_hc_up_mode") == 0) {
+        return (void *) ggml_cuda_q8_0_hc_up::get_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_q8_0_hc_up_mode") == 0) {
+        return (void *) ggml_cuda_q8_0_hc_up::set_mode;
+    }
     if (strcmp(name, "ggml_backend_cuda_get_q6_k_mmvq_mode") == 0) {
         return (void *) ggml_cuda_q6_k_mmvq::get_mode;
     }

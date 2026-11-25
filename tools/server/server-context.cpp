@@ -8,7 +8,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
-#include "server-q6-k-mmvq-mode.h"
+#include "server-cuda-mmvq-mode.h"
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -3976,7 +3976,7 @@ private:
 
                     refresh_gfx906_lds_modes();
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
-                        server_refresh_q6_k_mmvq_mode(ctx_tgt, ctx_dft);
+                        server_refresh_cuda_mmvq_modes(ctx_tgt, ctx_dft);
                     }
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks

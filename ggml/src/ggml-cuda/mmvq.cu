@@ -2,6 +2,8 @@
 #include "hc-fused.cuh"
 #include "q6-k-mmvq-mode.cuh"
 #include "q6-k-mmvq-reuse.cuh"
+#include "q8-0-hc-up-mode.cuh"
+#include "q8-0-hc-up-warp.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -2333,6 +2335,30 @@ void ggml_cuda_mul_mat_vec_q(
                 hc_down_split_k_parts), true);
         GGML_UNUSED(logged);
         return;
+    }
+
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q8_0 && device.cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            ne00 == 320 && ne01 == 10240 && ncols_dst == 3 &&
+            ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            ggml_cuda_q8_0_hc_up::configured() && ggml_cuda_hc_projection_for_weight(src0->name) == GGML_CUDA_HC_UP) {
+        const int mode = ggml_cuda_q8_0_hc_up::get_mode();
+        ggml_cuda_q8_0_hc_up::dispatched = true;
+        static std::atomic<int> last_mode{-1};
+        if (last_mode.load(std::memory_order_relaxed) != mode &&
+                last_mode.exchange(mode, std::memory_order_relaxed) != mode) {
+            GGML_LOG_INFO("CUDA Ada Q8_0 HC up dispatch: cols=3 mode=%s\n", mode == 1 ? "warp" : "off");
+        }
+        if (mode == 1) {
+            const ggml_cuda_kernel_launch_params params(
+                    dim3(ne01 / (2 * hc_up_warps_per_block)), dim3(device.warp_size, hc_up_warps_per_block), 0, stream);
+#ifdef GGML_CUDA_HAVE_MMVQ_TRACE
+            const mmvq_launch_trace trace(params, 3, false, false, false);
+#endif
+            ggml_cuda_kernel_launch(hc_up_q8_0_warp, params, static_cast<const block_q8_0 *>(src0->data),
+                    reinterpret_cast<const block_q8_1 *>(src1_q8_1.get()), dst_d, int(s11), int(s1));
+            return;
+        }
     }
 
     static const bool hc_up_pair = [] {
