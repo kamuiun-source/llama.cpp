@@ -1335,11 +1335,11 @@ struct ggml_backend_sched_single_miss {
     unsigned mask = 0;
 };
 
-static std::atomic<int> hip_single_miss_cpu_threads{0};
+static std::atomic<int> hip_single_miss_cpu_mode{0};
 
-void ggml_backend_sched_set_hip_single_miss_cpu(int threads) {
-    if (threads == 0 || threads == 1 || threads == 2 || threads == 4) {
-        hip_single_miss_cpu_threads.store(threads, std::memory_order_relaxed);
+void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
+    if (mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 8) {
+        hip_single_miss_cpu_mode.store(mode, std::memory_order_relaxed);
     }
 }
 
@@ -3775,7 +3775,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
                 async_input, false, mtp4_input, false, mirrored >= 0 ? sizes[mirrored] : 0);
     }
     if (mirrored >= 0 && host_copies && sched->target_mtp_verify_three &&
-            hip_single_miss_cpu_threads.load(std::memory_order_relaxed) &&
+            hip_single_miss_cpu_mode.load(std::memory_order_relaxed) &&
             sizes[mirrored] == 2560 * 3 * sizeof(float) && offsets[mirrored] == 0 &&
             srcs[mirrored]->type == GGML_TYPE_F32 && srcs[mirrored]->ne[0] == 2560 && ggml_is_contiguous(srcs[mirrored])) {
         host_copies->single_miss_activation = reinterpret_cast<const float *>(mapped_input.data);
@@ -4150,8 +4150,8 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
 }
 
 int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, const float ** activation, const float ** weights) {
-    const int threads = hip_single_miss_cpu_threads.load(std::memory_order_relaxed);
-    if (!sched || !threads || !sched->active_single_miss ||
+    const int mode = hip_single_miss_cpu_mode.load(std::memory_order_relaxed);
+    if (!sched || !mode || !sched->active_single_miss ||
             !sched->async_hip_return || !sched->target_mtp_verify_three || sched->target_mtp_verify_four ||
             sched->profile.enabled || sched->callback_eval || sched->n_copies != 1) {
         return 0;
@@ -4199,7 +4199,7 @@ int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, co
 
     *activation = copies->single_miss_activation;
     *weights = copies->single_miss_weights;
-    return threads;
+    return mode;
 }
 
 void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched,

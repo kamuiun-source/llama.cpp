@@ -3604,9 +3604,9 @@ struct llama_moe_cache::impl {
                 }
                 const float * activation;
                 const float * router_weights;
-                const int threads = expert >= 0 ? ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights) : 0;
-                if (threads) {
-                    auto & totals = single_miss_cpu->modes[threads];
+                const int mode = expert >= 0 ? ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights) : 0;
+                if (mode) {
+                    auto & totals = single_miss_cpu->modes[mode];
                     ++totals.eligible;
                     std::array<const ggml_tensor *, 3> planes{};
                     for (const auto * w : l.experts) {
@@ -3623,7 +3623,7 @@ struct llama_moe_cache::impl {
                     // A promotion writes back into the host slot of the selected scratch hit.
                     const int32_t promotion_host_slot = promote_index >= 0 ? map.host[scratch[promote_index]] : -1;
                     if (host_slot >= 0 && host_slot != promotion_host_slot &&
-                            single_miss_cpu->enqueue(threads, planes, host_slot, expert, ids.data(), activation, router_weights, mask)) {
+                            single_miss_cpu->enqueue(mode, planes, host_slot, expert, ids.data(), activation, router_weights, mask)) {
                         ggml_backend_sched_set_hip_single_miss_result(sched, [](void * worker, int64_t mi50_done_us) {
                             return static_cast<llama_single_miss_cpu *>(worker)->resolve(mi50_done_us);
                         }, single_miss_cpu.get(), mask);
@@ -4205,13 +4205,13 @@ struct llama_moe_cache::impl {
             }
         }
         if (single_miss_cpu) {
-            for (const int threads : {1, 2, 4}) {
-                const auto & cpu = single_miss_cpu->modes[threads];
-                LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: threads=%d eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f"
-                        " queue_ms=%.3f joined=%zu join_waited=%zu join_wait_ms=%.3f pending_at_mi50=%zu remaining_after_mi50_ms=%.3f cancelled=%zu\n",
-                        threads, cpu.eligible, cpu.applied, cpu.positions, cpu.avoided_bytes, cpu.compute_us / 1000.0,
+            for (const int mode : {1, 2, 4, 6, 8}) {
+                const auto & cpu = single_miss_cpu->modes[mode];
+                LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: threads=%d shared=%d eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f"
+                        " queue_ms=%.3f joined=%zu join_waited=%zu join_wait_ms=%.3f pending_at_mi50=%zu remaining_after_mi50_ms=%.3f cancelled=%zu quant_calls=%zu\n",
+                        mode > 4 ? mode - 4 : mode, mode > 4, cpu.eligible, cpu.applied, cpu.positions, cpu.avoided_bytes, cpu.compute_us / 1000.0,
                         cpu.queue_us / 1000.0, cpu.joined, cpu.waited, cpu.join_us / 1000.0,
-                        cpu.outstanding_at_mi50, cpu.remaining_after_mi50_us / 1000.0, cpu.cancelled);
+                        cpu.outstanding_at_mi50, cpu.remaining_after_mi50_us / 1000.0, cpu.cancelled, cpu.quant_calls);
             }
         }
         auto log = [](const char * name, const stats & st) {

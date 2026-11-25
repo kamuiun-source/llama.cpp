@@ -3,7 +3,7 @@
 #include "ggml-backend.h"
 
 extern "C" {
-GGML_API void ggml_backend_sched_set_hip_single_miss_cpu(int threads);
+GGML_API void ggml_backend_sched_set_hip_single_miss_cpu(int mode);
 GGML_API int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched,
         const float ** activation, const float ** weights);
 GGML_API void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched,

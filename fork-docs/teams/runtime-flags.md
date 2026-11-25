@@ -70,3 +70,5 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 ### 実ミス1件のCPU処理
 
 `codex/rocm-single-miss-cpu` の試作。サーバー起動時に `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` にモードファイルのパスを渡す。値は `SINGLE_MISS_CPU=off`（既定）・`SINGLE_MISS_CPU=on`（1ワーカー）・`SINGLE_MISS_CPU=2`・`SINGLE_MISS_CPU=4` で、リクエスト間で切り替わる。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ON系では実ミス1件のCPU計算をMI50と重ねる。[ワーカー比較](../rocm/09-single-bank-mtp3.md#実ミス1件を124-cpuワーカーで比較する)
+
+`SINGLE_MISS_CPU=2-shared`・`SINGLE_MISS_CPU=4-shared` ではgate/upとdownの量子化済み入力をワーカー間で共有する。共有OFFの比較値は `2`・`4`。2ワーカーで合流待ちは短縮、4ワーカーでは同程度。共有は既定OFF。[共有版の計測](../rocm/09-single-bank-mtp3.md#gateupとdownの量子化済み入力を共有する試作)

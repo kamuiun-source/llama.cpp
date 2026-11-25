@@ -20,11 +20,11 @@ inline bool llama_single_miss_cpu_configured() {
 struct llama_single_miss_cpu {
     static constexpr int width = 2560, inner = 640, tokens = 3, ranks = 10;
     struct stats {
-        size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0;
+        size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0, quant_calls = 0;
         size_t joined = 0, waited = 0, cancelled = 0, outstanding_at_mi50 = 0;
         int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0;
     };
-    stats modes[5];
+    stats modes[9];
 
     ~llama_single_miss_cpu() {
         drain();
@@ -53,7 +53,13 @@ struct llama_single_miss_cpu {
         const bool must_wait = !done;
         changed.wait(lock, [&] { return done; });
         pending = false;
-        auto & totals = modes[n_workers];
+        auto & totals = modes[active_mode];
+        const size_t quantizations = share_quantized ? (share_gate_up ? 2 : 3) : 3 * n_workers;
+        for (int t = 0; t < tokens; ++t) {
+            if (active_mask & (1u << t)) {
+                totals.quant_calls += quantizations;
+            }
+        }
         totals.compute_us += completed_us - started_us;
         totals.queue_us += started_us - queued_us;
         if (mi50_done_us) {
@@ -72,14 +78,15 @@ struct llama_single_miss_cpu {
         return weighted.data();
     }
 
-    bool enqueue(int threads, const std::array<const ggml_tensor *, 3> & planes, int host_slot, int expert,
+    bool enqueue(int mode, const std::array<const ggml_tensor *, 3> & planes, int host_slot, int expert,
             const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask) {
         using get_traits_t = const ggml_type_traits_cpu * (*)(ggml_type);
         static const auto get_traits = []() -> get_traits_t {
             const auto reg = ggml_backend_reg_by_name("CPU");
             return reg ? reinterpret_cast<get_traits_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_get_single_miss_traits")) : nullptr;
         }();
-        if (!get_traits || host_slot < 0 || (threads != 1 && threads != 2 && threads != 4)) {
+        const int threads = mode > 4 ? mode - 4 : mode;
+        if (!get_traits || host_slot < 0 || (mode != 1 && mode != 2 && mode != 4 && mode != 6 && mode != 8)) {
             return false;
         }
         work_plane plane_data[3];
@@ -98,7 +105,8 @@ struct llama_single_miss_cpu {
                 return false;
             }
             plane_data[p] = {static_cast<const char *>(w->data) + host_slot * w->nb[2], w->nb[1],
-                    int(w->ne[0]), int(w->ne[1]), input_traits->from_float, traits->vec_dot};
+                    int(w->ne[0]), int(w->ne[1]), input_traits->from_float, traits->vec_dot,
+                    traits->vec_dot_type, ggml_row_size(traits->vec_dot_type, w->ne[0])};
         }
 
         mask = 0;
@@ -141,6 +149,10 @@ struct llama_single_miss_cpu {
             active_mask = mask;
             queued_us = ggml_time_us();
             n_workers = threads;
+            active_mode = mode;
+            share_quantized = mode > 4;
+            share_gate_up = work[0].input_type == work[1].input_type && work[0].quantize == work[1].quantize;
+            inputs_ready = down_ready = false;
             joined_workers = gated_workers = 0;
             pending = true;
             done = false;
@@ -161,6 +173,8 @@ private:
         int cols, rows;
         ggml_from_float_t quantize;
         ggml_vec_dot_t dot;
+        ggml_type input_type;
+        size_t quant_bytes;
     };
     work_plane work[3];
     std::array<float, width * tokens> input;
@@ -173,6 +187,13 @@ private:
     std::condition_variable gates_ready;
     std::array<std::thread, 4> workers;
     alignas(64) std::array<std::array<float, inner>, tokens> gated;
+    struct alignas(64) quant_row {
+        char data[4096];
+    };
+    quant_row shared_input[3][tokens];
+    bool share_quantized = false, share_gate_up = false;
+    bool inputs_ready = false, down_ready = false;
+    int active_mode = 0;
     bool pending = false, done = false, stopping = false;
     uint64_t generation = 0;
     int n_workers = 0, joined_workers = 0, gated_workers = 0;
@@ -208,25 +229,58 @@ private:
         }
     }
 
+    void quantize_shared(int plane, int token, const float * values) {
+        const auto & w = work[plane];
+        auto * out = shared_input[plane][token].data;
+        // The Q8_K reference quantizer leaves bsums untouched for a zero block.
+        std::memset(out, 0, w.quant_bytes);
+        w.quantize(values, out, w.cols);
+    }
+
     void compute_parallel(int index) {
-        const auto run = [&](int plane, const float * values, float * output) {
+        const auto run = [&](int plane, int token, const float * values, float * output) {
             const auto & w = work[plane];
             alignas(64) char quantized[4096];
-            w.quantize(values, quantized, w.cols);
+            const char * q = quantized;
+            if (share_quantized) {
+                q = shared_input[plane == 1 && share_gate_up ? 0 : plane][token].data;
+            } else {
+                w.quantize(values, quantized, w.cols);
+            }
             const int begin = index * w.rows / n_workers;
             const int end = (index + 1) * w.rows / n_workers;
             for (int r = begin; r < end; ++r) {
-                w.dot(w.cols, output + r, 0, w.data + r*w.stride, 0, quantized, 0, 1);
+                w.dot(w.cols, output + r, 0, w.data + r*w.stride, 0, q, 0, 1);
             }
         };
+
+        if (share_quantized) {
+            if (index == 0) {
+                for (int t = 0; t < tokens; ++t) {
+                    if (active_mask & (1u << t)) {
+                        const auto * values = input.data() + t*width;
+                        quantize_shared(0, t, values);
+                        if (!share_gate_up) {
+                            quantize_shared(1, t, values);
+                        }
+                    }
+                }
+                std::lock_guard<std::mutex> lock(mutex);
+                inputs_ready = true;
+                gates_ready.notify_all();
+            } else {
+                std::unique_lock<std::mutex> lock(mutex);
+                gates_ready.wait(lock, [&] { return inputs_ready; });
+            }
+        }
         const int gate_begin = index * inner / n_workers;
         const int gate_end = (index + 1) * inner / n_workers;
         for (int t = 0; t < tokens; ++t) {
             if (active_mask & (1u << t)) {
                 std::array<float, inner> up;
                 auto & gate = gated[t];
-                run(0, input.data() + t*width, gate.data());
-                run(1, input.data() + t*width, up.data());
+                run(0, t, input.data() + t*width, gate.data());
+                run(1, t, input.data() + t*width, up.data());
                 for (int j = gate_begin; j < gate_end; ++j) {
                     gate[j] = (gate[j] / (1.0f + std::exp(-gate[j]))) * up[j];
                 }
@@ -235,9 +289,19 @@ private:
         {
             std::unique_lock<std::mutex> lock(mutex);
             if (++gated_workers == n_workers) {
+                if (share_quantized) {
+                    lock.unlock();
+                    for (int t = 0; t < tokens; ++t) {
+                        if (active_mask & (1u << t)) {
+                            quantize_shared(2, t, gated[t].data());
+                        }
+                    }
+                    lock.lock();
+                }
+                down_ready = true;
                 gates_ready.notify_all();
             } else {
-                gates_ready.wait(lock, [&] { return gated_workers == n_workers; });
+                gates_ready.wait(lock, [&] { return down_ready; });
             }
         }
         const int down_begin = index * width / n_workers;
@@ -245,7 +309,7 @@ private:
         for (int t = 0; t < tokens; ++t) {
             if (active_mask & (1u << t)) {
                 auto * out = weighted.data() + t*width;
-                run(2, gated[t].data(), out);
+                run(2, t, gated[t].data(), out);
                 for (int j = down_begin; j < down_end; ++j) {
                     out[j] *= weights[t];
                 }
