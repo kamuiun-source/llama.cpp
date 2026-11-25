@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- 共有RAMの採用経路を含む `77114439a` までを `codex/rocm-integrated-test` に取り込んだ。共有RAM読み込みと戻り側のRTX非同期H2Dは固定3幅で自動適用。Shared Expert先行発行は通常起動で明示指定する。過去のブランチ名は計測履歴として記載している。[統合後の起動設定](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動)
+
 - `codex/rocm-mi50-mapped-input-read` でMI50のカーネルが共有RAMの活性値をVRAMへ取り込む。試作時は固定3幅・Shared Expert先行発行OFFの両順4回で生成48.61→49.71 tok/s（+2.28%）、本体検証42.81→41.77 ms。ONは各12,912件の活性値H2Dを置き換え、全回の640生成ID・本文・MTP採用366/532が一致。[試作と計測](../rocm/10-decode-pipeline.md#mi50のカーネルで共有ramから活性値を読む試作)
 - 上記の読み込みとShared Expert先行発行を同じ層で併用可能にした。両方ONの固定5問×2回で、各回の48層すべてでMI50の読み込み、うち45層でShared Expert先行発行も動作。生成は修正前50.22 tok/s（1回）に対し修正後50.85 tok/s（2回合算）、出力・MTP採用366/532も一致。[併用の確認](../rocm/10-decode-pipeline.md#shared-expert先行発行との併用)
 - 固定3幅でShared Expert先行発行を通常起動に指定する。対応する受け渡しでは共有RAM読み込みと戻り側のRTX非同期H2Dを自動適用。試作専用フラグ3つとRouter先行D2Hの処理を廃止。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動)

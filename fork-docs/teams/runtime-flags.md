@@ -18,7 +18,7 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `codex/rocm-rtx-mapped-input` では、固定3幅のRTX→MI50活性値を `GGML_SCHED_HIP_ASYNC_INPUT=1` と共有ピン留め・一括転送の設定で自動的に共有RAMへ書き込む。試作専用の `GGML_SCHED_HIP_MAPPED_INPUT` は廃止。[試作と実測](../rocm/10-decode-pipeline.md#共有ramへのrtx側直接書き込み)
 
-`codex/rocm-mi50-mapped-input-read` の通常起動では、既存の共有ピン留め・非同期入力と戻りに `GGML_SCHED_HIP_SHARED_OVERLAP=1` を追加する。対応する固定3幅では、Shared Expert先行発行を使う層でもMI50カーネルによる共有RAM読み込みとRTXへの非同期H2Dが自動適用される。Router先行D2Hは廃止。試作専用フラグの名前と成績は計測メモに残す。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動) · [4条件の結果](../rocm/10-decode-pipeline.md#routerの先行d2hと戻り側h2dの非同期化)
+`codex/rocm-integrated-test` の通常起動では、既存の共有ピン留め・非同期入力と戻りに `GGML_SCHED_HIP_SHARED_OVERLAP=1` を追加する。対応する固定3幅では、Shared Expert先行発行を使う層でもMI50カーネルによる共有RAM読み込みとRTXへの非同期H2Dが自動適用される。Router先行D2Hは廃止。試作専用フラグの名前と成績は計測メモに残す。[通常起動への追加](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動) · [4条件の結果](../rocm/10-decode-pipeline.md#routerの先行d2hと戻り側h2dの非同期化)
 
 ## Windows Vulkan・高速固定3幅の採用設定
 

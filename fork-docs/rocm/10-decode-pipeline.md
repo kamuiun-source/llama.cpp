@@ -256,7 +256,7 @@ MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先�
 
 ##### 共有RAM読み込みを含む固定3幅の通常起動
 
-`codex/rocm-mi50-mapped-input-read` では、上記の固定3幅の設定にShared Expert先行発行を追加する。RTXが活性値を共有RAMに直接書き、MI50のカーネルがVRAMに取り込む経路は、既存の非同期入力と共有ピン留めが利用可能な固定3幅で自動適用する。戻りはMI50が共有RAMに書き、RTXの計算ストリームに非同期H2Dを積む。[併用時の計測](#shared-expert先行発行との併用)
+`codex/rocm-integrated-test` では、上記の固定3幅の設定にShared Expert先行発行を追加する。RTXが活性値を共有RAMに直接書き、MI50のカーネルがVRAMに取り込む経路は、既存の非同期入力と共有ピン留めが利用可能な固定3幅で自動適用する。戻りはMI50が共有RAMに書き、RTXの計算ストリームに非同期H2Dを積む。[併用時の計測](#shared-expert先行発行との併用)
 
 ```bash
   -e GGML_SCHED_HIP_SHARED_OVERLAP=1 \
