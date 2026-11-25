@@ -6738,15 +6738,17 @@ static __global__ void hip_mapped_activation_blit(const float4 * src, float4 * d
 
 static bool ggml_backend_hip_mapped_input_blit(ggml_backend_t backend, ggml_tensor * dst, const void * mapped) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    constexpr int elements = 2560 * 3;
+    const bool token_layout = (dst->ne[1] == 1 && dst->ne[2] == 3) || (dst->ne[1] == 3 && dst->ne[2] == 1);
     if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_VEGA20 ||
-            dst->type != GGML_TYPE_F32 || dst->ne[0] != 2560 || dst->ne[1] != 3 ||
-            dst->ne[2] != 1 || dst->ne[3] != 1 || !ggml_is_contiguous(dst) ||
+            dst->type != GGML_TYPE_F32 || dst->ne[0] != 2560 || !token_layout || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(dst) || ggml_nbytes(dst) != elements * sizeof(float) ||
             reinterpret_cast<uintptr_t>(dst->data) % sizeof(float4) || reinterpret_cast<uintptr_t>(mapped) % sizeof(float4)) {
         return false;
     }
 
     constexpr int threads = 128;
-    constexpr int vectors = 2560 * 3 / 4;
+    constexpr int vectors = elements / 4;
     static_assert(vectors % threads == 0, "mapped input blit must launch exactly one thread per vector");
     ggml_cuda_set_device(ctx->device);
     hip_mapped_activation_blit<<<vectors / threads, threads, 0, ctx->stream()>>>(
