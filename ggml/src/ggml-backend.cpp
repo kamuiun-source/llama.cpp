@@ -1477,6 +1477,17 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy_early;
     void * callback_copy_early_user_data;
     bool capture_host_copies;
+    bool defer_expert_copy_wait;
+    bool measure_expert_copy_wait;
+    ggml_backend_t deferred_expert_copy_backend;
+    int64_t deferred_expert_copy_start_us;
+    size_t expert_copy_wait_before;
+    size_t expert_copy_wait_after_router;
+    size_t expert_copy_wait_after_plan;
+    size_t expert_copy_wait_fallback;
+    int64_t expert_copy_wait_before_us;
+    int64_t expert_copy_wait_after_us;
+    int64_t expert_copy_cpu_before_wait_us;
     const ggml_backend_sched_host_copies * active_host_copies;
     const ggml_backend_sched_split * active_copy_split;
     struct after_submit {
@@ -2876,6 +2887,25 @@ static void ggml_backend_sched_wait_hip_return_h2d(ggml_backend_sched_t sched) {
     }
 }
 
+bool ggml_backend_sched_expert_copy_wait_pending(ggml_backend_sched_t sched) {
+    return sched && sched->deferred_expert_copy_backend;
+}
+
+void ggml_backend_sched_wait_expert_copy(ggml_backend_sched_t sched, bool after_router, bool after_plan) {
+    if (ggml_backend_sched_expert_copy_wait_pending(sched)) {
+        const int64_t start = ggml_time_us();
+        ggml_backend_synchronize(sched->deferred_expert_copy_backend);
+        sched->deferred_expert_copy_backend = nullptr;
+        sched->expert_copy_wait_after_us += ggml_time_us() - start;
+        sched->expert_copy_wait_after_router += after_router;
+        sched->expert_copy_wait_after_plan += after_plan;
+        sched->expert_copy_wait_fallback += !after_router;
+        if (after_router) {
+            sched->expert_copy_cpu_before_wait_us += start - sched->deferred_expert_copy_start_us;
+        }
+    }
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
         struct ggml_tensor * input, ggml_backend_sched_host_copies * host_copies,
         ggml_backend_sched_hip_return * hip_return = nullptr) {
@@ -2936,22 +2966,44 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
-    // wait for the split backend to finish using the input before overwriting it
-    handoff.destination_wait([&] {
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
+    const bool weight_callback = sched->callback_copy && ggml_backend_sched_is_host_weight(input);
+    const bool measure_expert_wait = sched->measure_expert_copy_wait && weight_callback && host_copies &&
+            sched->n_copies == 1 && sched->target_mtp_verify_three && !sched->profile.enabled && !sched->callback_eval &&
+            !split->has_custom && strncmp(input->name, "moe_cache.packed_slots-", 23) == 0 &&
+            strncmp(ggml_backend_name(split_backend), "ROCm", 4) == 0;
+    const bool captured_router = measure_expert_wait &&
+            std::any_of(host_copies->entries, host_copies->entries + host_copies->count,
+                    [](const ggml_backend_sched_host_copies::entry & entry) {
+                        return entry.size == 30 * sizeof(int32_t);
+                    });
+    if (captured_router && sched->defer_expert_copy_wait) {
+        GGML_ASSERT(!sched->deferred_expert_copy_backend);
+        sched->deferred_expert_copy_backend = split_backend;
+        sched->deferred_expert_copy_start_us = ggml_time_us();
+    } else {
+        // Finish earlier uses of the destination before overwriting it.
+        const int64_t wait_start = captured_router ? ggml_time_us() : 0;
+        handoff.destination_wait([&] {
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+        });
+        if (wait_start) {
+            ++sched->expert_copy_wait_before;
+            sched->expert_copy_wait_before_us += ggml_time_us() - wait_start;
         }
-    });
+    }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input)) {
+    if (weight_callback) {
         const int64_t start_us = sched->profile.enabled ? ggml_time_us() : 0;
         bool handled;
         {
             struct host_copies_scope {
                 ggml_backend_sched_t sched;
                 ~host_copies_scope() {
+                    ggml_backend_sched_wait_expert_copy(sched, false, false);
                     sched->active_host_copies = nullptr;
                     sched->active_copy_split = nullptr;
                 }
@@ -4477,6 +4529,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
     const char * verify_trace_path = getenv("GGML_SCHED_HIP_VERIFY_STAGE_TRACE");
+    const char * defer_expert_wait = getenv("GGML_SCHED_HIP_MTP3_DEFER_EXPERT_CALLBACK_WAIT");
+    const char * profile_expert_callback = getenv("LLAMA_EXPERT_PROFILE_CALLBACK");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
     const char * async_hip_return = getenv("GGML_SCHED_HIP_ASYNC_RETURN");
@@ -4529,6 +4583,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->dual_pinned_hip_handoff = allow_hip_dual_pinned && cuda_hip;
     sched->measure_hip_handoff = allow_hip_timing && cuda_hip;
     sched->trace_hip_handoff_wait = allow_hip_wait_trace && cuda_hip;
+    sched->defer_expert_copy_wait = cuda_hip && defer_expert_wait && strcmp(defer_expert_wait, "1") == 0;
+    sched->measure_expert_copy_wait = sched->defer_expert_copy_wait ||
+            (cuda_hip && (allow_verify_trace || (profile_expert_callback && strcmp(profile_expert_callback, "1") == 0)));
     if (cuda_hip && async_hip_input && strcmp(async_hip_input, "1") == 0) {
         sched->async_hip_input = sched->batch_hip_device_inputs && sched->dual_pinned_hip_handoff;
         if (!sched->async_hip_input) {
@@ -4845,6 +4902,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("packed HIP MTP3 mapped input: producers=%zu copies=%zu bytes=%zu reader_busy=%zu mapped=%d\n",
                 sched->mapped_hip_input_producers, stats.mapped_input_copies, stats.mapped_input_bytes,
                 sched->mapped_hip_input_busy, sched->hip_handoff.cuda_mapped != nullptr);
+    }
+    if (sched->measure_expert_copy_wait) {
+        GGML_LOG_INFO("packed HIP MTP3 Expert callback wait: before=%zu moved=%zu after_plan=%zu fallback=%zu before_ms=%.3f deferred_ms=%.3f cpu_before_wait_ms=%.3f\n",
+                sched->expert_copy_wait_before, sched->expert_copy_wait_after_router,
+                sched->expert_copy_wait_after_plan, sched->expert_copy_wait_fallback,
+                sched->expert_copy_wait_before_us / 1000.0, sched->expert_copy_wait_after_us / 1000.0,
+                sched->expert_copy_cpu_before_wait_us / 1000.0);
     }
     if (sched->hip_mapped_input_blit) {
         GGML_LOG_INFO("packed HIP MTP3 mapped input read: blit eligible=%zu applied=%zu bytes=%zu mapped=%d after_shared_producers=%zu\n",

@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-model.h"
 #include "llama-rtx-expert.h"
+#include "../ggml/src/ggml-backend-mtp.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -3186,9 +3187,15 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
-        finish_hip_mtp_promotion();
         const int32_t il      = it->second.first;
         const bool    has_cpu = it->second.second;
+        const bool defer_wait = ggml_backend_sched_expert_copy_wait_pending(sched) &&
+                placement && placement->hip_tuple_dma && placement->hip_mtp_verify_three && !placement->overlap &&
+                !early && !profile && !rtx_expert && !overlap_expert_promotion && !has_cpu && src == layers[il].slot_map;
+        if (!defer_wait) {
+            ggml_backend_sched_wait_expert_copy(sched, false, false);
+            finish_hip_mtp_promotion();
+        }
         if (early && (!packed_early_copy || !has_cpu || pending_layer != il || fills.empty() || pending_upload_bytes != 0)) {
             return false;
         }
@@ -3323,10 +3330,14 @@ struct llama_moe_cache::impl {
             GGML_ASSERT(l.prefill_ids.size() == ids.size());
             ids = l.prefill_ids;
         } else if (placement && sched && ggml_backend_sched_get_host_copy(sched, sel, ids.data(), ids_bytes)) {
-            // The scheduler waits for older work on this backend before exposing a host copy.
+            // The host snapshot is independent of the HIP input upload.
             ++router_host_hits;
             router_readback_elided_bytes += ids_bytes;
         } else {
+            if (defer_wait) {
+                ggml_backend_sched_wait_expert_copy(sched, false, false);
+                finish_hip_mtp_promotion();
+            }
             router_host_fallbacks += placement != nullptr;
             const int64_t router_start_us = profile ? ggml_time_us() : 0;
             ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ids_bytes);
@@ -3337,6 +3348,11 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (defer_wait && hip_mtp_pending_move.n_planes) {
+            // Publish a pending promotion before using the resident or scratch maps.
+            ggml_backend_sched_wait_expert_copy(sched, true, false);
+            finish_hip_mtp_promotion();
+        }
         if (next_prefetch_queue_layer == il) {
             cancel_next_prefetch_queue(il);
         }
@@ -3687,6 +3703,9 @@ struct llama_moe_cache::impl {
             const int32_t evict = placement->dynamic_resident && promote_index >= 0 ? packed_promotion_victim(l, map) : -1;
             if (fine_profile) {
                 callback_totals.plan_us += ggml_time_us() - plan_begin;
+            }
+            if (defer_wait) {
+                ggml_backend_sched_wait_expert_copy(sched, true, true);
             }
             const auto write_slot_map = [&] {
                 telemetry_scope scope(set_telemetry_cause, "slot_map");

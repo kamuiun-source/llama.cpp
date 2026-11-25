@@ -3784,6 +3784,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return true;
     }
 
+    ggml_backend_sched_wait_expert_copy(lctx->sched.get(), false, false);
     auto & st = lctx->copy_experts;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
