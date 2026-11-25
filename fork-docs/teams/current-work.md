@@ -8,7 +8,7 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
-- `codex/rocm-defer-next-router` で固定3幅の次層Router予測を現層MI50のExpertグラフ投入後に遅らせた。OFF→ON→ON→OFFで生成51.25→52.74 tok/s、本体検証40.28→38.87 ms、RTX→MI50転送元待ち13.64→12.33 ms。ONは毎回12,643件すべて後段発行。先読みヒットは平均83件減ったが、生成ID・本文・MTP採用366/532は全回一致。既定OFF。[実装と実測](../rocm/10-decode-pipeline.md#次層router予測を待ってからmi50へ渡している)
+- 固定3幅の次層Router予測を現層MI50のExpertグラフ投入後に発行する方式を採用。追加ON 2回の合算は53.13 tok/s（保存済みOFF 51.25）、本体検証40.28→38.58 ms、RTXからMI50への転送元待ち13.64→12.31 ms。先読みヒットは減少し、生成ID・本文・MTP採用366/532は一致した。統合版の通常起動で `GGML_SCHED_HIP_MTP3_DEFER_NEXT_ROUTER=1` を指定する。[追加計測](../rocm/10-decode-pipeline.md#次層routerのon追加計測と採用)
 
 - 固定3幅の次層Router予測はRTX→MI50の転送元同期に含まれる。既存の266検証で予測行列積・Softmax・Top-K計1.272 ms/検証がほぼ全量この待ちに重なった。予測IDを最初に使うのは現層のMI50投入後。予測を後段で別発行する候補を記録した。[コード経路と照合](../rocm/10-decode-pipeline.md#次層router予測を待ってからmi50へ渡している)
 
