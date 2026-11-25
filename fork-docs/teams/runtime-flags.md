@@ -4,15 +4,15 @@
 
 ## Linux ROCm・固定3幅の採用設定
 
-単一バンク・Expert直接DMAのDocker設定は [固定3幅の採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)、機能別のON/OFFは [固定3幅の起動フラグ一覧](../rocm/10-decode-pipeline.md#固定3幅の起動フラグ一覧) を参照。`codex/rocm-castagna-port` のMI50では、符号復号 `GGML_HIP_GFX906_IQ_SIGN_DECODE=1`、LDS先読み `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1`、3位置での出力4行 `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1` を採用する。
+単一バンク・Expert直接DMAのDocker設定は [固定3幅の採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)、機能別のON/OFFは [固定3幅の起動フラグ一覧](../rocm/10-decode-pipeline.md#固定3幅の起動フラグ一覧) を参照。移植を取り込んだ `codex/rocm-integrated-test` のMI50では、符号復号 `GGML_HIP_GFX906_IQ_SIGN_DECODE=1`、LDS先読み `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1`、3位置での出力4行 `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1` を採用する。
 
 2026-11-24に、LDS先読みを通常起動で使う型はIQ3_XXSのみと確定した。IQ2_Sの先読みと4行は通常起動でOFFとし、他の改善を進める中でIQ2_Sがボトルネックになった場合に再調査する。[ON/OFFの実測](../rocm/10-decode-pipeline.md#両型lds先読みoffの追加2回)
 
 IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` で有効になり、`GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS=1` も指定すると4行になる。両変数の既定はOFF。IQ2_Sだけで試す場合はIQ3_XXSのLDSフラグをOFFにする。
 
-`GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有。移植ブランチの通常起動で採用する。比較時は `0`。符号復号をON、IQ2_SのLDS先読みとLDSなし4行をOFFにする。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
+`GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有。統合ブランチの通常起動で採用する。比較時は `0`。符号復号をON、IQ2_SのLDS先読みとLDSなし4行をOFFにする。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
 
-`GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。移植ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
+`GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。統合ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
 
 ## Windows Vulkan・高速固定3幅の採用設定
 

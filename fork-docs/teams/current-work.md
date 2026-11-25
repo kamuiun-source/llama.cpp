@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- 2026-11-25に `codex/rocm-castagna-port` の `74f3efc85` までを `codex/rocm-integrated-test` に統合した。固定3幅の通常起動は[採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)を参照。RTXのQKV/gate結合は既定OFF。
+
 - RTXのQ6_K QKV/gate結合を `GGML_CUDA_QKV_GATE_MERGE=1` で試作。固定3幅・正式採用設定・5問を2回測り、全640生成ID・本文・MTP358/549は前回と一致。合算47.50 tok/s（過去の3回合算47.38）、本体検証42.40 ms（同42.56）。既定OFF。[実測と適用条件](../rocm/10-decode-pipeline.md#q6_kのqkvとgateをまとめる試作)
 
 - 移植版の固定3幅・全採用設定でRTX MMVQを2回トレース。両回で273検証と全135,681起動を照合し、Q6_K 6.70、Q8_0 2.63 ms/検証。Q6_KのQKV 1.75とgate 1.04が同じ入力を読むため、入力変換・起動の共通化を調査候補とする。高速化後の文言差は、自然な日本語で回答と指示が保たれれば許容。[RTXの投影別計測と候補](../rocm/10-decode-pipeline.md#rtxの量子化投影を集計する)

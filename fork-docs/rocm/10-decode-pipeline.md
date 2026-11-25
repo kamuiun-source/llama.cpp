@@ -197,7 +197,7 @@ docker run --rm --gpus all \
 
 #### 単一バンク・固定3幅の採用設定
 
-2026-11-25の移植ブランチでは、統合版から次層Expert先読みと非同期プリフィルを取り込み、既存の移植機能と組み合わせる。MI50からRTXへの戻りの直接書き込みは、既存の `GGML_SCHED_HIP_ASYNC_RETURN=1` と共有ピン留めの設定に統合した。単一バンク・固定3幅のDocker起動オプションに以下を加える。
+2026-11-25に移植ブランチを `codex/rocm-integrated-test` に取り込んだ。統合版の固定3幅では、次層Expert先読み・非同期プリフィルと採用済みの移植機能を組み合わせる。MI50からRTXへの戻りの直接書き込みは、既存の `GGML_SCHED_HIP_ASYNC_RETURN=1` と共有ピン留めの設定に統合した。単一バンク・固定3幅のDocker起動オプションに以下を加える。
 
 ```bash
   --ulimit memlock=22548578304:22548578304 \
@@ -224,11 +224,13 @@ docker run --rm --gpus all \
 
 直接DMAは、ROCmの単一バンク・固定3幅と `--load-mode none` で検証した。既存の `LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM` は未設定または `0` にする。連続配置はモデル読み込み時に決まるため、切り替えるときはサーバーを起動し直す。計測用のExpertミス集計と詳細トレースは通常起動に含めない。
 
+RTXのQKV/gate結合 `GGML_CUDA_QKV_GATE_MERGE` とMMVQ詳細計測 `GGML_CUDA_MMVQ_TRACE` は通常起動で未設定にする。
+
 Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を、読み込み前にOSでもページ固定する。以前の `LLAMA_EXPERT_HIP_TUPLE_MLOCK` は廃止した。Qwen3.8 Flash Nextの検証構成では固定対象が6領域・約19.56 GiBで、Dockerでは上記の21 GiBの `memlock` 上限を使う。`docker_images/rocm_cuda/enter.sh` から入る場合も同じ上限を設定する。上限不足で固定に失敗した場合は、必要バイト数と現在の上限を起動ログに出す。
 
 短い行向けconcatを含むビルドでは `GGML_CUDA_CONCAT_SMALL=1` を通常起動で使う。カーネルは各演算の形状で切り替え、短い非連続concatだけを高速経路に送る。比較時は `0` を指定してサーバーを再起動する。
 
-移植ブランチでSSMとGDNの融合を含むビルドでは、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
+SSMとGDNの融合を含む統合版では、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
 
