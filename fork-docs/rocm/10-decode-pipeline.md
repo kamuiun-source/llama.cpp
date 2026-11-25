@@ -228,7 +228,6 @@ docker run --rm --gpus all \
   -e GGML_CUDA_CONCAT_SMALL=1 \
   -e GGML_CUDA_UNARY_MUL_BCAST=1 \
   -e GGML_CUDA_GDN_GATED_NORM=1 \
-  -e GGML_CUDA_HC_DOWN_SPLIT_K=1 \
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
   -e GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1 \
   -e GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1 \
@@ -250,7 +249,7 @@ Linuxでは `LLAMA_EXPERT_HIP_TUPLE_DMA=1` で確保したExpertのRAM原本を�
 
 SSMとGDNの融合を含む統合版では、`GGML_CUDA_UNARY_MUL_BCAST=1` と `GGML_CUDA_GDN_GATED_NORM=1` も通常起動で使う。各融合は `0` で個別に切り替えられる。
 
-RTXのQ8_0 HC downは `GGML_CUDA_HC_DOWN_SPLIT_K=1` を通常起動に加える。比較時は `0` を指定してサーバーを再起動する。**FP32の加算順の違いによる丸め差で、温度0でも生成文言、出力トークン数、MTP採用数が変わる場合がある。** 厳密な出力照合では、比較元と同じSplit-K設定に揃える。[採用の実測と数値差](#rtxのhc-down-split-kの採用)
+RTXのQ8_0 HC down Split-Kは通常起動でOFF。環境変数は未設定または `0` とし、比較時だけ `GGML_CUDA_HC_DOWN_SPLIT_K=1` を指定してサーバーを再起動する。**FP32の加算順の違いによる丸め差で、温度0でも生成文言、出力トークン数、MTP採用数が変わる場合がある。** 厳密な出力照合では、比較元と同じSplit-K設定に揃える。[新しい5問の実測](#新しい独立5問でsplit-kを再比較)
 
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
 
@@ -296,7 +295,7 @@ Qwen3.8 Flash Nextの固定3位置で、CUDA Adaの `Q8_0` HC down（内積長10
 
 各設定の2回では全出力IDが一致し、ON/OFF間は全5問で出力が分かれた。共通の出力先頭は23、26、65、9、18トークン。上限512に達したのはOFFが第3問、ONが第1・3問。全問の最初の350トークンを比べてもONの速度改善は見られなかった。通常計測の比較なので、同じ中間活性値を使った対象カーネル単体の計測や、最初に出力が分かれた位置のlogit照合は行っていない。
 
-前回は1検証あたりの生成数が2.181→2.278（+4.47%）となり、生成速度+5.20%の大半を説明できる。今回は採用率差が逆方向で、検証1回の所要時間はほぼ同じ。Split-Kによる一貫した速度改善の根拠は得られなかった。設問とログ、集計はGit外の `/home/t-saka/rocm-hc-split-k-fresh-20261125/`。
+前回は1検証あたりの生成数が2.181→2.278（+4.47%）となり、生成速度+5.20%の大半を説明できる。今回は採用率差が逆方向で、検証1回の所要時間はほぼ同じ。Split-Kによる一貫した速度改善の根拠は得られなかったため、通常起動をOFFに変更した。設問とログ、集計はGit外の `/home/t-saka/rocm-hc-split-k-fresh-20261125/`。
 
 ##### 統合後の移植版を固定5問で確認
 
@@ -651,7 +650,7 @@ Qwen4expの固定3幅では、現層のFFN入力に次層Routerの重みを掛�
 
 ##### 統合後の固定3幅の速度とボトルネック
 
-2026-11-25に統合版 `e0daf2012` で、採用設定をすべて有効にした固定3幅・単一バンク・直接DMAを再計測した。次層Router予測の後段発行とShared Expert先行発行も有効。通常計測には直前の追加計測とハッシュが同じバイナリを使い、Qwen3.8 Flash Next、同じ固定5問、コンテキスト2,048、各問128トークン上限を維持した。
+2026-11-25に統合版 `e0daf2012` で、当時の採用設定をすべて有効にした固定3幅・単一バンク・直接DMAを再計測した。次層Router予測の後段発行、Shared Expert先行発行、HC down Split-Kも有効。通常計測には直前の追加計測とハッシュが同じバイナリを使い、Qwen3.8 Flash Next、同じ固定5問、コンテキスト2,048、各問128トークン上限を維持した。
 
 通常計測は5問完走。生成は合算52.91 tok/s（第1〜5問は44.07、52.76、55.78、54.82、57.38）、APIのプロンプト処理は合算121.18 tok/s（新規444トークン÷3.664秒）。生成640 ID・本文・MTP採用366/532がマージ前と一致し、次層Router予測は12,643件を後段発行、早期フォールバック0。
 
@@ -1073,7 +1072,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | 短い非連続行のconcat | `GGML_CUDA_CONCAT_SMALL` | `1` | `1` | `0` |
 | SSMのsoftplusと係数乗算の融合 | `GGML_CUDA_UNARY_MUL_BCAST` | `1` | `1` | `0` |
 | GDNのRMS正規化とsigmoidゲートの融合 | `GGML_CUDA_GDN_GATED_NORM` | `1` | `1` | `0` |
-| RTXのQ8_0 HC down Split-K | `GGML_CUDA_HC_DOWN_SPLIT_K` | `1` | `1` | `0` |
+| RTXのQ8_0 HC down Split-K | `GGML_CUDA_HC_DOWN_SPLIT_K` | 未設定（OFF） | `1` | `0` |
 | MI50のIQ2_S・IQ3_XXS符号復号 | `GGML_HIP_GFX906_IQ_SIGN_DECODE` | `1` | `1` | `0` |
 | MI50のIQ2_S Q8_1入力共有 | `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT` | `1` | `1`（LDS・4行がOFFのとき発動） | `0` |
 | MI50のIQ4_NL down復号短縮 | `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE` | `1` | `1` | `0` |

@@ -8,7 +8,7 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
-- RTX HC down Split-Kを統合版 `a73e9dad0` の新しい独立5問でOFF→ON→ON→OFF。合算50.32→49.62 tok/s、本体検証36.261→36.295 ms/回、MTP採用率56.49→55.28%。各設定内では出力が再現し、ON/OFF間は全問で分岐。従来の5問では1検証あたりの生成数が+4.47%で生成速度+5.20%の大半を占めた。今回の再比較で一貫した速度改善は確認できなかった。[新しい5問の計測](../rocm/10-decode-pipeline.md#新しい独立5問でsplit-kを再比較)
+- RTX HC down Split-Kを統合版の通常起動でOFFに変更。統合版 `a73e9dad0` の新しい独立5問の再比較では、合算50.32→49.62 tok/s、本体検証36.261→36.295 ms/回、MTP採用率56.49→55.28%。各設定内では出力が再現し、ON/OFF間は全問で分岐した。従来の5問では1検証あたりの生成数が+4.47%で生成速度+5.20%の大半を占めた。[新しい5問の計測](../rocm/10-decode-pipeline.md#新しい独立5問でsplit-kを再比較)
 
 - 統合版 `e0daf2012` の全採用設定・固定3幅で固定5問を再計測。通常生成52.91 tok/s、本体検証38.86 ms/回、出力・MTP採用366/532はマージ前と一致。両GPU同時トレースの266検証では、両GPUと重ならないExpert tuple H2Dが9.21 ms/回（第4問18.75）、カーネル群はRTX量子化行列積9.32とMI50 IQ2_S融合4.38が最大。両GPUとDMAが非活動の8.71 msのうち、MI50のExpert重み準備2.70、RTXグラフ投入1.92。次はExpertのミス転送量・待ちを優先する。[最新の内訳](../rocm/10-decode-pipeline.md#統合後の固定3幅の速度とボトルネック)
 
@@ -30,8 +30,6 @@
 - 固定3幅の受け渡し計時外にあるGPU・DMA非活動9.167 ms/検証を再集計し、現在の採用設定でも9.382 msを観測。MI50 Expert重み準備4.141（同期API 3.317）、RTXグラフ投入3.070（`cudaGraphLaunch` 2.640）、CPUバックエンド呼び出し0.963 ms。計測は固定5問・実3位置266回で、通常実行と640生成ID・本文・MTP採用366/532が一致。[内訳とログ](../rocm/10-decode-pipeline.md#受け渡し計時外の9167-msを再集計)
 
 - `codex/rocm-rtx-mapped-input` でRTX→MI50の活性値をCUDAカーネルから共有RAMへ書く方式を採用。追加3回は生成平均49.04 tok/s（保存済み基準48.96）、CUDA側読み出し0.546→0.418 ms/検証。各26,208件のCUDA D2Hを省略し、出力・MTP689/1,086は基準と一致。専用フラグを削除し、適格な非同期入力で自動適用。[試作と実測](../rocm/10-decode-pipeline.md#共有ramへのrtx側直接書き込み)
-
-- 固定3幅のRTX HC down Split-Kを `codex/rocm-integrated-test` の通常Docker起動に採用。固定5問の512上限ABABで46.54→48.96 tok/s。FP32の丸め差により文言・MTP採用数が変わり得る点を起動資料に記載。[採用結果](../rocm/10-decode-pipeline.md#rtxのhc-down-split-kの採用)
 
 - 2026-11-25に `codex/rocm-castagna-port` の `74f3efc85` までを `codex/rocm-integrated-test` に統合した。固定3幅の通常起動は[採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)を参照。RTXのQKV/gate結合は既定OFF。
 
