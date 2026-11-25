@@ -8,7 +8,7 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
-- `codex/rocm-expert-callback-wait` でExpertコールバック前のMI50同期をCPU側Router ID取得・選定の後へ移す試作。固定3幅のOFF→ON→ON→OFFで50.84→51.57 tok/s、本体検証40.58→40.04 ms、同期39.17→31.70 µs/呼び出し。各ONで12,912件を移動し7,540件は選定後。生成ID・本文・MTP採用366/532一致、既定OFF。[試作と実測](../rocm/10-decode-pipeline.md#expert選定をmi50同期より前に行う試作)
+- 固定3幅でExpertコールバック前のMI50同期をCPU側Router ID取得・選定の後へ移す方式を採用。追加3組は51.41→51.48 tok/s、全5組は51.18→51.51 tok/s。本体検証は全5組で40.31→40.07 ms、生成ID・本文・MTP採用366/532一致。試作フラグを廃止し、既存の非同期HIP入力を使う適格な構成で自動適用。[試作と実測](../rocm/10-decode-pipeline.md#expert選定をmi50同期より前に行う試作)
 
 - 共有RAMの採用経路を含む `77114439a` までを `codex/rocm-integrated-test` に取り込んだ。共有RAM読み込みと戻り側のRTX非同期H2Dは固定3幅で自動適用。Shared Expert先行発行は通常起動で明示指定する。過去のブランチ名は計測履歴として記載している。[統合後の起動設定](../rocm/10-decode-pipeline.md#共有ram読み込みを含む固定3幅の通常起動)
 

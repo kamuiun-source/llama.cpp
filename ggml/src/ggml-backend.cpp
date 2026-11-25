@@ -1477,7 +1477,6 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy_early;
     void * callback_copy_early_user_data;
     bool capture_host_copies;
-    bool defer_expert_copy_wait;
     bool measure_expert_copy_wait;
     ggml_backend_t deferred_expert_copy_backend;
     int64_t deferred_expert_copy_start_us;
@@ -2893,15 +2892,17 @@ bool ggml_backend_sched_expert_copy_wait_pending(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_wait_expert_copy(ggml_backend_sched_t sched, bool after_router, bool after_plan) {
     if (ggml_backend_sched_expert_copy_wait_pending(sched)) {
-        const int64_t start = ggml_time_us();
+        const int64_t start = sched->measure_expert_copy_wait ? ggml_time_us() : 0;
         ggml_backend_synchronize(sched->deferred_expert_copy_backend);
         sched->deferred_expert_copy_backend = nullptr;
-        sched->expert_copy_wait_after_us += ggml_time_us() - start;
-        sched->expert_copy_wait_after_router += after_router;
-        sched->expert_copy_wait_after_plan += after_plan;
-        sched->expert_copy_wait_fallback += !after_router;
-        if (after_router) {
-            sched->expert_copy_cpu_before_wait_us += start - sched->deferred_expert_copy_start_us;
+        if (sched->measure_expert_copy_wait) {
+            sched->expert_copy_wait_after_us += ggml_time_us() - start;
+            sched->expert_copy_wait_after_router += after_router;
+            sched->expert_copy_wait_after_plan += after_plan;
+            sched->expert_copy_wait_fallback += !after_router;
+            if (after_router) {
+                sched->expert_copy_cpu_before_wait_us += start - sched->deferred_expert_copy_start_us;
+            }
         }
     }
 }
@@ -2967,22 +2968,23 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     const bool weight_callback = sched->callback_copy && ggml_backend_sched_is_host_weight(input);
-    const bool measure_expert_wait = sched->measure_expert_copy_wait && weight_callback && host_copies &&
+    const bool expert_wait_candidate = (sched->async_hip_input || sched->measure_expert_copy_wait) &&
+            weight_callback && host_copies &&
             sched->n_copies == 1 && sched->target_mtp_verify_three && !sched->profile.enabled && !sched->callback_eval &&
             !split->has_custom && strncmp(input->name, "moe_cache.packed_slots-", 23) == 0 &&
             strncmp(ggml_backend_name(split_backend), "ROCm", 4) == 0;
-    const bool captured_router = measure_expert_wait &&
+    const bool captured_router = expert_wait_candidate &&
             std::any_of(host_copies->entries, host_copies->entries + host_copies->count,
                     [](const ggml_backend_sched_host_copies::entry & entry) {
                         return entry.size == 30 * sizeof(int32_t);
                     });
-    if (captured_router && sched->defer_expert_copy_wait) {
+    if (captured_router && sched->async_hip_input) {
         GGML_ASSERT(!sched->deferred_expert_copy_backend);
         sched->deferred_expert_copy_backend = split_backend;
-        sched->deferred_expert_copy_start_us = ggml_time_us();
+        sched->deferred_expert_copy_start_us = sched->measure_expert_copy_wait ? ggml_time_us() : 0;
     } else {
         // Finish earlier uses of the destination before overwriting it.
-        const int64_t wait_start = captured_router ? ggml_time_us() : 0;
+        const int64_t wait_start = captured_router && sched->measure_expert_copy_wait ? ggml_time_us() : 0;
         handoff.destination_wait([&] {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -4529,7 +4531,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * measure_hip = getenv("GGML_SCHED_HIP_HANDOFF_TIMING");
     const char * trace_hip_wait = getenv("GGML_SCHED_HIP_HANDOFF_WAIT_TRACE");
     const char * verify_trace_path = getenv("GGML_SCHED_HIP_VERIFY_STAGE_TRACE");
-    const char * defer_expert_wait = getenv("GGML_SCHED_HIP_MTP3_DEFER_EXPERT_CALLBACK_WAIT");
     const char * profile_expert_callback = getenv("LLAMA_EXPERT_PROFILE_CALLBACK");
     const char * async_hip_input = getenv("GGML_SCHED_HIP_ASYNC_INPUT");
     const char * async_hip_mtp4_input = getenv("GGML_SCHED_HIP_MTP4_ASYNC_INPUT");
@@ -4583,9 +4584,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->dual_pinned_hip_handoff = allow_hip_dual_pinned && cuda_hip;
     sched->measure_hip_handoff = allow_hip_timing && cuda_hip;
     sched->trace_hip_handoff_wait = allow_hip_wait_trace && cuda_hip;
-    sched->defer_expert_copy_wait = cuda_hip && defer_expert_wait && strcmp(defer_expert_wait, "1") == 0;
-    sched->measure_expert_copy_wait = sched->defer_expert_copy_wait ||
-            (cuda_hip && (allow_verify_trace || (profile_expert_callback && strcmp(profile_expert_callback, "1") == 0)));
+    sched->measure_expert_copy_wait = cuda_hip &&
+            (allow_verify_trace || (profile_expert_callback && strcmp(profile_expert_callback, "1") == 0));
     if (cuda_hip && async_hip_input && strcmp(async_hip_input, "1") == 0) {
         sched->async_hip_input = sched->batch_hip_device_inputs && sched->dual_pinned_hip_handoff;
         if (!sched->async_hip_input) {
