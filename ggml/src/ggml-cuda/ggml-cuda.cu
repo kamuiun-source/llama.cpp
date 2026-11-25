@@ -7675,11 +7675,17 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (strcmp(name, "ggml_backend_cuda_get_q6_k_mmvq_signed") == 0) {
+    if (strcmp(name, "ggml_backend_cuda_get_q6_k_mmvq_mode") == 0) {
         return (void *) ggml_cuda_q6_k_mmvq::get_mode;
     }
-    if (strcmp(name, "ggml_backend_cuda_set_q6_k_mmvq_signed") == 0) {
+    if (strcmp(name, "ggml_backend_cuda_set_q6_k_mmvq_mode") == 0) {
         return (void *) ggml_cuda_q6_k_mmvq::set_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_q6_k_mmvq_signed") == 0) {
+        return (void *) +[] { return ggml_cuda_q6_k_mmvq::get_mode() == ggml_cuda_q6_k_mmvq::signed_bytes; };
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_q6_k_mmvq_signed") == 0) {
+        return (void *) +[](bool enabled) { ggml_cuda_q6_k_mmvq::set_mode(enabled); };
     }
     if (strcmp(name, "ggml_backend_cuda_is_ada") == 0) {
         return (void *)+[](ggml_backend_dev_t dev) {

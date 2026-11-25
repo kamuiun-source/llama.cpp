@@ -16,10 +16,10 @@ inline void server_refresh_q6_k_mmvq_mode(llama_context * target, llama_context 
     }
 
     static const auto reg = ggml_backend_reg_by_name("CUDA");
-    static const auto get_mode = reg ? reinterpret_cast<bool (*)()>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_q6_k_mmvq_signed")) : nullptr;
-    static const auto set_mode = reg ? reinterpret_cast<void (*)(bool)>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_q6_k_mmvq_signed")) : nullptr;
+    static const auto get_mode = reg ? reinterpret_cast<int (*)()>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_q6_k_mmvq_mode")) : nullptr;
+    static const auto set_mode = reg ? reinterpret_cast<void (*)(int)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_q6_k_mmvq_mode")) : nullptr;
     if (!get_mode || !set_mode) {
         return;
     }
@@ -36,8 +36,8 @@ inline void server_refresh_q6_k_mmvq_mode(llama_context * target, llama_context 
     }
 
     static bool invalid = false;
-    const bool enabled = value == "Q6_K=signed";
-    if (!input.eof() || input.bad() || (!enabled && value != "Q6_K=off")) {
+    const int mode = value == "Q6_K=off" ? 0 : value == "Q6_K=signed" ? 1 : value == "Q6_K=reuse" ? 2 : -1;
+    if (!input.eof() || input.bad() || mode < 0) {
         if (!invalid) {
             LOG_WRN("invalid CUDA Q6_K MMVQ mode file: %s\n", path);
             invalid = true;
@@ -45,7 +45,7 @@ inline void server_refresh_q6_k_mmvq_mode(llama_context * target, llama_context 
         return;
     }
     invalid = false;
-    if (enabled == get_mode()) {
+    if (mode == get_mode()) {
         return;
     }
 
@@ -53,6 +53,6 @@ inline void server_refresh_q6_k_mmvq_mode(llama_context * target, llama_context 
     if (draft && draft != target) {
         llama_synchronize(draft);
     }
-    set_mode(enabled);
-    LOG_INF("CUDA Q6_K MMVQ mode applied: Q6_K=%s\n", enabled ? "signed" : "off");
+    set_mode(mode);
+    LOG_INF("CUDA Q6_K MMVQ mode applied: Q6_K=%.*s\n", int(value.size() - 5), value.data() + 5);
 }

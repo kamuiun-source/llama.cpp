@@ -23,15 +23,18 @@ inline bool configured() {
     return enabled;
 }
 
-inline std::atomic<bool> signed_mode{startup_signed()};
+enum mode { off, signed_bytes, reuse };
+inline std::atomic<int> active_mode{startup_signed() ? signed_bytes : off};
 inline thread_local bool dispatched = false;
 
-inline bool get_mode() {
-    return signed_mode.load(std::memory_order_relaxed);
+inline int get_mode() {
+    return active_mode.load(std::memory_order_relaxed);
 }
 
-inline void set_mode(bool enabled) {
-    signed_mode.store(enabled, std::memory_order_relaxed);
+inline void set_mode(int requested) {
+    if (requested >= off && requested <= reuse) {
+        active_mode.store(requested, std::memory_order_relaxed);
+    }
 }
 
 } // namespace ggml_cuda_q6_k_mmvq

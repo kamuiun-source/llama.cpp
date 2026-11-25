@@ -1,6 +1,7 @@
 #include "mmvq.cuh"
 #include "hc-fused.cuh"
 #include "q6-k-mmvq-mode.cuh"
+#include "q6-k-mmvq-reuse.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -745,7 +746,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
-          bool hc_reuse = false, int row_groups = 1, int split_k = 1, bool signed_q6 = false>
+          bool hc_reuse = false, int row_groups = 1, int split_k = 1, bool signed_q6 = false, bool reuse_q6 = false>
 __launch_bounds__(row_groups*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -901,7 +902,19 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-        if constexpr (hc_reuse) {
+        if constexpr (reuse_q6) {
+            static_assert(type == GGML_TYPE_Q6_K && ncols_dst == 3 && !has_fusion && !signed_q6);
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const auto & weight = static_cast<const block_q6_K *>(vx)[kbx_offset + i*stride_row_x + kbx];
+                float dots[3];
+                q6_k_mmvq_reuse_three(weight, y + kby, stride_col_y, kqs, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else if constexpr (hc_reuse) {
             static_assert(type == GGML_TYPE_Q8_0 && (ncols_dst == 2 || ncols_dst == 3) && rows_per_cuda_block == 2 && !has_fusion);
             constexpr int n = VDR_Q8_0_Q8_1_MMVQ;
             int u[ncols_dst][n];
@@ -2260,23 +2273,35 @@ void ggml_cuda_mul_mat_vec_q(
     if (!ids && !fusion && src0->type == GGML_TYPE_Q6_K && ncols_dst == 3 &&
             ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
             device.cc == GGML_CUDA_CC_ADA_LOVELACE && ggml_cuda_q6_k_mmvq::configured()) {
-        const bool enabled = ggml_cuda_q6_k_mmvq::get_mode();
-        ggml_cuda_q6_k_mmvq::dispatched = true;
-        static std::atomic<int> last_mode{-1};
-        if (last_mode.load(std::memory_order_relaxed) != enabled &&
-                last_mode.exchange(enabled, std::memory_order_relaxed) != enabled) {
-            GGML_LOG_INFO("CUDA Ada Q6_K MMVQ dispatch: cols=3 mode=%s\n", enabled ? "signed" : "off");
+        using namespace ggml_cuda_q6_k_mmvq;
+        const int mode = get_mode();
+        dispatched = true;
+        const bool use_reuse = mode == reuse && ne00 == 2560 && ne01 == 10240;
+        const bool use_signed = mode == signed_bytes;
+        if (mode != reuse || use_reuse) {
+            static std::atomic<int> last_mode{-1};
+            if (last_mode.load(std::memory_order_relaxed) != mode &&
+                    last_mode.exchange(mode, std::memory_order_relaxed) != mode) {
+                GGML_LOG_INFO("CUDA Ada Q6_K MMVQ dispatch: cols=3 mode=%s\n", use_reuse ? "reuse" : use_signed ? "signed" : "off");
+            }
         }
-        if (enabled) {
+        if (use_reuse || use_signed) {
             const auto dims = calc_launch_params<GGML_TYPE_Q6_K>(3, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc));
             const ggml_cuda_kernel_launch_params params(dims.first, dims.second, 0, stream);
 #ifdef GGML_CUDA_HAVE_MMVQ_TRACE
             const mmvq_launch_trace trace(params, 3, false, false, false);
 #endif
-            ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q6_K, 3, false, false, false, false, 1, 1, true>, params,
-                src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
-                uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
-                init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
+            const auto launch = [&](auto kernel) {
+                ggml_cuda_kernel_launch(kernel, params,
+                    src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
+                    uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
+                    init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
+            };
+            if (use_reuse) {
+                launch(mul_mat_vec_q<GGML_TYPE_Q6_K, 3, false, false, false, false, 1, 1, false, true>);
+            } else {
+                launch(mul_mat_vec_q<GGML_TYPE_Q6_K, 3, false, false, false, false, 1, 1, true>);
+            }
             return;
         }
     }
