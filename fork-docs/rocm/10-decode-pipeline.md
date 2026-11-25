@@ -439,7 +439,27 @@ Expert tupleの4種の実サイズをrocprofのコピー記録から照合した
 | CUDA/HIP API外 | 2.343 |
 | 合計 | 9.167 |
 
-元の計測はMI50→RTXの直接書き込みを有効にした時点。最新のRTX→MI50直接書き込みやSplit-Kの採用後の値とは別。CPUで何をしていたかはAPI外の区間だけでは特定できず、スケジューラ内の時刻もあわせて記録する。解析スクリプトとJSONはGit外の `/home/t-saka/rocm-verify-idle-20261125/`。
+元の計測はMI50→RTXの直接書き込みを有効にした時点。RTX→MI50直接書き込みとSplit-Kの採用後は、下記のホスト処理区間を追加して計測した。解析スクリプトとJSONはGit外の `/home/t-saka/rocm-verify-idle-20261125/`。
+
+###### 現行版でホスト処理区間も計測
+
+2026-11-25に `c11a0c157` で固定5問を1回計測。正式採用設定、固定3幅、単一バンク、直接DMA、両方向の直接書き込み、HC down Split-Kを有効にした。5問とも完走し、全640生成ID・本文・MTP採用366/532は同じ128トークン上限のSplit-K通常実行と一致。ウォームアップを除く実3位置266回で、本体検証は51.660 ms/回、両GPU・DMAの非活動時間は12.238 ms/回（受け渡し内2.856、外9.382）。受け渡し計時外の中央値は7.812、p95は19.768 ms/回。
+
+| 受け渡し計時外の非活動が重なったホスト処理 | ms/実3位置検証 | 内訳 |
+| --- | ---: | --- |
+| RTXグラフ投入 | 3.070 | 主に `cudaGraphLaunch` 2.640 |
+| MI50 Expert重みの準備（`host_weight_copy`） | 4.141 | 同期API 3.317、転送API 0.351、CUDA/HIP API外 0.466 |
+| CPUバックエンドのグラフ実行呼び出し | 0.963 | CUDA/HIP API外 |
+| MI50グラフ投入 | 0.320 | うち起動・Graph管理API 0.188 |
+| グラフ入力の設定・確保・構築 | 0.342 | ホスト側の `graph_inputs` 0.203、`graph_allocate` 0.101、`graph_build` 0.038 |
+| 重み以外のコピー準備 | 0.372 | 両GPU向けの `nonweight_copy` |
+| その他の記録済み区間 | 0.153 | デコード準備、コールバックなど |
+| ホスト区間マーカー外 | 0.020 | うちCUDA/HIP API外 0.010 |
+| 合計 | 9.382 | 丸めにより行の合計は一致しない場合がある |
+
+APIで再集計すると同期3.398 ms（うち `hipStreamSynchronize` 3.322）、起動・Graph管理2.961 ms、転送・memset 0.410 ms、イベント・その他0.205 ms、CUDA/HIP API外2.408 ms。MI50の重み準備にある同期が最大で、RTXのGraph投入が次に大きい。CUDA/HIP API外は、主にCPUバックエンドの実行呼び出し0.963 msと、MI50の重み準備0.466 msに重なる。これらは両GPUとDMAが非活動だった区間との交差であり、API呼び出し全体の時間やCPUが実際に走った時間、削減可能な時間までは示さない。CPUバックエンド内の演算別内訳や、Expert重み準備内で同期を呼ぶ箇所ごとの内訳も未計測。
+
+採取時は `GGML_SCHED_HIP_VERIFY_STAGE_TRACE=/results/verify-host.csv` を指定する。計測後に `/results/verify-host.csv.flush` を作り、未キャッシュの短い追加リクエストを発行してからプロファイラーを停止する。この追加リクエストは集計範囲外。CSVはウォームアップを含む269グラフ・100,116行で、欠落報告は0。生ログはGit外の `/home/t-saka/rocm-verify-idle-attribution-20261125/retry02/capture-01/`、集計は上記解析ディレクトリの `current-outside-stages.json`。
 
 #### RTXの量子化投影を集計する
 
