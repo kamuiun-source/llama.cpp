@@ -1443,6 +1443,9 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         // The context synchronizes its backends before destroying the cache.
+        if (single_miss_cpu) {
+            single_miss_cpu->drain();
+        }
         finish_async_demand();
         finish_next_prefetch();
         wait_hip_cold_upload();
@@ -3614,9 +3617,14 @@ struct llama_moe_cache::impl {
                         }
                     }
                     unsigned mask = 0;
-                    const int64_t cpu_start = ggml_time_us();
-                    if (single_miss_cpu->compute(planes, map.host[expert], expert, ids.data(), activation, router_weights, mask)) {
-                        ggml_backend_sched_set_hip_single_miss_result(sched, single_miss_cpu->weighted.data(), mask);
+                    const int32_t host_slot = map.host[expert];
+                    // A promotion writes back into the host slot of the selected scratch hit.
+                    const int32_t promotion_host_slot = promote_index >= 0 ? map.host[scratch[promote_index]] : -1;
+                    if (host_slot >= 0 && host_slot != promotion_host_slot &&
+                            single_miss_cpu->enqueue(planes, host_slot, expert, ids.data(), activation, router_weights, mask)) {
+                        ggml_backend_sched_set_hip_single_miss_result(sched, [](void * worker, int64_t mi50_done_us) {
+                            return static_cast<llama_single_miss_cpu *>(worker)->resolve(mi50_done_us);
+                        }, single_miss_cpu.get(), mask);
                         // The last tuple is initialized to zero and is outside all scratch and promotion ranges.
                         slots[expert] = llama_expert_profile::n_resident + placement->n_slots;
                         ++single_miss_cpu->applied;
@@ -3625,7 +3633,6 @@ struct llama_moe_cache::impl {
                         }
                         single_miss_cpu->avoided_bytes += placement->tuples[il].stride;
                     }
-                    single_miss_cpu->compute_us += ggml_time_us() - cpu_start;
                 }
             }
             std::array<int32_t, llama_expert_profile::n_experts> rtx_slots;
@@ -4196,9 +4203,12 @@ struct llama_moe_cache::impl {
             }
         }
         if (single_miss_cpu) {
-            LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f\n",
-                    single_miss_cpu->eligible, single_miss_cpu->applied, single_miss_cpu->positions,
-                    single_miss_cpu->avoided_bytes, single_miss_cpu->compute_us / 1000.0);
+            const auto & cpu = *single_miss_cpu;
+            LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f"
+                    " queue_ms=%.3f joined=%zu join_waited=%zu join_wait_ms=%.3f pending_at_mi50=%zu remaining_after_mi50_ms=%.3f cancelled=%zu\n",
+                    cpu.eligible, cpu.applied, cpu.positions, cpu.avoided_bytes, cpu.compute_us / 1000.0,
+                    cpu.queue_us / 1000.0, cpu.joined, cpu.waited, cpu.join_us / 1000.0,
+                    cpu.outstanding_at_mi50, cpu.remaining_after_mi50_us / 1000.0, cpu.cancelled);
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;

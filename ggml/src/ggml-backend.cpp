@@ -1330,7 +1330,8 @@ struct ggml_backend_sched_host_copies {
 struct ggml_backend_sched_single_miss {
     const ggml_backend_sched_split * destination = nullptr;
     const ggml_tensor * output = nullptr;
-    const float * result = nullptr;
+    const float * (*resolve)(void *, int64_t) = nullptr;
+    void * user_data = nullptr;
     unsigned mask = 0;
 };
 
@@ -1521,6 +1522,8 @@ struct ggml_backend_sched {
     int64_t expert_copy_wait_after_us;
     int64_t expert_copy_cpu_before_wait_us;
     ggml_backend_sched_single_miss * active_single_miss;
+    size_t single_miss_combined;
+    int64_t single_miss_combine_us;
     const ggml_backend_sched_host_copies * active_host_copies;
     const ggml_backend_sched_split * active_copy_split;
     struct after_submit {
@@ -3138,6 +3141,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                 sched->hip_async_input_pending = nullptr;
             }
         });
+        auto * correction = sched->active_single_miss;
+        const bool combine_single_miss = use_hip_return && correction && correction->destination == split &&
+                correction->output == input && correction->resolve;
+        const int64_t mi50_done_us = combine_single_miss ? ggml_time_us() : 0;
         const bool skip_hip_wait = sched->skip_hip_device_dst_wait && cuda_hip_pair && ggml_are_same_layout(input, input_cpy);
         const char * host_path = "host";
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -3156,19 +3163,23 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             handoff.destination_wait([&] { ggml_backend_synchronize(split_backend); });
         }
         if (use_hip_return) {
-            auto * correction = sched->active_single_miss;
-            if (correction && correction->destination == split && correction->output == input && correction->result) {
+            if (combine_single_miss) {
+                const float * result = correction->resolve(correction->user_data, mi50_done_us);
+                GGML_ASSERT(result);
+                const int64_t combine_start = ggml_time_us();
                 // Both GPU readers and writers of this return slot have completed.
                 auto * output = reinterpret_cast<float *>(hip_return->data);
                 for (int t = 0; t < 3; ++t) {
                     if (correction->mask & (1u << t)) {
                         for (int j = 0; j < 2560; ++j) {
                             const int i = t * 2560 + j;
-                            output[i] += correction->result[i];
+                            output[i] += result[i];
                         }
                     }
                 }
                 *correction = {};
+                ++sched->single_miss_combined;
+                sched->single_miss_combine_us += ggml_time_us() - combine_start;
             }
             handoff.read_start_us = hip_return->enqueue_start_us;
             handoff.read_end_us = hip_return->enqueue_end_us;
@@ -4145,7 +4156,7 @@ bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, c
     const auto * copies = sched->active_host_copies;
     const auto * split = sched->active_copy_split;
     if (!copies || !copies->single_miss_activation || !copies->single_miss_weights_dst || !split ||
-            split->has_custom || split + 1 == sched->splits + sched->n_splits || sched->active_single_miss->result) {
+            split->has_custom || split + 1 == sched->splits + sched->n_splits || sched->active_single_miss->resolve) {
         return false;
     }
 
@@ -4188,11 +4199,12 @@ bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, c
     return true;
 }
 
-void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched, const float * result, unsigned mask) {
+void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched,
+        const float * (*resolve)(void *, int64_t), void * user_data, unsigned mask) {
     auto * correction = sched->active_single_miss;
     const auto * destination = sched->active_copy_split + 1;
-    GGML_ASSERT(correction && !correction->result && result && mask > 0 && mask < 8 && destination->n_inputs == 1);
-    *correction = {destination, destination->inputs[0], result, mask};
+    GGML_ASSERT(correction && !correction->resolve && resolve && mask > 0 && mask < 8 && destination->n_inputs == 1);
+    *correction = {destination, destination->inputs[0], resolve, user_data, mask};
 }
 
 static enum ggml_status ggml_backend_sched_run_deferred_router(ggml_backend_sched_t sched, bool early) {
@@ -4258,6 +4270,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched::deferred_router router;
         ggml_backend_sched_single_miss single_miss;
         ~after_submit_scope() {
+            if (single_miss.resolve) {
+                single_miss.resolve(single_miss.user_data, 0);
+            }
             sched->active_after_submit = nullptr;
             sched->active_deferred_router = nullptr;
             sched->active_single_miss = nullptr;
@@ -5165,6 +5180,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("packed HIP MTP3 mapped input: producers=%zu copies=%zu bytes=%zu reader_busy=%zu mapped=%d\n",
                 sched->mapped_hip_input_producers, stats.mapped_input_copies, stats.mapped_input_bytes,
                 sched->mapped_hip_input_busy, sched->hip_handoff.cuda_mapped != nullptr);
+    }
+    if (sched->single_miss_combined) {
+        GGML_LOG_INFO("packed HIP MTP3 single CPU miss return: combined=%zu combine_ms=%.3f\n",
+                sched->single_miss_combined, sched->single_miss_combine_us / 1000.0);
     }
     if (sched->defer_next_router) {
         GGML_LOG_INFO("packed HIP MTP3 deferred next Router: plans=%zu after_expert=%zu early=%zu\n",
