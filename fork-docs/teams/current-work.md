@@ -8,7 +8,7 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
-- AstraがRTX量子化の3試作を再分析。Q6_Kはロードと復号命令が減らず、HC upワープ版は同一重みの再ロードをSASSで確認、整列版は通常MMVQ比でL2追い出し後に悪化。次の第一候補は現行HC upの直前のScale・SiLU・Q8_1変換の融合。保存トレース2回では対象の合計が約0.249 ms/検証。新規の実装・採用は保留。[Astraの再分析](../rocm/10-decode-pipeline.md#astraの再分析と次の候補)
+- Astraの第一候補のHC up直前融合を `HC_UP=prep` で試作。固定3幅の単体でQ8_1とHC出力がビット一致、L2追い出し条件のScale込みは14.568→12.541 µs。実モデルでScale込みの起動を確認し、同じPIDの5問はOFF→prep→OFFで51.88／57.06／57.19 tok/s。既定OFF。[実装と計測](../rocm/10-decode-pipeline.md#hc-up直前のq8_1変換を融合する試作)
 
 - `codex/rocm-rtx-quant-opt` のQ8_0 HC up整列を同じサーバー・固定3幅・固定5問でOFF→ON→OFF→ONと比較し、51.77／57.22／57.18／56.15 tok/s。後半のExpert転送待ちはともに3.28 ms/検証で、生成速度はONが1.8%低下。全4回の応答中スワップアウト0。Astraは整列失敗時のGraphフォールバックと、GPUグラフが元の重みを更新する場合の無効化を指摘。試作3件の既定はOFF。[OFF／ON比較](../rocm/10-decode-pipeline.md#整列だけの同一サーバーoffon比較)
 

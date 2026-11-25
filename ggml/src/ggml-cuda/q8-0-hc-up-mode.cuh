@@ -18,6 +18,7 @@ inline bool configured() {
 inline std::atomic<int> active_mode{0};
 inline thread_local bool dispatched = false;
 inline thread_local bool pack_target_seen = false;
+inline thread_local bool prep_candidate_seen = false;
 inline thread_local bool dispatched_packed = false;
 inline std::atomic<uint64_t> pack_epoch{0};
 
@@ -26,7 +27,7 @@ inline int get_mode() {
 }
 
 inline void set_mode(int requested) {
-    if (requested >= 0 && requested <= 2) {
+    if (requested >= 0 && requested <= 3) {
         active_mode.store(requested, std::memory_order_relaxed);
     }
 }

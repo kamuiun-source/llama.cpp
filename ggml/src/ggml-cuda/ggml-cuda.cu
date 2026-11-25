@@ -8,6 +8,7 @@
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/q6-k-mmvq-mode.cuh"
 #include "ggml-cuda/q8-0-hc-up-mode.cuh"
+#include "ggml-cuda/q8-0-hc-up-prep-graph.cuh"
 #include "ggml-cuda/q8-0-hc-up-cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -4580,6 +4581,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (const int prep = ggml_cuda_try_hc_up_prep(*cuda_ctx, cgraph, i)) {
+        return prep;
+    }
     static const bool hc_scale_silu = ggml_cuda_env_flag("GGML_CUDA_HC_SCALE_SILU_FUSE");
     if (hc_scale_silu && node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
@@ -6077,7 +6081,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
         if (it != cuda_ctx->cuda_graphs.end()) {
             const auto & graph = *it->second;
-            const int hc_up_graph_mode = hc_up_mode == 2 && !graph.hc_up_pack_target ? 0 : hc_up_mode;
+            const bool hc_mode_fallback = (hc_up_mode == 2 && !graph.hc_up_pack_target) ||
+                    (hc_up_mode == 3 && !graph.hc_up_prep_candidate);
+            const int hc_up_graph_mode = hc_mode_fallback ? 0 : hc_up_mode;
             if ((graph.q6_k_mmvq_mode >= 0 && graph.q6_k_mmvq_mode != q6_k_mode) ||
                     (graph.q8_0_hc_up_mode >= 0 && graph.q8_0_hc_up_mode != hc_up_graph_mode) ||
                     (graph.hc_up_packed && graph.hc_up_pack_epoch != hc_up_pack_epoch)) {
@@ -6154,6 +6160,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (hc_up_managed) {
         ggml_cuda_q8_0_hc_up::dispatched = false;
         ggml_cuda_q8_0_hc_up::pack_target_seen = false;
+        ggml_cuda_q8_0_hc_up::prep_candidate_seen = false;
         ggml_cuda_q8_0_hc_up::dispatched_packed = false;
     }
 #endif
@@ -6163,7 +6170,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         auto * graph = cuda_ctx->cuda_graph(graph_key);
         graph->q6_k_mmvq_mode = ggml_cuda_q6_k_mmvq::dispatched ? q6_k_mode : -1;
         graph->hc_up_pack_target = hc_up_managed && ggml_cuda_q8_0_hc_up::pack_target_seen;
-        const int hc_up_graph_mode = hc_up_mode == 2 && !graph->hc_up_pack_target ? 0 : hc_up_mode;
+        graph->hc_up_prep_candidate = hc_up_managed && ggml_cuda_q8_0_hc_up::prep_candidate_seen;
+        const bool hc_mode_fallback = (hc_up_mode == 2 && !graph->hc_up_pack_target) ||
+                (hc_up_mode == 3 && !graph->hc_up_prep_candidate);
+        const int hc_up_graph_mode = hc_mode_fallback ? 0 : hc_up_mode;
         graph->q8_0_hc_up_mode = ggml_cuda_q8_0_hc_up::dispatched ? hc_up_graph_mode : -1;
         graph->hc_up_packed = hc_up_managed && ggml_cuda_q8_0_hc_up::dispatched_packed;
         graph->hc_up_pack_epoch = hc_up_pack_epoch;
@@ -7739,6 +7749,9 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_test_hc_up_prep") == 0) {
+        return (void *) ggml_cuda_test_hc_up_prep;
+    }
     if (strcmp(name, "ggml_backend_cuda_get_q8_0_hc_up_mode") == 0) {
         return (void *) ggml_cuda_q8_0_hc_up::get_mode;
     }

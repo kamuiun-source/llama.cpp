@@ -3,6 +3,7 @@
 #include "q6-k-mmvq-mode.cuh"
 #include "q6-k-mmvq-reuse.cuh"
 #include "q8-0-hc-up-mode.cuh"
+#include "q8-0-hc-up-prep.cuh"
 #include "q8-0-hc-up-warp.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -2084,9 +2085,10 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-void ggml_cuda_mul_mat_vec_q(
+struct hc_up_prep_args;
+static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, [[maybe_unused]] const hc_up_prep_args * prep) {
 #ifdef GGML_CUDA_HAVE_MMVQ_TRACE
     const mmvq_trace_scope trace_scope(ctx.device, ids == nullptr, src0, src1, dst);
 #endif
@@ -2209,6 +2211,12 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         const auto quantize = [&] {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (prep) {
+                hc_up_launch_q8_1(*prep, src1_q8_1.get(), stream);
+                return;
+            }
+#endif
             quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         };
 #ifdef GGML_CUDA_HAVE_MMVQ_TRACE
@@ -2348,7 +2356,7 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_cuda_q8_0_hc_up::pack_target_seen |= pack_candidate;
         const bool pack_target = mode == 2 && pack_candidate;
         const auto packed = pack_target ? ggml_cuda_prepare_hc_up_packed(ctx, src0) : hc_up_packed_weights{};
-        if (mode != 2 || pack_target) {
+        if (mode < 2 || pack_target) {
             const int effective = packed.quants ? 2 : mode > 0 ? 1 : 0;
             static std::atomic<int> last_mode{-1};
             if (last_mode.load(std::memory_order_relaxed) != effective &&
@@ -2461,6 +2469,18 @@ void ggml_cuda_mul_mat_vec_q(
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
+
+void ggml_cuda_mul_mat_vec_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, nullptr);
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_mul_mat_vec_q_hc_up_prep(ggml_backend_cuda_context & ctx, ggml_tensor * up, const hc_up_prep_args & prep) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, up->src[0], up->src[1], nullptr, up, nullptr, &prep);
+}
+#endif
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,

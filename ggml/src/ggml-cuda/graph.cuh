@@ -62,6 +62,7 @@ struct ggml_cuda_graph {
     int q6_k_mmvq_mode = -1;
     int q8_0_hc_up_mode = -1;
     bool hc_up_pack_target = false;
+    bool hc_up_prep_candidate = false;
     bool hc_up_packed = false;
     uint64_t hc_up_pack_epoch = 0;
 #endif
