@@ -254,6 +254,17 @@ RTXのQ8_0 HC downは `GGML_CUDA_HC_DOWN_SPLIT_K=1` を通常起動に加える�
 
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
 
+##### 共有RAM読み込みを含む固定3幅の通常起動
+
+`codex/rocm-mi50-mapped-input-read` では、上記の固定3幅の設定に次の2つを追加する。Shared Expert先行発行を使う層でもRTXが活性値を共有RAMへ直接書き、MI50側のカーネルでVRAMに取り込む方式を採用する。[併用時の計測](#shared-expert先行発行との併用)
+
+```bash
+  -e GGML_SCHED_HIP_SHARED_OVERLAP=1 \
+  -e GGML_SCHED_HIP_MAPPED_INPUT_READ=1 \
+```
+
+MI50の読み込み経路を比較するときは `GGML_SCHED_HIP_MAPPED_INPUT_READ=0` で起動する。この場合は、先行発行を使う層のRTX側直接書き込みも従来の経路に戻る。共有RAMの登録、非同期入力・戻り、一括入力の正式採用設定は共通。
+
 ##### RTXのHC down Split-Kの採用
 
 Qwen3.8 Flash Nextの固定3位置で、CUDA Adaの `Q8_0` HC down（内積長10,240、出力320）のK方向を4分割し、FP32部分和を固定順で合算する。同じ重み・入力量子化を使う。FP32では加算順が変わると丸め結果がわずかに変わり、上位logitが僅差の箇所で選択トークンが入れ替わり得る。今回のON/OFFは第1問の61番目で出力が分かれた。最初の差分におけるlogitの順位変化は個別に計測していない。同一設定の2回では全出力IDと本文が一致した。
