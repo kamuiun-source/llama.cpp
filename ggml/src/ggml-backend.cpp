@@ -4330,7 +4330,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
             GGML_LOG_WARN("packed HIP MTP3 async input requires HIP input batching and dual-pinned handoff\n");
         }
     }
-    if (mapped_hip_input && strcmp(mapped_hip_input, "1") == 0) {
+    if (cuda_hip && mapped_hip_input && strcmp(mapped_hip_input, "1") == 0) {
         sched->mapped_hip_input = sched->async_hip_input;
         if (!sched->mapped_hip_input) {
             GGML_LOG_WARN("packed HIP MTP3 mapped input requires async HIP input, batching and dual-pinned handoff\n");
