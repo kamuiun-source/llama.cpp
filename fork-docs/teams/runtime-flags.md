@@ -35,6 +35,9 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `GGML_VK_MTP_ROUTED_GATE_UP_PAIR` | `0` | IQ2_S・IQ3_XXSの2位置重み共有。dispatch削減を確認したがウォーム後のDecode速度が低下。 |
 | `LLAMA_MTP_DRAFT_VOCAB` | 未設定 | 語彙縮小。日本語では受理率を維持し、コードでは受理率低下とDecode時間増加。 |
 | `LLAMA_MTP_DRAFT_VOCAB_REQUEST=1` | 未設定 | 固定3幅の検証ブランチ専用。会話からドラフト語彙を追加する。試作の5問では生成速度が低下。ベース語彙は `LLAMA_MTP_DRAFT_VOCAB_PREFIX` で指定。[計測](../research/mtp3-efficiency-20261125.md#固定5問の実機比較) |
+| `LLAMA_MTP_FIXED3_TARGET_GPU_GREEDY=1` | 未設定 | CUDA上の本体検証3位置でgreedy選択し、対象リクエストの全語彙logitのD2Hを省く。[計測](../research/mtp3-efficiency-20261125.md#本体gpu-greedyの初回測定) |
+| `GGML_CUDA_HC_DOWN_SPLIT_K=1` | 未設定 | CUDA Adaの3位置・Q8_0 HC downを4分割。[計測](../research/mtp3-efficiency-20261125.md#q8_0-hc-down-split-kの初回測定) |
+| `LLAMA_EXPERT_HIP_NEXT_ROUTER_YALIS=/path/to/table.bin` | 未設定 | 固定3幅の次層Expert先読みに校正済みスコア補正を加える。テーブル生成は別プロセスで `LLAMA_EXPERT_HIP_NEXT_ROUTER_CALIBRATE=/path/to/table.bin` を使う。 |
 | `LLAMA_EXPERT_RTX_COLD_SLOTS` | 未設定 | RTXへの非駐Expert分担は保留。 |
 | `GGML_CUDA_HC_MIX_FUSE`、`GGML_CUDA_HC_SCALE_SILU_FUSE`、`GGML_CUDA_HC_UP_PAIR` | 未設定 | 旧HC実験。採用済みのdown/up/injectと区別する。 |
 
