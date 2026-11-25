@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- `codex/rocm-rtx-mapped-input` でRTX→MI50の活性値をCUDAカーネルから共有RAMへ書く試作。固定3幅・Split-K採用設定の5問でCUDA D2Hを各26,208件省略、出力・MTP689/1,086が保存済み基準と一致。CUDA側読み出し0.546→0.412 ms/検証、生成48.96→49.19 tok/s。既定OFF。[試作と実測](../rocm/10-decode-pipeline.md#共有ramへのrtx側直接書き込み)
+
 - 固定3幅のRTX HC down Split-Kを `codex/rocm-integrated-test` の通常Docker起動に採用。固定5問の512上限ABABで46.54→48.96 tok/s。FP32の丸め差により文言・MTP採用数が変わり得る点を起動資料に記載。[採用結果](../rocm/10-decode-pipeline.md#rtxのhc-down-split-kの採用)
 
 - 2026-11-25に `codex/rocm-castagna-port` の `74f3efc85` までを `codex/rocm-integrated-test` に統合した。固定3幅の通常起動は[採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)を参照。RTXのQKV/gate結合は既定OFF。
