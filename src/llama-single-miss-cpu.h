@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -18,9 +19,12 @@ inline bool llama_single_miss_cpu_configured() {
 
 struct llama_single_miss_cpu {
     static constexpr int width = 2560, inner = 640, tokens = 3, ranks = 10;
-    size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0;
-    size_t joined = 0, waited = 0, cancelled = 0, outstanding_at_mi50 = 0;
-    int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0;
+    struct stats {
+        size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0;
+        size_t joined = 0, waited = 0, cancelled = 0, outstanding_at_mi50 = 0;
+        int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0;
+    };
+    stats modes[5];
 
     ~llama_single_miss_cpu() {
         drain();
@@ -28,9 +32,11 @@ struct llama_single_miss_cpu {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
-        if (worker.joinable()) {
-            worker.join();
+        for (size_t i = 0; i < workers.size(); ++i) {
+            wake[i].notify_one();
+            if (workers[i].joinable()) {
+                workers[i].join();
+            }
         }
     }
 
@@ -47,32 +53,33 @@ struct llama_single_miss_cpu {
         const bool must_wait = !done;
         changed.wait(lock, [&] { return done; });
         pending = false;
-        compute_us += completed_us - started_us;
-        queue_us += started_us - queued_us;
+        auto & totals = modes[n_workers];
+        totals.compute_us += completed_us - started_us;
+        totals.queue_us += started_us - queued_us;
         if (mi50_done_us) {
-            ++joined;
+            ++totals.joined;
             if (completed_us > mi50_done_us) {
-                ++outstanding_at_mi50;
-                remaining_after_mi50_us += completed_us - mi50_done_us;
+                ++totals.outstanding_at_mi50;
+                totals.remaining_after_mi50_us += completed_us - mi50_done_us;
             }
             if (must_wait) {
-                ++waited;
-                join_us += ggml_time_us() - join_start;
+                ++totals.waited;
+                totals.join_us += ggml_time_us() - join_start;
             }
         } else {
-            ++cancelled;
+            ++totals.cancelled;
         }
         return weighted.data();
     }
 
-    bool enqueue(const std::array<const ggml_tensor *, 3> & planes, int host_slot, int expert,
+    bool enqueue(int threads, const std::array<const ggml_tensor *, 3> & planes, int host_slot, int expert,
             const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask) {
         using get_traits_t = const ggml_type_traits_cpu * (*)(ggml_type);
         static const auto get_traits = []() -> get_traits_t {
             const auto reg = ggml_backend_reg_by_name("CPU");
             return reg ? reinterpret_cast<get_traits_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_get_single_miss_traits")) : nullptr;
         }();
-        if (!get_traits || host_slot < 0) {
+        if (!get_traits || host_slot < 0 || (threads != 1 && threads != 2 && threads != 4)) {
             return false;
         }
         work_plane plane_data[3];
@@ -115,11 +122,13 @@ struct llama_single_miss_cpu {
             if (pending) {
                 return false;
             }
-            if (!worker.joinable()) {
-                try {
-                    worker = std::thread([this] { loop(); });
-                } catch (const std::system_error &) {
-                    return false;
+            for (int i = 0; i < threads; ++i) {
+                if (!workers[i].joinable()) {
+                    try {
+                        workers[i] = std::thread([this, i] { loop(i); });
+                    } catch (const std::system_error &) {
+                        return false;
+                    }
                 }
             }
             std::memcpy(work, plane_data, sizeof(work));
@@ -131,10 +140,17 @@ struct llama_single_miss_cpu {
             }
             active_mask = mask;
             queued_us = ggml_time_us();
-            pending = queued = true;
+            n_workers = threads;
+            joined_workers = gated_workers = 0;
+            pending = true;
             done = false;
+            started_us = 0;
+            completed_us = 0;
+            ++generation;
         }
-        changed.notify_one();
+        for (int i = 0; i < threads; ++i) {
+            wake[i].notify_one();
+        }
         return true;
     }
 
@@ -147,32 +163,93 @@ private:
         ggml_vec_dot_t dot;
     };
     work_plane work[3];
-    std::array<float, width * tokens> input, weighted;
+    std::array<float, width * tokens> input;
+    alignas(64) std::array<float, width * tokens> weighted;
     float weights[tokens];
     unsigned active_mask = 0;
     std::mutex mutex;
     std::condition_variable changed;
-    std::thread worker;
-    bool pending = false, queued = false, done = false, stopping = false;
+    std::array<std::condition_variable, 4> wake;
+    std::condition_variable gates_ready;
+    std::array<std::thread, 4> workers;
+    alignas(64) std::array<std::array<float, inner>, tokens> gated;
+    bool pending = false, done = false, stopping = false;
+    uint64_t generation = 0;
+    int n_workers = 0, joined_workers = 0, gated_workers = 0;
     int64_t queued_us = 0, started_us = 0, completed_us = 0;
 
-    void loop() {
+    void loop(int index) {
+        uint64_t previous = 0;
         std::unique_lock<std::mutex> lock(mutex);
         for (;;) {
-            changed.wait(lock, [&] { return queued || stopping; });
+            wake[index].wait(lock, [&] {
+                return stopping || (pending && index < n_workers && generation != previous);
+            });
             if (stopping) {
                 return;
             }
-            queued = false;
+            previous = generation;
+            if (started_us == 0) {
+                started_us = ggml_time_us();
+            }
             lock.unlock();
-            const int64_t start = ggml_time_us();
-            compute();
+            if (n_workers == 1) {
+                compute();
+            } else {
+                compute_parallel(index);
+            }
             const int64_t end = ggml_time_us();
             lock.lock();
-            started_us = start;
-            completed_us = end;
-            done = true;
-            changed.notify_all();
+            completed_us = std::max(completed_us, end);
+            if (++joined_workers == n_workers) {
+                done = true;
+                changed.notify_one();
+            }
+        }
+    }
+
+    void compute_parallel(int index) {
+        const auto run = [&](int plane, const float * values, float * output) {
+            const auto & w = work[plane];
+            alignas(64) char quantized[4096];
+            w.quantize(values, quantized, w.cols);
+            const int begin = index * w.rows / n_workers;
+            const int end = (index + 1) * w.rows / n_workers;
+            for (int r = begin; r < end; ++r) {
+                w.dot(w.cols, output + r, 0, w.data + r*w.stride, 0, quantized, 0, 1);
+            }
+        };
+        const int gate_begin = index * inner / n_workers;
+        const int gate_end = (index + 1) * inner / n_workers;
+        for (int t = 0; t < tokens; ++t) {
+            if (active_mask & (1u << t)) {
+                std::array<float, inner> up;
+                auto & gate = gated[t];
+                run(0, input.data() + t*width, gate.data());
+                run(1, input.data() + t*width, up.data());
+                for (int j = gate_begin; j < gate_end; ++j) {
+                    gate[j] = (gate[j] / (1.0f + std::exp(-gate[j]))) * up[j];
+                }
+            }
+        }
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (++gated_workers == n_workers) {
+                gates_ready.notify_all();
+            } else {
+                gates_ready.wait(lock, [&] { return gated_workers == n_workers; });
+            }
+        }
+        const int down_begin = index * width / n_workers;
+        const int down_end = (index + 1) * width / n_workers;
+        for (int t = 0; t < tokens; ++t) {
+            if (active_mask & (1u << t)) {
+                auto * out = weighted.data() + t*width;
+                run(2, gated[t].data(), out);
+                for (int j = down_begin; j < down_end; ++j) {
+                    out[j] *= weights[t];
+                }
+            }
         }
     }
 

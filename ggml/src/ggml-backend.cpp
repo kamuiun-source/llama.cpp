@@ -1335,10 +1335,12 @@ struct ggml_backend_sched_single_miss {
     unsigned mask = 0;
 };
 
-static std::atomic<bool> hip_single_miss_cpu_enabled{false};
+static std::atomic<int> hip_single_miss_cpu_threads{0};
 
-void ggml_backend_sched_set_hip_single_miss_cpu(bool enabled) {
-    hip_single_miss_cpu_enabled.store(enabled, std::memory_order_relaxed);
+void ggml_backend_sched_set_hip_single_miss_cpu(int threads) {
+    if (threads == 0 || threads == 1 || threads == 2 || threads == 4) {
+        hip_single_miss_cpu_threads.store(threads, std::memory_order_relaxed);
+    }
 }
 
 using ggml_backend_cuda_get_shared_input_t = bool (*)(ggml_backend_t, const ggml_tensor * const *,
@@ -3773,7 +3775,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
                 async_input, false, mtp4_input, false, mirrored >= 0 ? sizes[mirrored] : 0);
     }
     if (mirrored >= 0 && host_copies && sched->target_mtp_verify_three &&
-            hip_single_miss_cpu_enabled.load(std::memory_order_relaxed) &&
+            hip_single_miss_cpu_threads.load(std::memory_order_relaxed) &&
             sizes[mirrored] == 2560 * 3 * sizeof(float) && offsets[mirrored] == 0 &&
             srcs[mirrored]->type == GGML_TYPE_F32 && srcs[mirrored]->ne[0] == 2560 && ggml_is_contiguous(srcs[mirrored])) {
         host_copies->single_miss_activation = reinterpret_cast<const float *>(mapped_input.data);
@@ -4147,17 +4149,18 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
     return true;
 }
 
-bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, const float ** activation, const float ** weights) {
-    if (!sched || !hip_single_miss_cpu_enabled.load(std::memory_order_relaxed) || !sched->active_single_miss ||
+int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, const float ** activation, const float ** weights) {
+    const int threads = hip_single_miss_cpu_threads.load(std::memory_order_relaxed);
+    if (!sched || !threads || !sched->active_single_miss ||
             !sched->async_hip_return || !sched->target_mtp_verify_three || sched->target_mtp_verify_four ||
             sched->profile.enabled || sched->callback_eval || sched->n_copies != 1) {
-        return false;
+        return 0;
     }
     const auto * copies = sched->active_host_copies;
     const auto * split = sched->active_copy_split;
     if (!copies || !copies->single_miss_activation || !copies->single_miss_weights_dst || !split ||
             split->has_custom || split + 1 == sched->splits + sched->n_splits || sched->active_single_miss->resolve) {
-        return false;
+        return 0;
     }
 
     const ggml_tensor * matmuls[3] = {};
@@ -4168,7 +4171,7 @@ bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, c
         const auto * node = split->graph.nodes[i];
         if (node->op == GGML_OP_MUL_MAT_ID) {
             if (count == 3) {
-                return false;
+                return 0;
             }
             matmuls[count++] = node;
         } else if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU) {
@@ -4191,12 +4194,12 @@ bool ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, c
             !((glu->src[0] == matmuls[0] && glu->src[1] == matmuls[1]) ||
               (glu->src[0] == matmuls[1] && glu->src[1] == matmuls[0])) ||
             !ggml_backend_sched_prepare_hip_return(sched, pending, routed, sched->splits[split - sched->splits + 1], false)) {
-        return false;
+        return 0;
     }
 
     *activation = copies->single_miss_activation;
     *weights = copies->single_miss_weights;
-    return true;
+    return threads;
 }
 
 void ggml_backend_sched_set_hip_single_miss_result(ggml_backend_sched_t sched,
