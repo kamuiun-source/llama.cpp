@@ -16,7 +16,7 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `GGML_CUDA_HC_DOWN_SPLIT_K=1` はRTXの固定3位置・Q8_0 HC downで採用。4分割した部分和のFP32加算順が変わり、丸め差で温度0でも出力文言・MTP採用数が変動し得る。従来経路との比較時は `0` を指定する。[採用結果](../rocm/10-decode-pipeline.md#rtxのhc-down-split-kの採用)
 
-`GGML_SCHED_HIP_MAPPED_INPUT=1` は `codex/rocm-rtx-mapped-input` の試作専用。既定OFF。固定3幅で、非同期HIP入力と共有ピン留めを維持し、活性値のCUDA D2Hだけ省く。[試作と実測](../rocm/10-decode-pipeline.md#共有ramへのrtx側直接書き込み)
+`codex/rocm-rtx-mapped-input` では、固定3幅のRTX→MI50活性値を `GGML_SCHED_HIP_ASYNC_INPUT=1` と共有ピン留め・一括転送の設定で自動的に共有RAMへ書き込む。試作専用の `GGML_SCHED_HIP_MAPPED_INPUT` は廃止。[試作と実測](../rocm/10-decode-pipeline.md#共有ramへのrtx側直接書き込み)
 
 ## Windows Vulkan・高速固定3幅の採用設定
 
