@@ -2581,6 +2581,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify,
                           llama_mtp_draft_row draft_row) {
+    if (prefill && sched) {
+        ggml_backend_sched_hip_verify_stage_poll_flush(sched.get());
+    }
     discard_mtp_first_draft_row();
     const bool tracked_draft = draft_row != llama_mtp_draft_row::normal;
     mtp_draft_row_stats.candidates += tracked_draft;

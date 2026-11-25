@@ -1378,13 +1378,15 @@ struct ggml_backend_hip_verify_trace {
     };
 
     const char * path;
+    const std::string flush_path;
     std::vector<std::string> backend_names;
     row * rows = new (std::nothrow) row[capacity]{};
     size_t count = 0;
     size_t dropped = 0;
+    size_t flushed = 0;
     uint64_t graphs = 0;
 
-    explicit ggml_backend_hip_verify_trace(const char * path) : path(path) {}
+    explicit ggml_backend_hip_verify_trace(const char * path) : path(path), flush_path(std::string(path) + ".flush") {}
 
     void record(uint64_t graph, int split, int backend, const char * stage, int64_t start, int64_t end) {
         if (start == end) {
@@ -4578,34 +4580,58 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+static bool ggml_backend_sched_hip_verify_stage_flush(ggml_backend_sched_t sched) {
+    auto * trace = sched->hip_verify_trace;
+    if (trace->count) {
+        FILE * file = fopen(trace->path, "a");
+        if (!file) {
+            GGML_LOG_WARN("HIP verify stage trace: could not open %s\n", trace->path);
+            return false;
+        }
+        if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0) {
+            fputs("scheduler,graph,split,backend,stage,start_us,end_us\n", file);
+        }
+        for (size_t i = 0; i < trace->count; ++i) {
+            const auto & row = trace->rows[i];
+            const char * backend = row.backend < 0 ? "host" : trace->backend_names[row.backend].c_str();
+            fprintf(file, "%p,%llu,%d,%s,%s,%lld,%lld\n", (void *) sched,
+                    (unsigned long long) row.graph, row.split, backend, row.stage,
+                    (long long) row.start_us, (long long) row.end_us);
+        }
+        const bool failed = ferror(file);
+        if (fclose(file) != 0 || failed) {
+            GGML_LOG_WARN("HIP verify stage trace: incomplete write to %s\n", trace->path);
+            return false;
+        }
+        trace->flushed += trace->count;
+        trace->count = 0;
+    }
+    GGML_LOG_INFO("HIP verify stage trace: graphs=%llu rows=%zu dropped=%zu path=%s\n",
+            (unsigned long long) trace->graphs, trace->flushed, trace->dropped, trace->path);
+    return true;
+}
+
+void ggml_backend_sched_hip_verify_stage_poll_flush(ggml_backend_sched_t sched) {
+    auto * trace = sched->hip_verify_trace;
+    if (!trace || !trace->count) {
+        return;
+    }
+    FILE * request = fopen(trace->flush_path.c_str(), "rb");
+    if (!request) {
+        return;
+    }
+    fclose(request);
+    if (ggml_backend_sched_hip_verify_stage_flush(sched) && remove(trace->flush_path.c_str()) != 0) {
+        GGML_LOG_WARN("HIP verify stage trace: could not remove %s\n", trace->flush_path.c_str());
+    }
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
     if (auto * trace = sched->hip_verify_trace) {
-        if (trace->count) {
-            FILE * file = fopen(trace->path, "a");
-            if (file) {
-                if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0) {
-                    fputs("scheduler,graph,split,backend,stage,start_us,end_us\n", file);
-                }
-                for (size_t i = 0; i < trace->count; ++i) {
-                    const auto & row = trace->rows[i];
-                    const char * backend = row.backend < 0 ? "host" : trace->backend_names[row.backend].c_str();
-                    fprintf(file, "%p,%llu,%d,%s,%s,%lld,%lld\n", (void *) sched,
-                            (unsigned long long) row.graph, row.split, backend, row.stage,
-                            (long long) row.start_us, (long long) row.end_us);
-                }
-                const bool failed = ferror(file);
-                if (fclose(file) != 0 || failed) {
-                    GGML_LOG_WARN("HIP verify stage trace: incomplete write to %s\n", trace->path);
-                }
-            } else {
-                GGML_LOG_WARN("HIP verify stage trace: could not open %s\n", trace->path);
-            }
-        }
-        GGML_LOG_INFO("HIP verify stage trace: graphs=%llu rows=%zu dropped=%zu path=%s\n",
-                (unsigned long long) trace->graphs, trace->count, trace->dropped, trace->path);
+        ggml_backend_sched_hip_verify_stage_flush(sched);
         delete trace;
     }
     if (sched->shared_input_pending) {
