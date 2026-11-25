@@ -747,7 +747,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 
 ### 固定3幅の起動フラグ一覧
 
-`codex/rocm-castagna-port` のDocker起動時に `-e 変数名=値` で渡す。値を変えるときは新しい環境変数で `llama-server` を再起動する。Expert直接DMAなどの共通設定は、上の「単一バンク・固定3幅の採用設定」を使う。LinuxではExpert直接DMA時にRAM原本を自動でページ固定する。Dockerを直接起動するときは `--ulimit memlock=22548578304:22548578304` を加える。
+`codex/rocm-integrated-test` のDocker起動時に `-e 変数名=値` で渡す。値を変えるときは新しい環境変数で `llama-server` を再起動する。Expert直接DMAなどの共通設定は、上の「単一バンク・固定3幅の採用設定」を使う。LinuxではExpert直接DMA時にRAM原本を自動でページ固定する。Dockerを直接起動するときは `--ulimit memlock=22548578304:22548578304` を加える。
 
 | 項目 | 環境変数 | 通常起動 | 全項目試験 | 個別OFF |
 | --- | --- | ---: | ---: | ---: |
