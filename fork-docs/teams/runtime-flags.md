@@ -74,3 +74,5 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 `SINGLE_MISS_CPU=2-shared`・`SINGLE_MISS_CPU=4-shared` ではgate/upとdownの量子化済み入力をワーカー間で共有する。共有OFFの比較値は `2`・`4`。2ワーカーで合流待ちは短縮、4ワーカーでは同程度。共有は既定OFF。[共有版の計測](../rocm/09-single-bank-mtp3.md#gateupとdownの量子化済み入力を共有する試作)
 
 `SINGLE_MISS_CPU=4-shared-pair` は実ミス1件を4ワーカー、2件を2＋2ワーカーで処理する。両方でgate/upとdownの量子化共有を使い、3件以上は通常DMA。3回の起動直後を除く合算は58.94 tok/s。試作は既定OFF。[2＋2ワーカー試作](../rocm/09-single-bank-mtp3.md#実ミス2件を2ワーカーずつで処理する試作)
+
+`SINGLE_MISS_CPU=4-shared-hybrid` は同じ1・2件経路に加え、3件以上の層で選択位置数が少ない2件をCPUへ、残りをMI50へ送る。量子化共有は有効。起動直後を除く3回合算は59.01 tok/s。既定OFF。[ハイブリッド試作](../rocm/09-single-bank-mtp3.md#実ミス3件以上で2件をcpu残りをmi50で処理する試作)

@@ -21,12 +21,23 @@ struct llama_single_miss_cpu {
     static constexpr int width = 2560, inner = 640, tokens = 3, ranks = 10;
     struct stats {
         size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0, quant_calls = 0, experts = 0;
+        size_t planned_gpu_uploads = 0, planned_gpu_bytes = 0;
         size_t joined = 0, waited = 0, cancelled = 0, outstanding_at_mi50 = 0;
         int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0, pair_merge_us = 0;
     };
     static constexpr int pair_mode = 9;
     static constexpr int pair_stats = 10;
-    stats modes[11];
+    static constexpr int hybrid_mode = 11;
+    static constexpr int hybrid_pair_stats = 12;
+    static constexpr int hybrid_multi_stats = 13;
+    stats modes[14];
+
+    static int stats_mode(int mode, int actual_misses) {
+        if (mode == hybrid_mode) {
+            return actual_misses == 1 ? hybrid_mode : actual_misses == 2 ? hybrid_pair_stats : hybrid_multi_stats;
+        }
+        return mode == pair_mode && actual_misses == 2 ? pair_stats : mode;
+    }
 
     static int thread_count(int mode) {
         return mode >= pair_mode ? 4 : mode > 4 ? mode - 4 : mode;
@@ -112,9 +123,15 @@ struct llama_single_miss_cpu {
     }
 
     bool enqueue(int mode, const std::array<const ggml_tensor *, 3> & planes, const int32_t * host_slots, const int32_t * experts,
-            int n_experts, const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask) {
-        if (n_experts < 1 || n_experts > 2 ||
-                (n_experts == 2 && (mode != pair_mode || host_slots[0] == host_slots[1] || experts[0] == experts[1]))) {
+            int n_experts, const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask,
+            int actual_misses = 0) {
+        if (actual_misses == 0) {
+            actual_misses = n_experts;
+        }
+        if (n_experts < 1 || n_experts > 2 || actual_misses < n_experts ||
+                (actual_misses > n_experts && (mode != hybrid_mode || n_experts != 2)) ||
+                (n_experts == 2 && ((mode != pair_mode && mode != hybrid_mode) ||
+                    host_slots[0] == host_slots[1] || experts[0] == experts[1]))) {
             return false;
         }
         using get_traits_t = const ggml_type_traits_cpu * (*)(ggml_type);
@@ -123,7 +140,7 @@ struct llama_single_miss_cpu {
             return reg ? reinterpret_cast<get_traits_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_get_single_miss_traits")) : nullptr;
         }();
         const int threads = thread_count(mode);
-        if (!get_traits || (mode != 1 && mode != 2 && mode != 4 && mode != 6 && mode != 8 && mode != pair_mode)) {
+        if (!get_traits || (mode != 1 && mode != 2 && mode != 4 && mode != 6 && mode != 8 && mode != pair_mode && mode != hybrid_mode)) {
             return false;
         }
         work_plane plane_data[3];
@@ -205,7 +222,7 @@ struct llama_single_miss_cpu {
             queued_us = ggml_time_us();
             n_workers = threads;
             n_teams = n_experts;
-            active_mode = n_experts == 2 ? pair_stats : mode;
+            active_mode = stats_mode(mode, actual_misses);
             share_quantized = mode > 4;
             joined_workers = 0;
             pending = true;

@@ -15,7 +15,7 @@ inline void server_refresh_single_miss_cpu_mode(llama_context * target, llama_co
         return;
     }
     std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
-    char buffer[32];
+    char buffer[64];
     input.read(buffer, sizeof(buffer));
     std::string_view mode(buffer, input.gcount());
     if (!mode.empty() && mode.back() == '\n') {
@@ -29,7 +29,7 @@ inline void server_refresh_single_miss_cpu_mode(llama_context * target, llama_co
     const int requested = mode == "SINGLE_MISS_CPU=off" ? 0 : mode == "SINGLE_MISS_CPU=on" ? 1 :
             mode == "SINGLE_MISS_CPU=2" ? 2 : mode == "SINGLE_MISS_CPU=4" ? 4 :
             mode == "SINGLE_MISS_CPU=2-shared" ? 6 : mode == "SINGLE_MISS_CPU=4-shared" ? 8 :
-            mode == "SINGLE_MISS_CPU=4-shared-pair" ? 9 : -1;
+            mode == "SINGLE_MISS_CPU=4-shared-pair" ? 9 : mode == "SINGLE_MISS_CPU=4-shared-hybrid" ? 11 : -1;
     if (!input.eof() || input.bad() || requested < 0) {
         if (!invalid) {
             LOG_WRN("invalid HIP single CPU miss mode file: %s\n", path);

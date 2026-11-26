@@ -1338,7 +1338,7 @@ struct ggml_backend_sched_single_miss {
 static std::atomic<int> hip_single_miss_cpu_mode{0};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
-    if (mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 8 || mode == 9) {
+    if (mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 8 || mode == 9 || mode == 11) {
         hip_single_miss_cpu_mode.store(mode, std::memory_order_relaxed);
     }
 }
@@ -4147,6 +4147,10 @@ static bool ggml_backend_sched_prepare_hip_return(ggml_backend_sched_t sched, gg
     pending.enqueue_end_us = 0;
     pending.mapped = false;
     return true;
+}
+
+int ggml_backend_sched_get_hip_single_miss_cpu_mode(void) {
+    return hip_single_miss_cpu_mode.load(std::memory_order_relaxed);
 }
 
 int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched, const float ** activation, const float ** weights) {
