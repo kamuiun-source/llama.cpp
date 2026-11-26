@@ -10,6 +10,8 @@
 
 - ROCmの通常実行・GPU別の処理時間・直近の比較結果は [最新計測サマリ](../rocm/latest-performance.md) を参照する。計測完了時に該当項目を更新する。
 
+- `codex/rocm-integrated-test` の `cde1afc09` から `codex/rocm-mtp3-catchup-first-draft` を作成。固定3幅・2候補で、確定したcatch-upだけを次の第1候補の入力とまとめる。試作 `4336cdca7` は既定OFF。固定5問の各2回で生成56.60→60.85 tok/s、ドラフト＋catch-up 6.39→5.60 ms/検証。診断で採用0・1・2件のドラフトKV位置を確認。ONの第5問1回は43トークンで早期EOS。[条件、計測と調査](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
+
 - packed ExpertのCPU並列計算と量子化共有を `codex/rocm-integrated-test` に統合。固定3幅の通常起動は `SINGLE_MISS_CPU=on`。物理コア数でCPUへ回す最大件数を決め、ほかのミスはMI50へ送る。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
 
 - 統合版 `403378601` から `codex/rocm-single-miss-cpu` を作成。固定3幅で、常駐・仮置き・先読みを除いた実ミスが1 Expertだけの層をCPUで処理する。固定5問のOFF→ON→OFFは51.36→56.02→56.78 tok/s。ONで2,186件・4.14 GiBのExpertアップロードを回避した。再実行OFFに比べH2D完了待ちが1.00 ms/検証短縮し、本体検証が1.03 ms/回増加。スワップアウトは全条件0。既定OFF。[試作と計測](../rocm/09-single-bank-mtp3.md#実ミス1件のexpertをcpuで計算する試作)
