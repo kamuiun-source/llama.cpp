@@ -43,6 +43,7 @@ MI50のカーネル表は同時トレースの部分集計。GPU活動の表に�
 
 ## 最新の比較試作
 
+- **固定3幅catch-upの履歴行をKV更新だけにする試作（既定OFF）。** `codex/rocm-mtp3-catchup-kv-only` の `f2519c395`。採用済みのcatch-up統合は両条件でON、固定5問をON/OFF各2回。生成58.98→59.63 tok/s、ドラフト4.77→4.60 ms/検証、MTP採用1,403/2,266→1,370/2,254。最後のOFFが最高速。全20応答が自然に完結し、QSAのプール完成と棄却後の再構成を別の診断実行で確認した。[試作と比較](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
 - **固定3幅のcatch-up＋第1候補の統合（通常起動ON）。** `codex/rocm-mtp3-catchup-first-draft` の `4336cdca7`。会話KV再利用、生成上限512、4K、device-pending有効の5問を同一サーバーでON/OFF各2回。生成57.55→60.20 tok/s（+4.6%）、ドラフト＋catch-up 6.03→5.20 ms/検証、MTP採用1,459/2,324→1,395/2,194。第5問は4回とも自然なEOSで、2K・上限128の試行で起きた43トークンの途中EOSは再現しなかった。以前の診断では両候補棄却後と第1候補だけ採用した場合のドラフトKV末尾を照合した。[手法・計測・出力](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
   統合後の採用設定で5問を1回再計測し、全5問合算58.61 tok/s、第2〜5問合算61.36 tok/s。ドラフト＋catch-upは5.43 ms/検証。全5問が自然に完結し、スワップアウト0。[統合後の確認](../research/mtp3-efficiency-20261125.md#統合後の通常起動確認)
 - **MI50→RTXの戻りイベント（不採用、既定OFF）。** 試作ブランチ `codex/rocm-return-ready-event` の修正版 `332bb26fe`。詳細ログ付きでON・OFF各2回。Expert転送待ちが近かったOFF 2回とON 2回目では、戻り待ち8.922→8.859 ms/検証、イベント発行0.048 msを含めると8.907 ms。本体検証32.783→33.499 ms、生成60.15→57.09 tok/s。試作の計測結果は通常実行の基準値とは分けて記録する。[詳細計測](https://github.com/kamuiun-source/llama.cpp/blob/41f275d38/fork-docs/rocm/10-decode-pipeline.md#戻りイベントの詳細ログによるonoff各2回の再計測)

@@ -82,3 +82,5 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_MTP_CATCHUP_FIRST_DRAFT_DIAGNOSTICS` | 未設定 | `1` で検証後のドラフトKV位置と一時行の削除位置を出す。 |
 
 会話のKVを再利用した上限512の比較では、生成57.55→60.20 tok/s、第5問は全4回で自然に完結した。バッチ形状に伴う演算順序や丸めの違いは出力差の候補。出力が分かれた位置のlogitは比較しておらず、原因は未確定。前回の途中EOSも再現しなかった。[通常起動](../rocm/10-decode-pipeline.md#mtpのcatch-upと第1候補をまとめる設定) · [比較結果](../research/mtp3-efficiency-20261125.md#会話kvを維持した512トークン上限の再計測)
+
+試作ブランチ `codex/rocm-mtp3-catchup-kv-only` では、同じモードファイルに `CATCHUP_FIRST_DRAFT=kv-only` を指定すると、catch-upの履歴行をKVとQSAプールの更新に限る。対照は採用済みの `CATCHUP_FIRST_DRAFT=on`。モード間で生成トークンや文面に差が出る。通常起動は `on`。[比較結果](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
