@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-cpu.h"
+#include "llama-single-miss-selection.h"
 
 #include <algorithm>
 #include <array>
@@ -8,7 +9,9 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <system_error>
 #include <thread>
 
@@ -23,25 +26,13 @@ struct llama_single_miss_cpu {
         size_t eligible = 0, applied = 0, positions = 0, avoided_bytes = 0, quant_calls = 0, experts = 0;
         size_t planned_gpu_uploads = 0, planned_gpu_bytes = 0;
         size_t joined = 0, waited = 0, cancelled = 0, outstanding_at_mi50 = 0;
-        int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0, pair_merge_us = 0;
+        int64_t compute_us = 0, queue_us = 0, join_us = 0, remaining_after_mi50_us = 0, merge_us = 0;
     };
-    static constexpr int pair_mode = 9;
-    static constexpr int pair_stats = 10;
-    static constexpr int hybrid_mode = 11;
-    static constexpr int hybrid_pair_stats = 12;
-    static constexpr int hybrid_multi_stats = 13;
-    stats modes[14];
+    static constexpr int max_jobs = llama_single_miss_budget::max_jobs;
+    const llama_single_miss_budget budget;
+    std::array<stats, max_jobs + 1> jobs;
 
-    static int stats_mode(int mode, int actual_misses) {
-        if (mode == hybrid_mode) {
-            return actual_misses == 1 ? hybrid_mode : actual_misses == 2 ? hybrid_pair_stats : hybrid_multi_stats;
-        }
-        return mode == pair_mode && actual_misses == 2 ? pair_stats : mode;
-    }
-
-    static int thread_count(int mode) {
-        return mode >= pair_mode ? 4 : mode > 4 ? mode - 4 : mode;
-    }
+    explicit llama_single_miss_cpu(int physical_cores) : budget{physical_cores} {}
 
     ~llama_single_miss_cpu() {
         drain();
@@ -70,10 +61,10 @@ struct llama_single_miss_cpu {
         const bool must_wait = !done;
         changed.wait(lock, [&] { return done; });
         pending = false;
-        auto & totals = modes[active_mode];
+        auto & totals = jobs[n_teams];
         for (int i = 0; i < n_teams; ++i) {
-            const auto & team = teams[i];
-            const size_t quantizations = share_quantized ? (team.share_gate_up ? 2 : 3) : 3 * n_workers;
+            const auto & team = *teams[i];
+            const size_t quantizations = team.share_gate_up ? 2 : 3;
             for (int t = 0; t < tokens; ++t) {
                 if (team.mask & (1u << t)) {
                     totals.quant_calls += quantizations;
@@ -95,52 +86,51 @@ struct llama_single_miss_cpu {
         } else {
             ++totals.cancelled;
         }
-        if (mi50_done_us && n_teams == 2) {
+        if (mi50_done_us && n_teams > 1) {
             const int64_t merge_start = ggml_time_us();
-            auto & first = teams[0];
-            const auto & second = teams[1];
-            for (int t = 0; t < tokens; ++t) {
-                if (second.mask & (1u << t)) {
-                    auto * dst = first.weighted.data() + t*width;
-                    const auto * rhs = second.weighted.data() + t*width;
-                    if (first.mask & (1u << t)) {
-                        for (int j = 0; j < width; ++j) {
-                            dst[j] += rhs[j];
+            auto & first = *teams[0];
+            unsigned merged = first.mask;
+            for (int i = 1; i < n_teams; ++i) {
+                const auto & next = *teams[i];
+                for (int t = 0; t < tokens; ++t) {
+                    if (next.mask & (1u << t)) {
+                        auto * dst = first.weighted.data() + t*width;
+                        const auto * rhs = next.weighted.data() + t*width;
+                        if (merged & (1u << t)) {
+                            for (int j = 0; j < width; ++j) {
+                                dst[j] += rhs[j];
+                            }
+                        } else {
+                            std::memcpy(dst, rhs, width*sizeof(float));
                         }
-                    } else {
-                        std::memcpy(dst, rhs, width*sizeof(float));
                     }
                 }
+                merged |= next.mask;
             }
-            totals.pair_merge_us += ggml_time_us() - merge_start;
+            totals.merge_us += ggml_time_us() - merge_start;
         }
-        return teams[0].weighted.data();
+        return teams[0]->weighted.data();
     }
 
-    bool enqueue(int mode, const std::array<const ggml_tensor *, 3> & planes, int host_slot, int expert,
-            const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask) {
-        return enqueue(mode, planes, &host_slot, &expert, 1, ids, activation, router_weights, mask);
-    }
-
-    bool enqueue(int mode, const std::array<const ggml_tensor *, 3> & planes, const int32_t * host_slots, const int32_t * experts,
-            int n_experts, const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask,
-            int actual_misses = 0) {
-        if (actual_misses == 0) {
-            actual_misses = n_experts;
-        }
-        if (n_experts < 1 || n_experts > 2 || actual_misses < n_experts ||
-                (actual_misses > n_experts && (mode != hybrid_mode || n_experts != 2)) ||
-                (n_experts == 2 && ((mode != pair_mode && mode != hybrid_mode) ||
-                    host_slots[0] == host_slots[1] || experts[0] == experts[1]))) {
+    bool enqueue(const std::array<const ggml_tensor *, 3> & planes, const int32_t * host_slots, const int32_t * experts,
+            int n_experts, const int32_t * ids, const float * activation, const float * router_weights, unsigned & mask) {
+        if (n_experts < 1 || n_experts > budget.jobs()) {
             return false;
+        }
+        for (int i = 0; i < n_experts; ++i) {
+            for (int j = 0; j < i; ++j) {
+                if (host_slots[i] == host_slots[j] || experts[i] == experts[j]) {
+                    return false;
+                }
+            }
         }
         using get_traits_t = const ggml_type_traits_cpu * (*)(ggml_type);
         static const auto get_traits = []() -> get_traits_t {
             const auto reg = ggml_backend_reg_by_name("CPU");
             return reg ? reinterpret_cast<get_traits_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_get_single_miss_traits")) : nullptr;
         }();
-        const int threads = thread_count(mode);
-        if (!get_traits || (mode != 1 && mode != 2 && mode != 4 && mode != 6 && mode != 8 && mode != pair_mode && mode != hybrid_mode)) {
+        const int threads = budget.workers(n_experts);
+        if (!get_traits) {
             return false;
         }
         work_plane plane_data[3];
@@ -168,8 +158,9 @@ struct llama_single_miss_cpu {
                     traits->vec_dot_type, ggml_row_size(traits->vec_dot_type, w->ne[0])};
         }
 
-        unsigned masks[2] = {};
-        float routes[2][tokens] = {};
+        unsigned masks[max_jobs] = {};
+        unsigned selected_positions = 0;
+        float routes[max_jobs][tokens] = {};
         for (int i = 0; i < n_experts; ++i) {
             for (int t = 0; t < tokens; ++t) {
                 for (int r = 0; r < ranks; ++r) {
@@ -185,12 +176,20 @@ struct llama_single_miss_cpu {
             if (!masks[i]) {
                 return false;
             }
+            selected_positions |= masks[i];
         }
-        mask = masks[0] | masks[1];
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (pending) {
                 return false;
+            }
+            for (int i = 0; i < n_experts; ++i) {
+                if (!teams[i]) {
+                    teams[i].reset(new (std::nothrow) team_state);
+                    if (!teams[i]) {
+                        return false;
+                    }
+                }
             }
             for (int i = 0; i < threads; ++i) {
                 if (!workers[i].joinable()) {
@@ -202,7 +201,7 @@ struct llama_single_miss_cpu {
                 }
             }
             for (int i = 0; i < n_experts; ++i) {
-                auto & team = teams[i];
+                auto & team = *teams[i];
                 for (int p = 0; p < 3; ++p) {
                     team.work[p] = plane_data[p];
                     team.work[p].data += host_slots[i] * planes[p]->nb[2];
@@ -214,6 +213,7 @@ struct llama_single_miss_cpu {
                 team.inputs_ready = team.down_ready = false;
                 team.gated_workers = 0;
             }
+            mask = selected_positions;
             for (int t = 0; t < tokens; ++t) {
                 if (mask & (1u << t)) {
                     std::memcpy(input.data() + t*width, activation + t*width, width*sizeof(float));
@@ -222,8 +222,6 @@ struct llama_single_miss_cpu {
             queued_us = ggml_time_us();
             n_workers = threads;
             n_teams = n_experts;
-            active_mode = stats_mode(mode, actual_misses);
-            share_quantized = mode > 4;
             joined_workers = 0;
             pending = true;
             done = false;
@@ -261,14 +259,12 @@ private:
         bool share_gate_up = false, inputs_ready = false, down_ready = false;
         std::condition_variable gates_ready;
     };
-    team_state teams[2];
+    std::array<std::unique_ptr<team_state>, max_jobs> teams;
     std::array<float, width * tokens> input;
     std::mutex mutex;
     std::condition_variable changed;
-    std::array<std::condition_variable, 4> wake;
-    std::array<std::thread, 4> workers;
-    bool share_quantized = false;
-    int active_mode = 0;
+    std::array<std::condition_variable, 2 * max_jobs> wake;
+    std::array<std::thread, 2 * max_jobs> workers;
     bool pending = false, done = false, stopping = false;
     uint64_t generation = 0;
     int n_workers = 0, n_teams = 0, joined_workers = 0;
@@ -289,12 +285,8 @@ private:
                 started_us = ggml_time_us();
             }
             lock.unlock();
-            if (n_workers == 1) {
-                compute(teams[0]);
-            } else {
-                const int team_size = n_workers / n_teams;
-                compute_parallel(teams[index / team_size], index % team_size, team_size);
-            }
+            const int team_size = n_workers / n_teams;
+            compute_parallel(*teams[index / team_size], index % team_size, team_size);
             const int64_t end = ggml_time_us();
             lock.lock();
             completed_us = std::max(completed_us, end);
@@ -314,15 +306,9 @@ private:
     }
 
     void compute_parallel(team_state & team, int index, int team_size) {
-        const auto run = [&](int plane, int token, const float * values, float * output) {
+        const auto run = [&](int plane, int token, float * output) {
             const auto & w = team.work[plane];
-            alignas(64) char quantized[4096];
-            const char * q = quantized;
-            if (share_quantized) {
-                q = team.shared_input[plane == 1 && team.share_gate_up ? 0 : plane][token].data;
-            } else {
-                w.quantize(values, quantized, w.cols);
-            }
+            const auto * q = team.shared_input[plane == 1 && team.share_gate_up ? 0 : plane][token].data;
             const int begin = index * w.rows / team_size;
             const int end = (index + 1) * w.rows / team_size;
             for (int r = begin; r < end; ++r) {
@@ -330,24 +316,22 @@ private:
             }
         };
 
-        if (share_quantized) {
-            if (index == 0) {
-                for (int t = 0; t < tokens; ++t) {
-                    if (team.mask & (1u << t)) {
-                        const auto * values = input.data() + t*width;
-                        quantize_shared(team, 0, t, values);
-                        if (!team.share_gate_up) {
-                            quantize_shared(team, 1, t, values);
-                        }
+        if (index == 0) {
+            for (int t = 0; t < tokens; ++t) {
+                if (team.mask & (1u << t)) {
+                    const auto * values = input.data() + t*width;
+                    quantize_shared(team, 0, t, values);
+                    if (!team.share_gate_up) {
+                        quantize_shared(team, 1, t, values);
                     }
                 }
-                std::lock_guard<std::mutex> lock(mutex);
-                team.inputs_ready = true;
-                team.gates_ready.notify_all();
-            } else {
-                std::unique_lock<std::mutex> lock(mutex);
-                team.gates_ready.wait(lock, [&] { return team.inputs_ready; });
             }
+            std::lock_guard<std::mutex> lock(mutex);
+            team.inputs_ready = true;
+            team.gates_ready.notify_all();
+        } else {
+            std::unique_lock<std::mutex> lock(mutex);
+            team.gates_ready.wait(lock, [&] { return team.inputs_ready; });
         }
         const int gate_begin = index * inner / team_size;
         const int gate_end = (index + 1) * inner / team_size;
@@ -355,8 +339,8 @@ private:
             if (team.mask & (1u << t)) {
                 std::array<float, inner> up;
                 auto & gate = team.gated[t];
-                run(0, t, input.data() + t*width, gate.data());
-                run(1, t, input.data() + t*width, up.data());
+                run(0, t, gate.data());
+                run(1, t, up.data());
                 for (int j = gate_begin; j < gate_end; ++j) {
                     gate[j] = (gate[j] / (1.0f + std::exp(-gate[j]))) * up[j];
                 }
@@ -365,15 +349,13 @@ private:
         {
             std::unique_lock<std::mutex> lock(mutex);
             if (++team.gated_workers == team_size) {
-                if (share_quantized) {
-                    lock.unlock();
-                    for (int t = 0; t < tokens; ++t) {
-                        if (team.mask & (1u << t)) {
-                            quantize_shared(team, 2, t, team.gated[t].data());
-                        }
+                lock.unlock();
+                for (int t = 0; t < tokens; ++t) {
+                    if (team.mask & (1u << t)) {
+                        quantize_shared(team, 2, t, team.gated[t].data());
                     }
-                    lock.lock();
                 }
+                lock.lock();
                 team.down_ready = true;
                 team.gates_ready.notify_all();
             } else {
@@ -385,7 +367,7 @@ private:
         for (int t = 0; t < tokens; ++t) {
             if (team.mask & (1u << t)) {
                 auto * out = team.weighted.data() + t*width;
-                run(2, t, team.gated[t].data(), out);
+                run(2, t, out);
                 for (int j = down_begin; j < down_end; ++j) {
                     out[j] *= team.weights[t];
                 }
@@ -393,29 +375,4 @@ private:
         }
     }
 
-    void compute(team_state & team) {
-        const auto run = [&](int plane, const float * values, float * output) {
-            const auto & w = team.work[plane];
-            alignas(64) char quantized[4096];
-            w.quantize(values, quantized, w.cols);
-            for (int r = 0; r < w.rows; ++r) {
-                w.dot(w.cols, output + r, 0, w.data + r*w.stride, 0, quantized, 0, 1);
-            }
-        };
-        for (int t = 0; t < tokens; ++t) {
-            if (team.mask & (1u << t)) {
-                std::array<float, inner> gate, up;
-                run(0, input.data() + t*width, gate.data());
-                run(1, input.data() + t*width, up.data());
-                for (int j = 0; j < inner; ++j) {
-                    gate[j] = (gate[j] / (1.0f + std::exp(-gate[j]))) * up[j];
-                }
-                auto * out = team.weighted.data() + t*width;
-                run(2, gate.data(), out);
-                for (int j = 0; j < width; ++j) {
-                    out[j] *= team.weights[t];
-                }
-            }
-        }
-    }
 };

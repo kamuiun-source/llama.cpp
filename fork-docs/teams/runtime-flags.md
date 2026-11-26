@@ -67,12 +67,8 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
 
-### 実ミス1件のCPU処理
+### Packed ExpertのCPU並列計算
 
-`codex/rocm-single-miss-cpu` の試作。サーバー起動時に `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` にモードファイルのパスを渡す。値は `SINGLE_MISS_CPU=off`（既定）・`SINGLE_MISS_CPU=on`（1ワーカー）・`SINGLE_MISS_CPU=2`・`SINGLE_MISS_CPU=4` で、リクエスト間で切り替わる。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ON系では実ミス1件のCPU計算をMI50と重ねる。[ワーカー比較](../rocm/09-single-bank-mtp3.md#実ミス1件を124-cpuワーカーで比較する)
+`codex/rocm-single-miss-cpu` のサーバー起動時に `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` にモードファイルのパスを渡す。値は `SINGLE_MISS_CPU=off`（既定）または `SINGLE_MISS_CPU=on`。リクエスト間で切り替わる。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ONではgate/upとdownの量子化共有を常に使う。使用可能な物理コアから2コア分を残し、実ミス1件なら最大4ワーカー、複数件なら1件あたり2ワーカーを使う。残りは通常のMI50転送。旧試作モードの計測結果は記録に残っている。[自動配分](../rocm/09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
 
-`SINGLE_MISS_CPU=2-shared`・`SINGLE_MISS_CPU=4-shared` ではgate/upとdownの量子化済み入力をワーカー間で共有する。共有OFFの比較値は `2`・`4`。2ワーカーで合流待ちは短縮、4ワーカーでは同程度。共有は既定OFF。[共有版の計測](../rocm/09-single-bank-mtp3.md#gateupとdownの量子化済み入力を共有する試作)
-
-`SINGLE_MISS_CPU=4-shared-pair` は実ミス1件を4ワーカー、2件を2＋2ワーカーで処理する。両方でgate/upとdownの量子化共有を使い、3件以上は通常DMA。3回の起動直後を除く合算は58.94 tok/s。試作は既定OFF。[2＋2ワーカー試作](../rocm/09-single-bank-mtp3.md#実ミス2件を2ワーカーずつで処理する試作)
-
-`SINGLE_MISS_CPU=4-shared-hybrid` は同じ1・2件経路に加え、3件以上の層で選択位置数が少ない2件をCPUへ、残りをMI50へ送る。量子化共有は有効。起動直後を除く3回合算は59.01 tok/s。既定OFF。[ハイブリッド試作](../rocm/09-single-bank-mtp3.md#実ミス3件以上で2件をcpu残りをmi50で処理する試作)
+`--moe-cache-cpu-share F` は通常のMoEキャッシュが満杯になった後、ミスのうちCPUで計算する割合を指定する。packed Expert経路の条件は `F=0`（既定）で、正の値は初期化時に拒否される。

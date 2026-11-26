@@ -8,7 +8,7 @@
 #include "llama-model.h"
 #include "llama-rtx-expert.h"
 #include "llama-single-miss-cpu.h"
-#include "llama-single-miss-selection.h"
+#include "llama-single-miss-topology.h"
 #include "../ggml/src/ggml-backend-mtp.h"
 
 #include "ggml-cpp.h"
@@ -820,7 +820,11 @@ struct llama_moe_cache::impl {
             }
             placement_owner.reset(placement);
             if (placement->hip_single_miss_cpu && model.arch == LLM_ARCH_QWEN4EXP && n_expert_used == 10) {
-                single_miss_cpu = std::make_unique<llama_single_miss_cpu>();
+                const auto cores = llama_single_miss_physical_cores();
+                single_miss_cpu = std::make_unique<llama_single_miss_cpu>(cores);
+                const auto & budget = single_miss_cpu->budget;
+                LLAMA_LOG_INFO("packed HIP MTP3 CPU Expert budget: physical_cores=%d reserved_cores=2 max_jobs=%d single_workers=%d multi_workers=%d\n",
+                        cores, budget.jobs(), budget.jobs() ? budget.workers(1) : 0, budget.workers(budget.jobs()));
             }
             const char * pair_overlap = std::getenv("LLAMA_MTP_PAIR_EXPERT_OVERLAP");
             if (!mtp_verify_three_enabled && n_expert_used == mtp_pair_experts && pair_overlap && std::strcmp(pair_overlap, "1") == 0) {
@@ -3592,20 +3596,18 @@ struct llama_moe_cache::impl {
                 }
             }
             if (l.single_miss_cpu && fixed_three && !use_waves && !early && !profile && sched) {
-                const int mode = ggml_backend_sched_get_hip_single_miss_cpu_mode();
-                const bool hybrid = mode == llama_single_miss_cpu::hybrid_mode;
-                const auto selection = mode ? llama_select_cpu_expert_misses(ids.data(), hybrid, [&](int32_t id) {
+                const auto & budget = single_miss_cpu->budget;
+                const bool enabled = budget.jobs() > 0 && ggml_backend_sched_get_hip_single_miss_cpu_mode();
+                const auto selection = enabled ? llama_select_cpu_expert_misses(ids.data(), [&](int32_t id) {
                     return slots[id] < 0 && next_prefetch_slot(il, id) < 0;
                 }) : llama_single_miss_selection{};
                 const int n_misses = selection.actual;
                 const float * activation;
                 const float * router_weights;
-                const bool eligible = n_misses == 1 || (n_misses == 2 && mode == llama_single_miss_cpu::pair_mode) ||
-                        (hybrid && n_misses > 0);
-                if (eligible && ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights) == mode) {
-                    const auto & experts = hybrid ? selection.fewest : selection.first;
-                    const int n_cpu = std::min(n_misses, 2);
-                    auto & totals = single_miss_cpu->modes[llama_single_miss_cpu::stats_mode(mode, n_misses)];
+                if (n_misses > 0 && ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights)) {
+                    const auto & experts = selection.ids;
+                    const int n_cpu = std::min(n_misses, budget.jobs());
+                    auto & totals = single_miss_cpu->jobs[n_cpu];
                     ++totals.eligible;
                     std::array<const ggml_tensor *, 3> planes{};
                     for (const auto * w : l.experts) {
@@ -3618,7 +3620,7 @@ struct llama_moe_cache::impl {
                         }
                     }
                     unsigned mask = 0;
-                    std::array<int32_t, 2> host_slots{};
+                    std::array<int32_t, llama_single_miss_budget::max_jobs> host_slots;
                     bool safe = true;
                     // A promotion writes back into the host slot of the selected scratch hit.
                     const int32_t promotion_host_slot = promote_index >= 0 ? map.host[scratch[promote_index]] : -1;
@@ -3626,8 +3628,8 @@ struct llama_moe_cache::impl {
                         host_slots[i] = map.host[experts[i]];
                         safe &= host_slots[i] >= 0 && host_slots[i] != promotion_host_slot;
                     }
-                    if (safe && single_miss_cpu->enqueue(mode, planes, host_slots.data(), experts.data(), n_cpu,
-                            ids.data(), activation, router_weights, mask, n_misses)) {
+                    if (safe && single_miss_cpu->enqueue(planes, host_slots.data(), experts.data(), n_cpu,
+                            ids.data(), activation, router_weights, mask)) {
                         ggml_backend_sched_set_hip_single_miss_result(sched, [](void * worker, int64_t mi50_done_us) {
                             return static_cast<llama_single_miss_cpu *>(worker)->resolve(mi50_done_us);
                         }, single_miss_cpu.get(), mask);
@@ -4214,21 +4216,16 @@ struct llama_moe_cache::impl {
             }
         }
         if (single_miss_cpu) {
-            using cpu_modes = llama_single_miss_cpu;
-            for (const int mode : {1, 2, 4, 6, 8, cpu_modes::pair_mode, cpu_modes::pair_stats,
-                    cpu_modes::hybrid_mode, cpu_modes::hybrid_pair_stats, cpu_modes::hybrid_multi_stats}) {
-                const auto & cpu = single_miss_cpu->modes[mode];
-                LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: threads=%d shared=%d eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f"
+            const auto & budget = single_miss_cpu->budget;
+            for (int n = 1; n <= budget.jobs(); ++n) {
+                const auto & cpu = single_miss_cpu->jobs[n];
+                LLAMA_LOG_INFO("packed HIP MTP3 single CPU miss: jobs=%d threads=%d eligible=%zu applied=%zu positions=%zu avoided_bytes=%zu cpu_ms=%.3f"
                         " queue_ms=%.3f joined=%zu join_waited=%zu join_wait_ms=%.3f pending_at_mi50=%zu remaining_after_mi50_ms=%.3f cancelled=%zu quant_calls=%zu"
-                        " pair_mode=%d misses=%d experts=%zu pair_merge_ms=%.3f hybrid_mode=%d planned_gpu_uploads=%zu planned_gpu_bytes=%zu\n",
-                        llama_single_miss_cpu::thread_count(mode), mode > 4, cpu.eligible, cpu.applied, cpu.positions, cpu.avoided_bytes, cpu.compute_us / 1000.0,
+                        " experts=%zu merge_ms=%.3f planned_gpu_uploads=%zu planned_gpu_bytes=%zu\n",
+                        n, budget.workers(n), cpu.eligible, cpu.applied, cpu.positions, cpu.avoided_bytes, cpu.compute_us / 1000.0,
                         cpu.queue_us / 1000.0, cpu.joined, cpu.waited, cpu.join_us / 1000.0,
                         cpu.outstanding_at_mi50, cpu.remaining_after_mi50_us / 1000.0, cpu.cancelled, cpu.quant_calls,
-                        mode == cpu_modes::pair_mode || mode == cpu_modes::pair_stats,
-                        mode == cpu_modes::hybrid_multi_stats ? 3 :
-                            (mode == cpu_modes::pair_stats || mode == cpu_modes::hybrid_pair_stats ? 2 : 1),
-                        cpu.experts, cpu.pair_merge_us / 1000.0, mode >= cpu_modes::hybrid_mode,
-                        cpu.planned_gpu_uploads, cpu.planned_gpu_bytes);
+                        cpu.experts, cpu.merge_us / 1000.0, cpu.planned_gpu_uploads, cpu.planned_gpu_bytes);
             }
         }
         auto log = [](const char * name, const stats & st) {
