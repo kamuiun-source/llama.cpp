@@ -270,6 +270,26 @@ printf '%s\n' 'SINGLE_MISS_CPU=on' > "$cpu_expert_mode_dir/mode"
 
 Linuxで使える物理コア数から2コア分を残し、6コアなら最大2件、8コアなら最大3件の実ミスを同時にCPUで計算する。残りはMI50へ転送する。比較時はホスト側のmodeを `SINGLE_MISS_CPU=off` にしてリクエスト間で切り替える。通常MoEキャッシュの `--moe-cache-cpu-share` は既定の0を使う。[CPU Expert処理の自動配分](09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
 
+##### MTPのcatch-upと第1候補をまとめる設定
+
+固定3幅・greedyの2候補で使う `llama-server` の通常起動に採用する。ホストでモードファイルを作る。
+
+```bash
+mtp_catchup_mode_dir="$PWD/rocm-mtp-catchup-mode"
+mkdir -p "$mtp_catchup_mode_dir"
+printf '%s\n' 'CATCHUP_FIRST_DRAFT=on' > "$mtp_catchup_mode_dir/mode"
+```
+
+固定3幅のDocker起動オプションに加える。
+
+```bash
+  --mount "type=bind,src=$mtp_catchup_mode_dir,dst=/mtp-catchup-mode,readonly" \
+  -e LLAMA_MTP_FIXED3_DEVICE_PENDING=1 \
+  -e LLAMA_MTP_CATCHUP_FIRST_DRAFT_MODE_FILE=/mtp-catchup-mode/mode \
+```
+
+比較する場合は、サーバーの待機中にモードファイルを `CATCHUP_FIRST_DRAFT=off` に更新する。起動時にモードファイルを指定しない場合はコード既定のOFF。**ON/OFFを変えると、同じ入力・温度0でも生成トークン、回答の文面や長さ、MTP採用数が変わることがある。** 出力を照合する際は両方の設定を同じにする。[フラグと実測](../teams/runtime-flags.md#固定3幅のmtp-catch-upと第1候補)
+
 ##### 共有RAM読み込みを含む固定3幅の通常起動
 
 `codex/rocm-integrated-test` では、上記の固定3幅の設定にShared Expert先行発行を追加する。次層Router予測の後段発行は、既存の非同期HIP入力を使う対象の固定3幅で自動適用する。RTXが活性値を共有RAMに直接書き、MI50のカーネルがVRAMに取り込む経路は、既存の非同期入力と共有ピン留めが利用可能な固定3幅で自動適用する。戻りはMI50が共有RAMに書き、RTXの計算ストリームに非同期H2Dを積む。[併用時の計測](#shared-expert先行発行との併用) · [次層Routerの追加計測](#次層routerのon追加計測と採用)
@@ -1166,6 +1186,8 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | MI50のHIP Graphs無効化 | `GGML_HIP_GFX906_DISABLE_GRAPHS` | `0`（Graphs有効） | `1`（Graphs無効） | `0` |
 
 環境変数を省略した場合は各項目とも個別OFFと同じ。語彙プレフィックスを使うときは、ファイルで語彙を指定する `LLAMA_MTP_DRAFT_VOCAB` を未設定にする。全項目試験でもRTXのCUDA Graphsは有効にする。
+
+モードファイルで実行中に切り替える項目は、[CPU Expertの通常起動](#単一バンク固定3幅の採用設定)と[MTPのcatch-upと第1候補をまとめる設定](#mtpのcatch-upと第1候補をまとめる設定)を参照する。
 
 LDS先読みと出力4行は量子型ごとに独立して切り替える。`IQ2_S` のLDS先読みと出力4行は実3位置が対象。どちらの型も符号復号を有効にし、出力4行には同じ型のLDS先読みも有効にする。`IQ2_S` だけで先読みを試す場合は `GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` にし、IQ3_XXSのLDSフラグ2つは `0` にする。
 

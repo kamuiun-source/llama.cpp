@@ -72,3 +72,13 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 `codex/rocm-integrated-test` の固定3幅の通常起動では `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` に `SINGLE_MISS_CPU=on` を入れたモードファイルを渡す。比較時は `off` にし、リクエスト間で切り替える。変数の未指定時はコード既定OFF。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ONではgate/upとdownの量子化共有を常に使う。使用可能な物理コアから2コア分を残し、実ミス1件なら最大4ワーカー、複数件なら1件あたり2ワーカーを使う。残りは通常のMI50転送。旧試作モードの計測結果は記録に残っている。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定) · [自動配分](../rocm/09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
 
 `--moe-cache-cpu-share F` は通常のMoEキャッシュが満杯になった後、ミスのうちCPUで計算する割合を指定する。packed Expert経路の条件は `F=0`（既定）で、正の値は初期化時に拒否される。
+
+### 固定3幅のMTP catch-upと第1候補
+
+| フラグ | 通常起動 | 説明 |
+| --- | --- | --- |
+| `LLAMA_MTP_CATCHUP_FIRST_DRAFT_MODE_FILE` | `CATCHUP_FIRST_DRAFT=on` を1行で記載したファイルを指定 | 固定3幅・greedyの2候補で、採用済み履歴の反映と次の第1候補の生成をまとめる。`CATCHUP_FIRST_DRAFT=off` でリクエスト間に切り替え可能。ファイル未指定時のコード既定はOFF。**同じ入力・温度0でも、ON/OFFで生成トークン、回答の文面や長さ、MTP採用数が変わり得る。** |
+| `LLAMA_MTP_FIXED3_DEVICE_PENDING` | `1` | 上記の前提。直前の確定位置の隠れ状態をRTX上で受け渡す。ON/OFF比較でも両方を `1` に揃える。 |
+| `LLAMA_MTP_CATCHUP_FIRST_DRAFT_DIAGNOSTICS` | 未設定 | `1` で検証後のドラフトKV位置と一時行の削除位置を出す。 |
+
+会話のKVを再利用した上限512の比較では、生成57.55→60.20 tok/s、第5問は全4回で自然に完結した。バッチ形状に伴う演算順序や丸めの違いは出力差の候補。出力が分かれた位置のlogitは比較しておらず、原因は未確定。前回の途中EOSも再現しなかった。[通常起動](../rocm/10-decode-pipeline.md#mtpのcatch-upと第1候補をまとめる設定) · [比較結果](../research/mtp3-efficiency-20261125.md#会話kvを維持した512トークン上限の再計測)
