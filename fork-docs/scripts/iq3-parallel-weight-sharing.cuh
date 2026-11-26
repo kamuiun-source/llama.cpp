@@ -119,10 +119,11 @@ static __device__ __forceinline__ void project(
     }
 }
 
+template<bool ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
-        const int32_t * ids, const uint32_t * groups, float * out) {
+        const int32_t * ids, const uint32_t * groups, float * out, bool share_weights = true) {
     constexpr int grid_size = sizeof(iq3xxs_grid) / sizeof(iq3xxs_grid[0]);
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
@@ -133,7 +134,7 @@ static __global__ void gate_up(
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
     const uint32_t group = groups[blockIdx.y];
-    const uint32_t shared = group >> shared_shift;
+    const uint32_t shared = !ablation || share_weights ? group >> shared_shift : 0;
     const int rank = int((group >> (token * rank_bits)) & rank_mask) - 1;
     const int row0 = blockIdx.x * rows_per_tile;
     const auto * token_input = reinterpret_cast<const uint32_t *>(activation + token * input_blocks);

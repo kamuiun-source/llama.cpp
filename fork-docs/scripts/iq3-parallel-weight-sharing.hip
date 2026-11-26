@@ -43,7 +43,92 @@ double median(std::vector<double> values) {
     return values.size() % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2.0;
 }
 
-int main() {
+template<typename Kernel>
+int active_blocks(Kernel kernel, int threads, size_t dynamic_lds) {
+    int blocks = 0;
+    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, threads, dynamic_lds));
+    return blocks;
+}
+
+template<typename Baseline, typename Grouped>
+size_t report_ablation_resources(Baseline baseline, Grouped grouped, int threads) {
+    hipFuncAttributes stock{}, prototype{};
+    check(hipFuncGetAttributes(&stock, reinterpret_cast<const void *>(baseline)));
+    check(hipFuncGetAttributes(&prototype, reinterpret_cast<const void *>(grouped)));
+    const int stock_blocks = active_blocks(baseline, threads, 0);
+    const int grouped_blocks = active_blocks(grouped, threads, 0);
+    const size_t same_lds = prototype.sharedSizeBytes > stock.sharedSizeBytes ?
+            prototype.sharedSizeBytes - stock.sharedSizeBytes : 0;
+    size_t padding = same_lds;
+    int padded_blocks = active_blocks(baseline, threads, padding);
+    if (padded_blocks != grouped_blocks) {
+        int device = 0;
+        hipDeviceProp_t properties{};
+        check(hipGetDevice(&device));
+        check(hipGetDeviceProperties(&properties, device));
+        const size_t max_padding = properties.sharedMemPerBlock - stock.sharedSizeBytes;
+        size_t best_distance = max_padding + 1;
+        for (size_t candidate = 256; candidate <= max_padding; candidate += 256) {
+            const size_t distance = candidate > same_lds ? candidate - same_lds : same_lds - candidate;
+            if (distance < best_distance && active_blocks(baseline, threads, candidate) == grouped_blocks) {
+                padding = candidate;
+                padded_blocks = grouped_blocks;
+                best_distance = distance;
+            }
+        }
+    }
+
+    for (int arm = 0; arm < 4; ++arm) {
+        const auto & attrs = arm < 2 ? stock : prototype;
+        const size_t dynamic = arm == 1 ? padding : 0;
+        const int blocks = arm == 0 ? stock_blocks : arm == 1 ? padded_blocks : grouped_blocks;
+        std::printf("ablation_resources arm=%c lds_static=%zu lds_dynamic=%zu lds_total=%zu vgpr_per_thread=%d max_active_blocks_per_cu=%d\n",
+                    'A' + arm, attrs.sharedSizeBytes, dynamic, attrs.sharedSizeBytes + dynamic, attrs.numRegs, blocks);
+    }
+    std::printf("ablation_occupancy padded_matches_grouped=%d\n", padded_blocks == grouped_blocks);
+    return padding;
+}
+
+template<typename Launch>
+void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches) {
+    // Each arm appears once in each position and follows every other arm once per four trials.
+    constexpr int order[4][4] = {{0, 1, 3, 2}, {1, 2, 0, 3}, {2, 3, 1, 0}, {3, 0, 2, 1}};
+    std::array<std::vector<double>, 4> samples;
+    std::vector<double> b_minus_a, c_minus_b, d_minus_c;
+    for (int trial = -warmup; trial < trials; ++trial) {
+        const auto & arms = order[(trial + warmup) % 4];
+        std::array<double, 4> timings{};
+        for (int arm : arms) {
+            timings[arm] = time_batch([&] { launch(arm); }, start, stop, launches);
+        }
+        if (trial < 0) {
+            continue;
+        }
+        for (int arm = 0; arm < 4; ++arm) {
+            samples[arm].push_back(timings[arm]);
+        }
+        b_minus_a.push_back(timings[1] - timings[0]);
+        c_minus_b.push_back(timings[2] - timings[1]);
+        d_minus_c.push_back(timings[3] - timings[2]);
+        std::printf("ablation_sample trial=%d order=%c%c%c%c A_us=%.6f B_us=%.6f C_us=%.6f D_us=%.6f\n",
+                    trial, 'A' + arms[0], 'A' + arms[1], 'A' + arms[2], 'A' + arms[3],
+                    timings[0], timings[1], timings[2], timings[3]);
+    }
+    for (int arm = 0; arm < 4; ++arm) {
+        const auto bounds = std::minmax_element(samples[arm].begin(), samples[arm].end());
+        std::printf("ablation_timing arm=%c samples=%d launches_per_sample=%d median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                    'A' + arm, trials, launches, median(samples[arm]), *bounds.first, *bounds.second);
+    }
+    std::printf("ablation_paired_delta B_minus_A_us=%.6f C_minus_B_us=%.6f D_minus_C_us=%.6f\n",
+                median(b_minus_a), median(c_minus_b), median(d_minus_c));
+}
+
+int main(int argc, char ** argv) {
+    const bool ablation = argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0;
+    if (argc != 1 && !ablation) {
+        std::fprintf(stderr, "usage: %s [--ablate-lds]\n", argv[0]);
+        return 1;
+    }
     constexpr int ncols = 2560, nrows = 640, experts = 30, tokens = 3, ranks = 10;
     constexpr int weight_row_stride = ncols / QK_K;
     constexpr int weight_expert_stride = nrows * weight_row_stride;
@@ -84,7 +169,11 @@ int main() {
     check(hipEventCreate(&event_stop));
     std::printf("timing_config warmup_batches=%d measured_pairs=%d launches_per_batch=%d\n",
                 warmup_batches, measured_pairs, launches_per_batch);
-    for (int multiplicity = 1; multiplicity <= 3; ++multiplicity) {
+    const int first_multiplicity = ablation ? 2 : 1;
+    const int last_multiplicity = ablation ? 2 : 3;
+    const auto baseline = mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>;
+    const auto grouped = iq3_parallel_weights::gate_up<true>;
+    for (int multiplicity = first_multiplicity; multiplicity <= last_multiplicity; ++multiplicity) {
         std::vector<int32_t> ids_host(ranks * tokens);
         for (int t = 0; t < tokens; ++t) {
             for (int rank = 0; rank < ranks; ++rank) {
@@ -103,22 +192,55 @@ int main() {
         const dim3 parallel_grid(nrows / 4, groups.size());
         std::printf("parallel_plan overlap_positions=%d cta_groups=%zu threads=%u duplicate_payload_bytes=%zu\n",
                     multiplicity, groups.size(), block.x * block.y, duplicate_payload_bytes);
-        const auto launch_off = [&] {
-            mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>
-                <<<grid, block>>>(up_gpu, input_gpu, ids_gpu, fusion, out_gpu, ncols, make_uint3(1, 1, 1), nrows,
-                    weight_row_stride, input_token_stride, output_token_stride, weight_expert_stride, 0, nrows, tokens, ranks);
+        const auto launch_stock = [&](size_t padding) {
+            baseline<<<grid, block, padding>>>(up_gpu, input_gpu, ids_gpu, fusion, out_gpu, ncols,
+                    make_uint3(1, 1, 1), nrows, weight_row_stride, input_token_stride, output_token_stride,
+                    weight_expert_stride, 0, nrows, tokens, ranks, nullptr);
         };
+        const auto launch_off = [&] { launch_stock(0); };
         const auto launch_on = [&] {
-            iq3_parallel_weights::gate_up<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu);
+            iq3_parallel_weights::gate_up<><<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu);
         };
-        check(hipMemset(out_gpu, 0xff, sizeof(float)*output_elements));
-        launch_off();
-        check(hipGetLastError());
-        check(hipMemcpy(off.data(), out_gpu, sizeof(float)*output_elements, hipMemcpyDeviceToHost));
-        check(hipMemset(out_gpu, 0xff, sizeof(float)*output_elements));
-        launch_on();
-        check(hipGetLastError());
-        check(hipMemcpy(on.data(), out_gpu, sizeof(float)*output_elements, hipMemcpyDeviceToHost));
+        const auto copy_output = [&](auto launch, std::vector<float> & output) {
+            check(hipMemset(out_gpu, 0xff, sizeof(float)*output_elements));
+            launch();
+            check(hipGetLastError());
+            check(hipMemcpy(output.data(), out_gpu, sizeof(float)*output_elements, hipMemcpyDeviceToHost));
+        };
+        copy_output(launch_off, off);
+        if (ablation) {
+            // A and B execute the same instructions. B requests additional, untouched dynamic LDS.
+            // C and D use one runtime-switched kernel and reserve identical resources.
+            const size_t padding = report_ablation_resources(baseline, grouped, block.x * block.y);
+            const auto launch = [&](int arm) {
+                if (arm < 2) {
+                    launch_stock(arm == 1 ? padding : 0);
+                } else {
+                    grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, arm == 3);
+                }
+            };
+            for (int arm = 0; arm < 4; ++arm) {
+                if (arm != 0) {
+                    copy_output([&] { launch(arm); }, on);
+                }
+                const auto & output = arm == 0 ? off : on;
+                int different = 0, non_finite = 0;
+                for (int i = 0; i < output_elements; ++i) {
+                    non_finite += !std::isfinite(output[i]);
+                    different += std::memcmp(&off[i], &output[i], sizeof(float)) != 0;
+                }
+                std::printf("ablation_correctness arm=%c outputs=%d bitwise_differences=%d non_finite=%d\n",
+                            'A' + arm, output_elements, different, non_finite);
+                if (different || non_finite) {
+                    return 3;
+                }
+            }
+            time_ablation(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch);
+            check(hipFree(groups_gpu));
+            check(hipFree(ids_gpu));
+            continue;
+        }
+        copy_output(launch_on, on);
         size_t different = 0;
         float max_abs = 0;
         for (int i = 0; i < output_elements; ++i) {
