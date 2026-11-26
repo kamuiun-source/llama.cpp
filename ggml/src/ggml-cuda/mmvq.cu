@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 #ifdef GGML_USE_HIP
 #include "mmvq-iq2-strata.cuh"
+#include "mtp3-compact-slot-map.cuh"
 #endif
 
 #include <atomic>
@@ -2279,7 +2280,9 @@ void ggml_cuda_mul_mat_vec_q(
         namespace reuse = iq3_strata_reuse;
         const auto * map = plan::map_from_ids(ids, iq2_strata ? plan::iq2 : plan::iq3);
         if (map && map->data) {
-            const auto * groups = static_cast<const int32_t *>(map->data) + plan::experts;
+            const bool compact = ggml_hip_mtp3_compact_slot_map_enabled() &&
+                    ggml_hip_mtp3_compact_slot_map::is_lookup(ids->view_src);
+            const auto * groups = static_cast<const int32_t *>(map->data) + (compact ? plan::routes : plan::experts);
             const ggml_cuda_kernel_launch_params params(dim3(reuse::nrows / reuse::rows_per_tile, plan::routes),
                     dim3(reuse::waves * reuse::wave), 0, stream);
             const auto * q8 = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());

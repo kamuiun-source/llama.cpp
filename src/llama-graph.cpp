@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 #include "../ggml/src/ggml-hip-iq3-strata-plan.h"
+#include "../ggml/src/ggml-hip-mtp3-compact-slot-map.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2831,6 +2832,12 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, cold ? "ffn_moe_cold_slots" : "ffn_moe_slots", il);
+    namespace compact = ggml_hip_mtp3_compact_slot_map;
+    if (slot_map->op == GGML_OP_NONE && slot_map->op_params[0] == compact::tag &&
+            target_mtp_verify_packed && !cold && prefill_wave < 0 &&
+            selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3) {
+        slots->op_params[0] = compact::tag;
+    }
     static const bool shared_iq3_weights = [] {
         const char * value = std::getenv("GGML_HIP_GFX906_MTP3_IQ3_XXS_SHARE_WEIGHTS");
         return value && std::strcmp(value, "1") == 0;

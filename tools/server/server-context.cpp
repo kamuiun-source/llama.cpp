@@ -13,6 +13,7 @@
 #include "server-single-miss-cpu-mode.h"
 #include "src/llama-next-router-readback.h"
 #include "server-next-router-top10-mode.h"
+#include "server-mtp3-compact-slot-map-mode.h"
 #include "server-iq3-strata-mode.h"
 #include "server-mtp-catchup-mode.h"
 #include "server-stream.h"
@@ -3990,6 +3991,7 @@ private:
                         server_refresh_iq_strata_mode<true>(ctx_tgt, ctx_dft);
                         const bool next_router_top10 = server_refresh_next_router_top10_mode(ctx_tgt, ctx_dft);
                         llama_refresh_next_router_readback_mode(next_router_top10);
+                        server_refresh_mtp3_compact_slot_map_mode(ctx_tgt, ctx_dft);
                         server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
                     }
                     if (task.is_parent()) {

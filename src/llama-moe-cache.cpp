@@ -12,6 +12,7 @@
 #include "llama-single-miss-topology.h"
 #include "../ggml/src/ggml-backend-mtp.h"
 #include "../ggml/src/ggml-hip-iq3-strata-plan.h"
+#include "../ggml/src/ggml-hip-mtp3-compact-slot-map.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -694,6 +695,14 @@ struct llama_moe_cache::impl {
     std::array<iq_strata_stats, ggml_hip_iq3_strata_plan::quant_count> iq_strata;
     size_t hip_mtp_slot_staging_stride = sizeof(llama_expert_placement::layer_map::resident);
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
+    using compact_slot_map_mode_t = int (*)(ggml_backend_dev_t);
+    compact_slot_map_mode_t compact_slot_map_mode = nullptr;
+    size_t compact_slot_map_layers = 0;
+    size_t compact_slot_map_async = 0;
+    size_t compact_slot_map_sync = 0;
+    size_t compact_slot_map_fallback = 0;
+    size_t compact_slot_map_bytes = 0;
+    size_t compact_slot_map_saved_bytes = 0;
     bool hip_mtp_slot_async = false;
     bool hip_mtp4_slot_async = false;
     ggml_backend_buffer_ptr hip_mtp_promotion_staging;
@@ -875,6 +884,17 @@ struct llama_moe_cache::impl {
                     stats.profile = stats.mode && profile && std::strcmp(profile, "1") == 0;
                 }
             }
+            namespace compact = ggml_hip_mtp3_compact_slot_map;
+            const char * compact_mode_file = std::getenv(compact::mode_file_env);
+            if (compact_mode_file && *compact_mode_file && target_reg && placement->hip_tuple_dma &&
+                    placement->hip_mtp_verify_three && !placement->overlap && n_expert_used == 10 &&
+                    model.hparams.n_expert == strata::experts) {
+                compact_slot_map_mode = reinterpret_cast<compact_slot_map_mode_t>(
+                        ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_hip_mtp3_compact_slot_map_mode"));
+                if (compact_slot_map_mode && compact_slot_map_mode(placement->target) < 0) {
+                    compact_slot_map_mode = nullptr;
+                }
+            }
             const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
@@ -901,6 +921,10 @@ struct llama_moe_cache::impl {
                 }
                 hip_mtp_slot_staging_stride = std::max(hip_mtp_slot_staging_stride, ggml_nbytes(l.slot_map));
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
+                if (compact_slot_map_mode) {
+                    l.slot_map->op_params[0] = compact::tag;
+                    ++compact_slot_map_layers;
+                }
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
                 for (int32_t wave = 0; wave < n_prefill_waves; ++wave) {
                     auto * map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
@@ -3890,23 +3914,35 @@ struct llama_moe_cache::impl {
                 const int quant = fixed_three ? strata::lookup_quant(lookup) : -1;
                 auto * stats = quant >= 0 ? &iq_strata[quant] : nullptr;
                 const bool with_plan = stats && stats->mode && stats->mode(placement->target) > 0;
-                const size_t bytes_map = with_plan ? strata::map_entries * sizeof(int32_t) : sizeof(slots);
+                namespace compact = ggml_hip_mtp3_compact_slot_map;
+                const bool try_compact = fixed_three && compact_slot_map_mode && compact_slot_map_mode(placement->target) > 0;
+                const bool compact_map = try_compact && compact::is_lookup(lookup);
+                const size_t slot_entries = compact_map ? compact::routes : slots.size();
+                const size_t bytes_map = (slot_entries + (with_plan ? strata::routes : 0)) * sizeof(int32_t);
                 GGML_ASSERT(bytes_map <= ggml_nbytes(dst));
+                compact_slot_map_fallback += try_compact && !compact_map;
                 std::array<int32_t, strata::map_entries> sync_map;
                 auto * staging = async_map_dst ?
                         static_cast<int32_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get())) +
                             il * (hip_mtp_slot_staging_stride / sizeof(int32_t)) :
                         sync_map.data();
                 const int32_t * map_data = slots.data();
-                if (with_plan || async_map_dst) {
-                    // This callback's destination wait has drained any prior use of this layer's staging.
+                // This callback's destination wait has drained any prior use of this layer's staging.
+                if (compact_map) {
+                    compact::pack(staging, ids.data(), slots.data());
+                    map_data = staging;
+                    compact_slot_map_async += async_map_dst;
+                    compact_slot_map_sync += !async_map_dst;
+                    compact_slot_map_bytes += bytes_map;
+                    compact_slot_map_saved_bytes += sizeof(slots) - slot_entries * sizeof(int32_t);
+                } else if (with_plan || async_map_dst) {
                     std::memcpy(staging, slots.data(), sizeof(slots));
                     map_data = staging;
                 }
                 const bool measure = with_plan && stats->profile;
                 if (with_plan) {
                     const int64_t prep_start = measure ? ggml_time_us() : 0;
-                    int32_t * plan = staging + strata::experts;
+                    int32_t * plan = staging + slot_entries;
                     const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
                     strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu));
                     if (measure) {
@@ -4279,6 +4315,12 @@ struct llama_moe_cache::impl {
                             quant == ggml_hip_iq3_strata_plan::iq2 ? 2 : 3, stats.layers, stats.plans, stats.bytes,
                             stats.groups[0], stats.groups[1], stats.groups[2], stats.prep_us, stats.async_submit_us, stats.sync_copy_us);
                 }
+            }
+            if (compact_slot_map_mode) {
+                LLAMA_LOG_INFO("packed HIP MTP3 compact slot map: eligible_layers=%zu copies=%zu async_copies=%zu sync_copies=%zu"
+                        " bytes=%zu full_bytes_avoided=%zu fallback_maps=%zu\n",
+                        compact_slot_map_layers, compact_slot_map_async + compact_slot_map_sync, compact_slot_map_async,
+                        compact_slot_map_sync, compact_slot_map_bytes, compact_slot_map_saved_bytes, compact_slot_map_fallback);
             }
             if (hip_mtp_slot_staging && hip_mtp_slot_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",

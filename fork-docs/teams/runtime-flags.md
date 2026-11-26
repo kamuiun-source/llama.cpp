@@ -94,6 +94,7 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` | 未設定（通常） / `1`（詳細比較） | 試作ON/OFF両方に層ごとのホスト時刻を出す。GPU時刻はrocprofで照合する。 |
 | `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE` | 通常起動は `NEXT_ROUTER_READBACK=on`。比較は `NEXT_ROUTER_READBACK=off`。未指定時のコード既定はOFF。 | ONは固定3幅の通常次層予測IDをRTXのピン留め受信枠へ読み出し、後続の進行点で完了を確認する。後回しの対象外では即時ピン留め経路にフォールバックする。OFFは従来の読み戻し。リクエスト間で切り替え、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` でモード別に終了時集計。[通常起動](../rocm/10-decode-pipeline.md#次層routerの読み戻しを有効にする) |
 | `LLAMA_CUDA_NEXT_ROUTER_TOP10_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_TOP10=off` または `NEXT_ROUTER_TOP10=on` | RTXで固定3幅の通常次層予測のTop-10を直接選ぶ試作。リクエスト間で切り替える。 |
+| `LLAMA_EXPERT_HIP_MTP3_COMPACT_SLOT_MAP_MODE_FILE` | 未指定（既定OFF） / ファイルに `COMPACT_SLOT_MAP=off` または `COMPACT_SLOT_MAP=on` | gfx906の固定3幅・単一バンク・直接DMAで物理スロット30件を直接送る試作。リクエスト間で切り替える。[試作](../rocm/10-decode-pipeline.md#固定3幅のexpertスロット表を圧縮する試作) |
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
 
