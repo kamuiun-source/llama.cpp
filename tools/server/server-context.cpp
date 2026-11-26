@@ -11,6 +11,7 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-single-miss-cpu-mode.h"
+#include "server-hip-return-ready-mode.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -3977,6 +3978,7 @@ private:
                     refresh_gfx906_lds_modes();
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
                         server_refresh_single_miss_cpu_mode(ctx_tgt, ctx_dft);
+                        server_refresh_hip_return_ready_mode(ctx_tgt, ctx_dft);
                     }
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks

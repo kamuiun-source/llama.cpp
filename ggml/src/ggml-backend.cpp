@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-mtp.h"
+#include "ggml-backend-hip-return-ready.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1335,6 +1336,12 @@ struct ggml_backend_sched_single_miss {
     unsigned mask = 0;
 };
 
+static std::atomic<bool> hip_return_ready_enabled{false};
+
+void ggml_backend_sched_set_hip_return_ready(bool enabled) {
+    hip_return_ready_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 static std::atomic<int> hip_single_miss_cpu_mode{0};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
@@ -1568,6 +1575,7 @@ struct ggml_backend_sched {
     ggml_backend_hip_mapped_input_blit_t hip_mapped_input_blit;
     size_t hip_mapped_input_read_eligible;
     size_t hip_mapped_input_read_applied;
+    ggml_backend_hip_return_ready hip_return_ready;
     ggml_backend_event_t hip_return_h2d_event;
     ggml_backend_t hip_return_h2d_pending;
     size_t hip_return_h2d_applied;
@@ -2964,8 +2972,13 @@ struct ggml_backend_sched_hip_return {
         }
     }
 
+    bool ready_requested = false;
+    bool ready_recorded = false;
+
     ~ggml_backend_sched_hip_return() { wait(); }
 };
+
+#include "ggml-backend-hip-return-ready.inc"
 
 struct ggml_backend_sched_mapped_hip_input {
     ggml_backend_t source = nullptr;
@@ -3135,7 +3148,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         handoff.source_wait([&] {
             if (use_hip_return) {
-                hip_return->wait();
+                ggml_backend_sched_wait_return_ready(sched, *hip_return);
             } else {
                 ggml_backend_synchronize(input_backend);
             }
@@ -4590,6 +4603,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         pinned.hip_mapped + (hip_return.data - pinned.data), &mapped_status)) {
                 hip_return.source = split_backend;
                 hip_return.mapped = true;
+                if (mapped_status == GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_record_return_ready(sched, hip_return);
+                }
                 if (trace) {
                     ggml_backend_sched_trace_submit(sched, split_id, split_backend, graph, submit_start_us, ggml_time_us());
                 }
@@ -4623,6 +4639,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 hip_return.enqueue_start_us = ggml_time_us();
                 ggml_backend_tensor_get_async(split_backend, hip_return.input, hip_return.data, 0, ggml_nbytes(hip_return.input));
                 hip_return.enqueue_end_us = ggml_time_us();
+                ggml_backend_sched_record_return_ready(sched, hip_return);
             }
             if (trace) {
                 ggml_backend_sched_trace_submit(sched, split_id, split_backend, graph, submit_start_us, ggml_time_us());
@@ -5054,6 +5071,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_backend_sched_free_return_ready(sched);
     if (auto * trace = sched->hip_verify_trace) {
         ggml_backend_sched_hip_verify_stage_flush(sched);
         delete trace;
