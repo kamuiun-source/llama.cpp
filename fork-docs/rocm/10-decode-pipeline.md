@@ -744,6 +744,11 @@ Lunaが同じ増分ビルドで、各順序につき同一サーバー内のOFF�
 
 ONの対象51,606回はすべてイベント経路で完了し、フォールバック0。読み戻しのCPU時間は合算で0.042 ms/検証短縮。大部分はAPI内の待ちからイベント待ちへ移った。2回目の会話は両順序でGPU側の補充数が減り、生成が速かった。先読みヒットは合算12.68→12.80件/検証、GPU側の補充対象に対する割合は59.84→59.43%。本体検証の差は0.065 ms/回で、速度差とヒット数の差を試作単独に帰属できない。通常起動は既定OFFを維持する。[OFF→ONの記録](/home/t-saka/rocm-next-router-readback-ab-20261126/session-batch-01) · [ON→OFFの記録](/home/t-saka/rocm-next-router-readback-reverse-ab-20261126/session-batch-01)
 
+###### 公開実装を参考にした次の候補
+
+- 最初に測るのは、予測IDの生成そのもの。固定3幅の通常予測は3行×512 logitsをSoftmaxに通し、`ggml_argsort_top_k` で512件を全ソートしてTop-10を切り出す。この形状では既存CUDA `ggml_top_k` も、確認した実装の条件ではbitonic全ソートとD2Dを使う。vLLMのwarp内Top-Kのように、必要な10件だけを順位付きで生成する候補を現行の同一logitsで比較する。まずSoftmaxを維持し、通常のscore mode 0でTop-10のIDと順位を照合する。Softmax省略は独立した比較とし、丸めで同点になる場合も確認する。現行の後段発行は5ノードの形を識別条件にしているため、短縮版でもMI50投入後に発行されることを確認する。旧266検証で予測の行列積0.727、Softmax 0.069、Top-K 0.477 ms/検証。後段発行後の別トレースで予測グラフ全体は1.35 ms/検証。現在の本体検証から削減できる時間は、MI50との重なりや先読みの締め切りに依存する。[vLLMのルーティングカーネル](https://github.com/vllm-project/vllm/blob/main/csrc/moe/topk_softmax_kernels.cu) · [旧トレース](#次層router予測を待ってからmi50へ渡している)
+- 次に、D2Hの発行とIDの消費を分ける。公開版ProMoEの一経路ではピン留めCPUバッファへコピーしてイベントを記録し、別の予測ワーカーが完了を待って転送の優先度付きキューへつなぐ。現行のホストは発行直後に待つので、ワーカーを導入する前に、既存スケジューラの進行点でイベント完了を照会する範囲を測る。最初の先読み1〜2件の発行が遅れるとヒット数が落ち得る。予測完了、D2H完了、先読み初回発行、次層の需要コピーの時刻を比較し、同じGPUタイムラインで本体に露出する待ちを分ける。8枠の上限、実ミス優先、原本と受信枠の再利用条件を維持する。試作と再計測は未実施。[ProMoEのコピーとイベント](https://github.com/promoe-opensource/promoe/blob/022f8b22dc11c5fdfbbcee831f6628c14bccf6dd/src/cpp_worker/predictor.cpp#L469-L471) · [ProMoEのワーカー](https://github.com/promoe-opensource/promoe/blob/022f8b22dc11c5fdfbbcee831f6628c14bccf6dd/src/cpp_worker/worker.cpp#L6-L22) · [CUDAイベントAPI](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__EVENT.html)
+
 ##### 統合後の固定3幅の速度とボトルネック
 
 2026-11-25に統合版 `e0daf2012` で、当時の採用設定をすべて有効にした固定3幅・単一バンク・直接DMAを再計測した。次層Router予測の後段発行、Shared Expert先行発行、HC down Split-Kも有効。通常計測には直前の追加計測とハッシュが同じバイナリを使い、Qwen3.8 Flash Next、同じ固定5問、コンテキスト2,048、各問128トークン上限を維持した。
