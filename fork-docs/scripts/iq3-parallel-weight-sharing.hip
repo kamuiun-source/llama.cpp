@@ -216,11 +216,12 @@ int main(int argc, char ** argv) {
     const bool vector_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-vector-copy") == 0;
     const bool row_overlap = argc == 2 && std::strcmp(argv[1], "--ablate-row-overlap") == 0;
     const bool row_decomposition = argc == 2 && std::strcmp(argv[1], "--ablate-row-decomposition") == 0;
-    const bool paired_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-paired-plane-copy") == 0;
+    const bool valid_overlap_arg = argc == 3 && (std::strcmp(argv[2], "2") == 0 || std::strcmp(argv[2], "3") == 0);
+    const bool paired_ablation = (argc == 2 || valid_overlap_arg) && std::strcmp(argv[1], "--ablate-paired-plane-copy") == 0;
     const bool copy_ablation = batch_ablation || vector_ablation || row_overlap || row_decomposition || paired_ablation;
     const bool ablation = copy_ablation || (argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0);
     if (argc != 1 && !ablation) {
-        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy|--ablate-row-overlap|--ablate-row-decomposition|--ablate-paired-plane-copy]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy|--ablate-row-overlap|--ablate-row-decomposition|--ablate-paired-plane-copy [2|3]]\n", argv[0]);
         return 1;
     }
     constexpr int ncols = 2560, nrows = 640, experts = 30, tokens = 3, ranks = 10;
@@ -263,8 +264,9 @@ int main(int argc, char ** argv) {
     check(hipEventCreate(&event_stop));
     std::printf("timing_config warmup_batches=%d measured_pairs=%d launches_per_batch=%d\n",
                 warmup_batches, measured_pairs, launches_per_batch);
-    const int first_multiplicity = ablation ? 2 : 1;
-    const int last_multiplicity = ablation ? 2 : 3;
+    const int selected_multiplicity = paired_ablation && argc == 3 && argv[2][0] == '3' ? 3 : 2;
+    const int first_multiplicity = ablation ? selected_multiplicity : 1;
+    const int last_multiplicity = ablation ? selected_multiplicity : 3;
     const auto baseline = mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>;
     const auto split = iq3_parallel_weights::gate_up<true, false, false, true>;
     const auto dot_control = iq3_parallel_weights::gate_up<false, false, false, false, true>;
