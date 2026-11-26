@@ -119,11 +119,18 @@ static __device__ __forceinline__ void project(
     }
 }
 
+enum weight_mode : uint32_t {
+    weights_direct = 0,
+    weights_stage = 1,
+    weights_read = 2,
+    weights_share = weights_stage | weights_read,
+};
+
 template<bool ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
-        const int32_t * ids, const uint32_t * groups, float * out, bool share_weights = true) {
+        const int32_t * ids, const uint32_t * groups, float * out, weight_mode mode = weights_share) {
     constexpr int grid_size = sizeof(iq3xxs_grid) / sizeof(iq3xxs_grid[0]);
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
@@ -134,7 +141,7 @@ static __global__ void gate_up(
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
     const uint32_t group = groups[blockIdx.y];
-    const uint32_t shared = !ablation || share_weights ? group >> shared_shift : 0;
+    const uint32_t shared = group >> shared_shift;
     const int rank = int((group >> (token * rank_bits)) & rank_mask) - 1;
     const int row0 = blockIdx.x * rows_per_tile;
     const auto * token_input = reinterpret_cast<const uint32_t *>(activation + token * input_blocks);
@@ -147,7 +154,7 @@ static __global__ void gate_up(
     }
 
     // The first participating wave copies one packed tile for all participating waves.
-    if (shared && token == __builtin_ctz(shared)) {
+    if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
         stage_weights(shared_up, up + offset, lane);
@@ -161,7 +168,7 @@ static __global__ void gate_up(
 
     auto * dst = out + (token * ranks + rank) * nrows + row0;
     const auto * token_activation = reinterpret_cast<const block_q8_1 *>(input[token]);
-    if ((shared >> token) & 1) {
+    if ((!ablation || (mode & weights_read)) && ((shared >> token) & 1)) {
         project(shared_up, shared_gate, token_activation, grid, dst);
     } else {
         const int expert = ids[token * ranks + rank];

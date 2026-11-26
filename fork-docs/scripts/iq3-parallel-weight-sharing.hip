@@ -43,6 +43,8 @@ double median(std::vector<double> values) {
     return values.size() % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2.0;
 }
 
+constexpr int ablation_arms = 5;
+
 template<typename Kernel>
 int active_blocks(Kernel kernel, int threads, size_t dynamic_lds) {
     int blocks = 0;
@@ -78,7 +80,7 @@ size_t report_ablation_resources(Baseline baseline, Grouped grouped, int threads
         }
     }
 
-    for (int arm = 0; arm < 4; ++arm) {
+    for (int arm = 0; arm < ablation_arms; ++arm) {
         const auto & attrs = arm < 2 ? stock : prototype;
         const size_t dynamic = arm == 1 ? padding : 0;
         const int blocks = arm == 0 ? stock_blocks : arm == 1 ? padded_blocks : grouped_blocks;
@@ -91,36 +93,48 @@ size_t report_ablation_resources(Baseline baseline, Grouped grouped, int threads
 
 template<typename Launch>
 void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches) {
-    // Each arm appears once in each position and follows every other arm once per four trials.
-    constexpr int order[4][4] = {{0, 1, 3, 2}, {1, 2, 0, 3}, {2, 3, 1, 0}, {3, 0, 2, 1}};
-    std::array<std::vector<double>, 4> samples;
-    std::vector<double> b_minus_a, c_minus_b, d_minus_c;
+    // Five rotations and their reverses balance arm positions and adjacent pairs over ten trials.
+    constexpr int order[ablation_arms] = {0, 1, 4, 2, 3};
+    std::array<std::vector<double>, ablation_arms> samples;
+    std::vector<double> b_minus_a, c_minus_b, d_minus_c, e_minus_c, d_minus_e;
     for (int trial = -warmup; trial < trials; ++trial) {
-        const auto & arms = order[(trial + warmup) % 4];
-        std::array<double, 4> timings{};
-        for (int arm : arms) {
+        const int sequence = (trial + warmup) % (2 * ablation_arms);
+        std::array<int, ablation_arms> arms{};
+        std::array<double, ablation_arms> timings{};
+        for (int position = 0; position < ablation_arms; ++position) {
+            const int index = sequence < ablation_arms ? position : ablation_arms - 1 - position;
+            const int arm = (order[index] + sequence) % ablation_arms;
+            arms[position] = arm;
             timings[arm] = time_batch([&] { launch(arm); }, start, stop, launches);
         }
         if (trial < 0) {
             continue;
         }
-        for (int arm = 0; arm < 4; ++arm) {
+        for (int arm = 0; arm < ablation_arms; ++arm) {
             samples[arm].push_back(timings[arm]);
         }
         b_minus_a.push_back(timings[1] - timings[0]);
         c_minus_b.push_back(timings[2] - timings[1]);
         d_minus_c.push_back(timings[3] - timings[2]);
-        std::printf("ablation_sample trial=%d order=%c%c%c%c A_us=%.6f B_us=%.6f C_us=%.6f D_us=%.6f\n",
-                    trial, 'A' + arms[0], 'A' + arms[1], 'A' + arms[2], 'A' + arms[3],
-                    timings[0], timings[1], timings[2], timings[3]);
+        e_minus_c.push_back(timings[4] - timings[2]);
+        d_minus_e.push_back(timings[3] - timings[4]);
+        std::printf("ablation_sample trial=%d order=%c%c%c%c%c A_us=%.6f B_us=%.6f C_us=%.6f D_us=%.6f E_us=%.6f\n",
+                    trial, 'A' + arms[0], 'A' + arms[1], 'A' + arms[2], 'A' + arms[3], 'A' + arms[4],
+                    timings[0], timings[1], timings[2], timings[3], timings[4]);
     }
-    for (int arm = 0; arm < 4; ++arm) {
+    for (int arm = 0; arm < ablation_arms; ++arm) {
         const auto bounds = std::minmax_element(samples[arm].begin(), samples[arm].end());
         std::printf("ablation_timing arm=%c samples=%d launches_per_sample=%d median_us=%.6f min_us=%.6f max_us=%.6f\n",
                     'A' + arm, trials, launches, median(samples[arm]), *bounds.first, *bounds.second);
     }
     std::printf("ablation_paired_delta B_minus_A_us=%.6f C_minus_B_us=%.6f D_minus_C_us=%.6f\n",
                 median(b_minus_a), median(c_minus_b), median(d_minus_c));
+    const auto stage = std::minmax_element(e_minus_c.begin(), e_minus_c.end());
+    const auto consume = std::minmax_element(d_minus_e.begin(), d_minus_e.end());
+    std::printf("ablation_paired_delta contrast=E_minus_C median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                median(e_minus_c), *stage.first, *stage.second);
+    std::printf("ablation_paired_delta contrast=D_minus_E median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                median(d_minus_e), *consume.first, *consume.second);
 }
 
 int main(int argc, char ** argv) {
@@ -210,16 +224,19 @@ int main(int argc, char ** argv) {
         copy_output(launch_off, off);
         if (ablation) {
             // A and B execute the same instructions. B requests additional, untouched dynamic LDS.
-            // C and D use one runtime-switched kernel and reserve identical resources.
+            // C, D, and E use one runtime-switched kernel and reserve identical resources.
             const size_t padding = report_ablation_resources(baseline, grouped, block.x * block.y);
             const auto launch = [&](int arm) {
                 if (arm < 2) {
                     launch_stock(arm == 1 ? padding : 0);
                 } else {
-                    grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, arm == 3);
+                    constexpr iq3_parallel_weights::weight_mode modes[] = {
+                        iq3_parallel_weights::weights_direct, iq3_parallel_weights::weights_share, iq3_parallel_weights::weights_stage,
+                    };
+                    grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, modes[arm - 2]);
                 }
             };
-            for (int arm = 0; arm < 4; ++arm) {
+            for (int arm = 0; arm < ablation_arms; ++arm) {
                 if (arm != 0) {
                     copy_output([&] { launch(arm); }, on);
                 }
