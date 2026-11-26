@@ -92,7 +92,7 @@ size_t report_ablation_resources(Baseline baseline, Grouped grouped, int threads
 }
 
 template<typename Launch>
-void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches, bool batch_ablation) {
+void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches, const char * copy_contrast) {
     // Five rotations and their reverses balance arm positions and adjacent pairs over ten trials.
     constexpr int order[ablation_arms] = {0, 1, 4, 2, 3};
     std::array<std::vector<double>, ablation_arms> samples;
@@ -128,13 +128,13 @@ void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup,
         std::printf("ablation_timing arm=%c samples=%d launches_per_sample=%d median_us=%.6f min_us=%.6f max_us=%.6f\n",
                     'A' + arm, trials, launches, median(samples[arm]), *bounds.first, *bounds.second);
     }
-    if (batch_ablation) {
+    if (copy_contrast) {
         const auto stage = std::minmax_element(c_minus_b.begin(), c_minus_b.end());
         const auto consume = std::minmax_element(e_minus_d.begin(), e_minus_d.end());
-        std::printf("ablation_paired_delta contrast=batched_minus_serial_copy_only median_us=%.6f min_us=%.6f max_us=%.6f\n",
-                    median(c_minus_b), *stage.first, *stage.second);
-        std::printf("ablation_paired_delta contrast=batched_minus_serial_full median_us=%.6f min_us=%.6f max_us=%.6f\n",
-                    median(e_minus_d), *consume.first, *consume.second);
+        std::printf("ablation_paired_delta contrast=%s_copy_only median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                    copy_contrast, median(c_minus_b), *stage.first, *stage.second);
+        std::printf("ablation_paired_delta contrast=%s_full median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                    copy_contrast, median(e_minus_d), *consume.first, *consume.second);
         return;
     }
     std::printf("ablation_paired_delta B_minus_A_us=%.6f C_minus_B_us=%.6f D_minus_C_us=%.6f\n",
@@ -149,9 +149,11 @@ void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup,
 
 int main(int argc, char ** argv) {
     const bool batch_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-load-batching") == 0;
-    const bool ablation = batch_ablation || (argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0);
+    const bool vector_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-vector-copy") == 0;
+    const bool copy_ablation = batch_ablation || vector_ablation;
+    const bool ablation = copy_ablation || (argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0);
     if (argc != 1 && !ablation) {
-        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy]\n", argv[0]);
         return 1;
     }
     constexpr int ncols = 2560, nrows = 640, experts = 30, tokens = 3, ranks = 10;
@@ -197,7 +199,9 @@ int main(int argc, char ** argv) {
     const int first_multiplicity = ablation ? 2 : 1;
     const int last_multiplicity = ablation ? 2 : 3;
     const auto baseline = mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>;
-    const auto grouped = batch_ablation ? iq3_parallel_weights::gate_up<true, true> : iq3_parallel_weights::gate_up<true>;
+    const auto grouped = vector_ablation ? iq3_parallel_weights::gate_up<true, false, true> :
+            batch_ablation ? iq3_parallel_weights::gate_up<true, true> : iq3_parallel_weights::gate_up<true>;
+    const char * copy_contrast = vector_ablation ? "vector_minus_batched" : batch_ablation ? "batched_minus_serial" : nullptr;
     for (int multiplicity = first_multiplicity; multiplicity <= last_multiplicity; ++multiplicity) {
         std::vector<int32_t> ids_host(ranks * tokens);
         for (int t = 0; t < tokens; ++t) {
@@ -237,11 +241,13 @@ int main(int argc, char ** argv) {
             // A and B execute the same instructions. B requests additional, untouched dynamic LDS.
             // C, D, and E use one runtime-switched kernel and reserve identical resources.
             size_t padding = 0;
-            if (batch_ablation) {
+            if (copy_ablation) {
                 hipFuncAttributes attrs{};
                 check(hipFuncGetAttributes(&attrs, reinterpret_cast<const void *>(grouped)));
                 const int blocks = active_blocks(grouped, block.x * block.y, 0);
-                constexpr const char * labels[] = {"direct", "serial_copy_only", "batched_copy_only", "serial_full", "batched_full"};
+                constexpr const char * batch_labels[] = {"direct", "serial_copy_only", "batched_copy_only", "serial_full", "batched_full"};
+                constexpr const char * vector_labels[] = {"direct", "batched_copy_only", "vector_copy_only", "batched_full", "vector_full"};
+                const auto * labels = vector_ablation ? vector_labels : batch_labels;
                 for (int arm = 0; arm < ablation_arms; ++arm) {
                     std::printf("ablation_resources arm=%c mode=%s lds_static=%zu lds_dynamic=0 vgpr_per_thread=%d max_active_blocks_per_cu=%d\n",
                                 'A' + arm, labels[arm], attrs.sharedSizeBytes, attrs.numRegs, blocks);
@@ -251,9 +257,15 @@ int main(int argc, char ** argv) {
             }
             const auto launch = [&](int arm) {
                 using namespace iq3_parallel_weights;
-                if (batch_ablation) {
-                    constexpr weight_mode modes[] = {weights_direct, weights_stage, weights_stage_batched, weights_share, weights_share_batched};
-                    grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, modes[arm]);
+                if (copy_ablation) {
+                    constexpr weight_mode batch_modes[] = {
+                        weights_direct, weights_stage, weights_stage_batched, weights_share, weights_share_batched,
+                    };
+                    constexpr weight_mode vector_modes[] = {
+                        weights_direct, weights_stage_batched, weights_stage_vector, weights_share_batched, weights_share_vector,
+                    };
+                    const weight_mode mode = vector_ablation ? vector_modes[arm] : batch_modes[arm];
+                    grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, mode);
                 } else if (arm < 2) {
                     launch_stock(arm == 1 ? padding : 0);
                 } else {
@@ -262,10 +274,10 @@ int main(int argc, char ** argv) {
                 }
             };
             for (int arm = 0; arm < ablation_arms; ++arm) {
-                if (arm != 0 || batch_ablation) {
+                if (arm != 0 || copy_ablation) {
                     copy_output([&] { launch(arm); }, on);
                 }
-                const auto & output = arm == 0 && !batch_ablation ? off : on;
+                const auto & output = arm == 0 && !copy_ablation ? off : on;
                 int different = 0, non_finite = 0;
                 for (int i = 0; i < output_elements; ++i) {
                     non_finite += !std::isfinite(output[i]);
@@ -277,7 +289,7 @@ int main(int argc, char ** argv) {
                     return 3;
                 }
             }
-            time_ablation(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch, batch_ablation);
+            time_ablation(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch, copy_contrast);
             check(hipFree(groups_gpu));
             check(hipFree(ids_gpu));
             continue;

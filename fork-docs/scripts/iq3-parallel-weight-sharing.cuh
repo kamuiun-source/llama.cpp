@@ -107,6 +107,19 @@ static __device__ __forceinline__ void stage_weights_batched(weight_tile & dst, 
 #endif
 }
 
+static __device__ __forceinline__ void stage_weights_vector(weight_tile & dst, const block_iq3_xxs * src, int lane) {
+    constexpr int bytes = sizeof(uint4);
+    constexpr int units = sizeof(weight_tile) / bytes;
+    static_assert(bytes == 16 && sizeof(weight_tile) % bytes == 0 && nrows % rows_per_tile == 0);
+    auto * out = static_cast<unsigned char *>(__builtin_assume_aligned(&dst, bytes));
+    const auto * in = static_cast<const unsigned char *>(__builtin_assume_aligned(src, bytes));
+
+    // The final stride has only 53 valid lanes. Each valid lane copies one complete vector.
+    for (int unit = lane; unit < units; unit += 64) {
+        __builtin_memcpy(out + unit * bytes, in + unit * bytes, bytes);
+    }
+}
+
 static __device__ __forceinline__ void project(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
         const uint32_t * grid, float * out) {
@@ -160,9 +173,12 @@ enum weight_mode : uint32_t {
     weights_batch = 4,
     weights_stage_batched = weights_stage | weights_batch,
     weights_share_batched = weights_share | weights_batch,
+    weights_vector = 8,
+    weights_stage_vector = weights_stage | weights_vector,
+    weights_share_vector = weights_share | weights_vector,
 };
 
-template<bool ablation = false, bool batch_ablation = false>
+template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -171,8 +187,8 @@ static __global__ void gate_up(
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
     __shared__ uint32_t input[tokens][activation_words];
-    alignas(uint32_t) __shared__ weight_tile shared_up;
-    alignas(uint32_t) __shared__ weight_tile shared_gate;
+    alignas(vector_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
+    alignas(vector_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
 
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
@@ -193,7 +209,15 @@ static __global__ void gate_up(
     if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
-        if (batch_ablation && (mode & weights_batch)) {
+        if constexpr (vector_ablation) {
+            if (mode & weights_vector) {
+                stage_weights_vector(shared_up, up + offset, lane);
+                stage_weights_vector(shared_gate, gate + offset, lane);
+            } else {
+                stage_weights_batched(shared_up, up + offset, lane);
+                stage_weights_batched(shared_gate, gate + offset, lane);
+            }
+        } else if (batch_ablation && (mode & weights_batch)) {
             stage_weights_batched(shared_up, up + offset, lane);
             stage_weights_batched(shared_gate, gate + offset, lane);
         } else {
