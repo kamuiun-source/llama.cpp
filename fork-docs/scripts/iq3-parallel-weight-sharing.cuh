@@ -152,6 +152,35 @@ static __device__ __forceinline__ void wait_weight_loads() {
 #endif
 }
 
+constexpr int iq3_parts_per_block = QK_K / QK8_1;
+constexpr int iq3_parts_per_tile = rows_per_tile * weight_blocks * iq3_parts_per_block;
+constexpr int iq3_scale_offset = 3 * iq3_parts_per_tile * sizeof(uint32_t);
+static_assert(sizeof(block_iq3_xxs) == 98 && iq3_parts_per_block == 8 && sizeof(weight_tile) == 3920);
+static_assert(iq3_scale_offset + rows_per_tile * weight_blocks * sizeof(uint16_t) == sizeof(weight_tile));
+
+static __device__ __forceinline__ int swizzled_halfword(int index) {
+    constexpr int halfwords_per_block = sizeof(block_iq3_xxs) / sizeof(uint16_t);
+    const int block = index / halfwords_per_block;
+    const int within = index % halfwords_per_block;
+    const int payload = within - 1;
+    const bool grid = payload < 4 * iq3_parts_per_block;
+    const int field = grid ? (payload >> 1) & 1 : 2;
+    const int part = grid ? payload >> 2 : (payload - 4 * iq3_parts_per_block) >> 1;
+    const int word = field * iq3_parts_per_tile + block * iq3_parts_per_block + part;
+    return within == 0 ? iq3_scale_offset / sizeof(uint16_t) + block : 2 * word + (payload & 1);
+}
+
+static __device__ __forceinline__ void store_swizzled_vector(unsigned char * dst, const uint4 & value, int offset) {
+    uint16_t words[sizeof(uint4) / sizeof(uint16_t)];
+    __builtin_memcpy(words, &value, sizeof(value));
+#pragma unroll
+    for (int j = 0; j < int(sizeof(words) / sizeof(words[0])); ++j) {
+        const int idx = swizzled_halfword(offset / sizeof(uint16_t) + j);
+        __builtin_memcpy(dst + idx * sizeof(uint16_t), &words[j], sizeof(uint16_t));
+    }
+}
+
+template<bool swizzled = false>
 static __device__ __forceinline__ void stage_weights_vector_pair(
         weight_tile & up_dst, weight_tile & gate_dst, const block_iq3_xxs * up, const block_iq3_xxs * gate, int lane) {
     constexpr int bytes = sizeof(uint4);
@@ -166,8 +195,13 @@ static __device__ __forceinline__ void stage_weights_vector_pair(
         uint4 up_value, gate_value;
         issue_weight_pair(up_in + i, gate_in + i, up_value, gate_value);
         wait_weight_loads();
-        __builtin_memcpy(up_out + i, &up_value, bytes);
-        __builtin_memcpy(gate_out + i, &gate_value, bytes);
+        if constexpr (swizzled) {
+            store_swizzled_vector(up_out, up_value, i);
+            store_swizzled_vector(gate_out, gate_value, i);
+        } else {
+            __builtin_memcpy(up_out + i, &up_value, bytes);
+            __builtin_memcpy(gate_out + i, &gate_value, bytes);
+        }
     }
 }
 
@@ -183,7 +217,24 @@ static __device__ __forceinline__ void publish_weight_tail(
     }
 }
 
-template<int project_rows = rows_per_tile>
+template<bool swizzled>
+static __device__ __forceinline__ iq3_xxs_mmvq_weights read_weights(const block_iq3_xxs * tile, int block, int kqs) {
+    if constexpr (swizzled) {
+        const auto * bytes = static_cast<const unsigned char *>(__builtin_assume_aligned(tile, sizeof(uint4)));
+        const int slot = block * iq3_parts_per_block + kqs / VDR_IQ3_XXS_Q8_1_MMVQ;
+        iq3_xxs_mmvq_weights weights;
+        const int field_bytes = iq3_parts_per_tile * sizeof(uint32_t);
+        __builtin_memcpy(&weights.qs.x, bytes + slot * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&weights.qs.y, bytes + field_bytes + slot * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&weights.aux, bytes + 2 * field_bytes + slot * sizeof(uint32_t), sizeof(uint32_t));
+        __builtin_memcpy(&weights.d, bytes + iq3_scale_offset + block * sizeof(uint16_t), sizeof(uint16_t));
+        return weights;
+    } else {
+        return load_iq_mmvq_weights(tile[block], kqs);
+    }
+}
+
+template<int project_rows = rows_per_tile, bool swizzled = false>
 static __device__ __forceinline__ void project(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
         const uint32_t * grid, float * out) {
@@ -203,12 +254,12 @@ static __device__ __forceinline__ void project(
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const int row = (2 * group + i) * weight_blocks;
-            const auto up_current = load_iq_mmvq_weights(up[row + kbx], kqs);
-            const auto gate_current = load_iq_mmvq_weights(gate[row + kbx], kqs);
+            const auto up_current = read_weights<swizzled>(up, row + kbx, kqs);
+            const auto gate_current = read_weights<swizzled>(gate, row + kbx, kqs);
             iq3_xxs_mmvq_weights up_next, gate_next;
             if (kbx_next < weight_blocks) {
-                up_next = load_iq_mmvq_weights(up[row + kbx_next], kqs);
-                gate_next = load_iq_mmvq_weights(gate[row + kbx_next], kqs);
+                up_next = read_weights<swizzled>(up, row + kbx_next, kqs);
+                gate_next = read_weights<swizzled>(gate, row + kbx_next, kqs);
             }
             tmp[i] += vec_dot_iq_q8_1_loaded<true>(up_current, current, grid);
             tmp_gate[i] += vec_dot_iq_q8_1_loaded<true>(gate_current, current, grid);
@@ -247,9 +298,12 @@ enum weight_mode : uint32_t {
     weights_pair = 128,
     weights_stage_pair = weights_stage | weights_pair,
     weights_share_pair = weights_share | weights_pair,
+    weights_swizzle = 256,
+    weights_stage_swizzled = weights_stage | weights_swizzle,
+    weights_share_swizzled = weights_share | weights_swizzle,
 };
 
-template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false, bool dot_ablation = false, bool paired_ablation = false>
+template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false, bool dot_ablation = false, bool paired_ablation = false, bool lds_layout = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -258,8 +312,8 @@ static __global__ void gate_up(
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
     __shared__ uint32_t input[tokens][activation_words];
-    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
-    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
+    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation || lds_layout ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
+    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation || lds_layout ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
 
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
@@ -340,7 +394,13 @@ static __global__ void gate_up(
     } else if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
-        if constexpr (paired_ablation) {
+        if constexpr (lds_layout) {
+            if (mode & weights_swizzle) {
+                stage_weights_vector_pair<true>(shared_up, shared_gate, up + offset, gate + offset, lane);
+            } else {
+                stage_weights_vector_pair(shared_up, shared_gate, up + offset, gate + offset, lane);
+            }
+        } else if constexpr (paired_ablation) {
             if (mode & weights_pair) {
                 stage_weights_vector_pair(shared_up, shared_gate, up + offset, gate + offset, lane);
             } else {
@@ -402,7 +462,11 @@ static __global__ void gate_up(
     auto * dst = out + (token * ranks + rank) * nrows + row0;
     const auto * token_activation = reinterpret_cast<const block_q8_1 *>(input[token]);
     if ((!ablation || (mode & weights_read)) && ((shared >> token) & 1)) {
-        project(shared_up, shared_gate, token_activation, grid, dst);
+        if (lds_layout && (mode & weights_swizzle)) {
+            project<rows_per_tile, true>(shared_up, shared_gate, token_activation, grid, dst);
+        } else {
+            project(shared_up, shared_gate, token_activation, grid, dst);
+        }
     } else {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
