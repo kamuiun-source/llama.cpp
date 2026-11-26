@@ -14,6 +14,7 @@
   生成上限512・4K・会話KV再利用の各2回では57.55→60.20 tok/s、ドラフト＋catch-up 6.03→5.20 ms/検証。第5問は全4回で指定の4項目を含め自然に完結し、前回の途中EOSは再現せず。通常起動にONを採用。出力が変わり得ることをフラグの説明に明記。[512上限での計測](../research/mtp3-efficiency-20261125.md#会話kvを維持した512トークン上限の再計測)
   HyperFlareを参照し、履歴行のKV専用処理、RTX内での候補間の受け渡し、2段のCUDA Graph化を候補として整理した。採用後のドラフトGGMLグラフは2回/検証。CUDA APIの起動・再captureは採用後構成で未計測。[次のMTP候補](../research/mtp3-efficiency-20261125.md#hyperflareを参考にした固定3幅mtpの次の統合候補)
   `codex/rocm-mtp3-catchup-kv-only` で、`CATCHUP_FIRST_DRAFT=kv-only` により履歴行はKV・QSAプール更新だけを実行する試作を比較。生成58.98→59.63 tok/s、ドラフト4.77→4.60 ms/検証。最後のOFFが最高速。QSAプールの棄却後の再構成と全20応答の完走を確認。既定OFF。[試作と比較](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
+  `codex/rocm-mtp3-rtx-draft-chain` ではKV専用OFFで、第1候補ID・隠れ状態をRTX内で受け渡す。初版では埋め込みのCPU lookupが待ちを残し、`47f7bb2bd` で選択行だけをRTXから読む経路に変更。候補間同期待ちが縮み、ドラフト4.79→4.51 ms/検証、生成60.57→60.17 tok/s。既定OFF。[試作と比較](../research/mtp3-efficiency-20261125.md#固定3幅の第1候補から第2候補へのrtx内受け渡し)
 
 - packed ExpertのCPU並列計算と量子化共有を `codex/rocm-integrated-test` に統合。固定3幅の通常起動は `SINGLE_MISS_CPU=on`。物理コア数でCPUへ回す最大件数を決め、ほかのミスはMI50へ送る。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
 

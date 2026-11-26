@@ -84,3 +84,5 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 会話のKVを再利用した上限512の比較では、生成57.55→60.20 tok/s、第5問は全4回で自然に完結した。バッチ形状に伴う演算順序や丸めの違いは出力差の候補。出力が分かれた位置のlogitは比較しておらず、原因は未確定。前回の途中EOSも再現しなかった。[通常起動](../rocm/10-decode-pipeline.md#mtpのcatch-upと第1候補をまとめる設定) · [比較結果](../research/mtp3-efficiency-20261125.md#会話kvを維持した512トークン上限の再計測)
 
 試作ブランチ `codex/rocm-mtp3-catchup-kv-only` では、同じモードファイルに `CATCHUP_FIRST_DRAFT=kv-only` を指定すると、catch-upの履歴行をKVとQSAプールの更新に限る。対照は採用済みの `CATCHUP_FIRST_DRAFT=on`。モード間で生成トークンや文面に差が出る。通常起動は `on`。[比較結果](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
+
+試作ブランチ `codex/rocm-mtp3-rtx-draft-chain` の `CATCHUP_FIRST_DRAFT=rtx-chain` は、固定3幅のgreedyで第1候補のIDと隠れ状態をRTX上の第2段へ渡す。KV専用処理はOFF。比較は `on` に切り替え、`LLAMA_MTP_RTX_CHAIN_TRACE=1` で候補間と最後の読み戻しを記録する。切り替えで生成トークンや文面が変わることがある。[比較結果](../research/mtp3-efficiency-20261125.md#固定3幅の第1候補から第2候補へのrtx内受け渡し)
