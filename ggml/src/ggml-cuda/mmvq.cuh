@@ -12,7 +12,9 @@ bool ggml_cuda_mmvq_trace_enabled(int device);
 #ifdef GGML_USE_HIP
 bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs);
 int ggml_hip_gfx906_lds_modes();
-
+bool ggml_hip_gfx906_iq3_share_enabled();
+bool ggml_hip_gfx906_iq3_share_launch_enabled(int lds_modes);
+void ggml_hip_gfx906_set_iq3_share(bool enabled);
 #endif
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);

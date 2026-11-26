@@ -6014,9 +6014,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     graph_key = ggml_cuda_graph_get_key(cgraph);
 #ifdef GGML_USE_HIP
     const int lds_modes = ggml_hip_gfx906_lds_modes();
-    if (lds_modes >= 0 && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+    const bool is_gfx906 = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20;
+    const bool iq3_share = is_gfx906 && ggml_hip_gfx906_iq3_share_launch_enabled(lds_modes);
+    if (is_gfx906) {
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
-        if (it != cuda_ctx->cuda_graphs.end() && it->second->gfx906_lds_modes != lds_modes) {
+        if (it != cuda_ctx->cuda_graphs.end() &&
+                (it->second->gfx906_lds_modes != lds_modes || it->second->gfx906_iq3_share != iq3_share)) {
             // Captured launches contain the kernel selected under the previous mode.
             cuda_ctx->cuda_graphs.erase(it);
         }
@@ -6028,6 +6031,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 #ifdef GGML_USE_HIP
         graph->gfx906_lds_modes = lds_modes;
+        graph->gfx906_iq3_share = iq3_share;
 #endif
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
@@ -7664,6 +7668,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #ifdef GGML_USE_HIP
     if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
         return (void *) ggml_hip_gfx906_set_lds_modes;
+    }
+    if (strcmp(name, "ggml_backend_hip_gfx906_iq3_share_enabled") == 0) {
+        return (void *) ggml_hip_gfx906_iq3_share_enabled;
+    }
+    if (strcmp(name, "ggml_backend_hip_set_gfx906_iq3_share") == 0) {
+        return (void *) ggml_hip_gfx906_set_iq3_share;
     }
 #endif
     if (strcmp(name, "ggml_backend_cuda_make_ssm_conv_history") == 0) {

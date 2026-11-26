@@ -1062,6 +1062,18 @@ MI50→RTXの転送元待ちには先行GPU計算を含む。CPUステージン�
 
 次の単体比較は同じ重み・入力・Expert IDを使い、重複0件・2位置共有・3位置共有の3パターンに絞る。現行LDS・4行、従来2行、共有2行のカーネル時間とTCC/EA読み出し要求、L2ヒット／ミスを比較する。まず重複0件で照合だけのコストを測り、重複時にメモリ要求が減るかを見る。減る場合は、既存のExpert選定時に位置と順位の表を組んで出力行ごとの照合をなくし、単独Expertは通常経路を維持する案を優先する。この段階ではカーネル分割を追加せず、実モデルでの試作は単体比較の結果を見て判断する。
 
+### IQ3_XXSの重み共有とLDS先読み・4行の併用
+
+`codex/rocm-iq3-weight-sharing` は統合版 `7e9dbd296` から分岐。固定3幅・gfx906のIQ3_XXS gate/up＋SwiGLUで、採用済みのLDS先読み・4出力行・1,600ブロックを共用する。旧試作の専用2行カーネルは廃止し、同じExpertが複数位置にあるときだけ重みの読み出しと復号を共有する。位置ごとの内積順と出力順位を維持する。同じ位置に同じ物理スロットが複数出る場合は、それぞれ従来どおりに計算する。
+
+カーネル固有の処理は `ggml/src/ggml-cuda/mmvq-iq3-weight-sharing.cuh`、試験用モードの読み込みは `tools/server/server-iq3-weight-sharing.h` に置いた。通常のディスパッチは適用条件と呼び出しを担当する。各waveの順位照合は3回のballotから1回にまとめた。別カーネルの発行や転送は加えていない。
+
+- 通常設定では共有OFF。起動時に `GGML_HIP_GFX906_MTP3_IQ3_XXS_SHARE_WEIGHTS=1` を指定すると共有候補になる。対象経路には採用設定の `GGML_HIP_GFX906_IQ_SIGN_DECODE=1`、`GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1`、`GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1` が必要。LDSのライブ設定を使う場合は `IQ3_XXS=4` を選ぶ。
+- 同じサーバーで切り替える場合は、起動時に `LLAMA_HIP_GFX906_IQ3_WEIGHT_SHARING_MODE_FILE` へコンテナ内の設定ファイルのパスを渡す。ファイルは `IQ3_WEIGHT_SHARING=on` または `IQ3_WEIGHT_SHARING=off` の1行。次のリクエスト前にアイドル状態で読み、実効モードの変わったHIP Graphを作り直す。Docker越しにファイルを差し替える場合は親ディレクトリをマウントする。
+- 発動時は `HIP gfx906 IQ3_XXS shared routed weights applied: LDS prefetch positions=3 row_groups=2` が初回に出る。実モデルの速度比較ではこの発動と同じLDS・4行設定を確認し、プロファイラーなしの結果とカーネル計測を分けて記録する。
+
+変更対象のHIP・CUDA・サーバー・グラフのオブジェクトをコンパイルした。MI50の単体テストでは、同じ入力・重みで、選択Expertが互いに異なる場合、2位置で共有する場合、3位置で共有する場合の3条件を確認した。すべて通常のLDS・4行版と19,200出力がビット一致。実モデルでの切り替え・速度・転送時間は未計測。
+
 ## 実ミス1件のExpertをCPUで計算する試作
 
 統合ブランチ `403378601` から `codex/rocm-single-miss-cpu` を作成した。固定MTP 3幅・単一バンク・直接tuple DMAを対象にする。常駐・仮置き・先読みで間に合う分を除き、残るExpert IDが1種類の層で、ページ固定済みのRAM原本からCPUでgate/up・SwiGLU・downを計算する。複数位置が同じExpertを選んだ場合も、その位置とRouter順位に対応する出力を合流する。
