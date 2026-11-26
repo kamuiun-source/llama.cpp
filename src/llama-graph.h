@@ -840,6 +840,7 @@ struct llm_graph_params {
     llm_graph_result * res;
     bool target_mtp_verify_three = false;
     bool target_mtp_verify_packed = false;
+    bool mtp_q8_head_pair_rows = false;
     bool mtp_history_kv_only = false;
     ggml_tensor * mtp_chain_embedding = nullptr;
     ggml_tensor * mtp_chain_hidden = nullptr;
@@ -925,6 +926,7 @@ struct llm_graph_params {
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
             next_router_score_mode == other.next_router_score_mode &&
+            mtp_q8_head_pair_rows == other.mtp_q8_head_pair_rows &&
             mtp_history_kv_only == other.mtp_history_kv_only &&
             mtp_chain_embedding == other.mtp_chain_embedding &&
             mtp_chain_hidden == other.mtp_chain_hidden &&

@@ -167,6 +167,7 @@ struct llama_context {
                               bool   profile = false,
                               bool   draft_cache_eligible = false);
 
+    void set_mtp_q8_head_pair_rows(bool enabled);
     bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
     bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }
     void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
@@ -435,6 +436,7 @@ private:
     ggml_backend_sched_ptr sched;
     std::unique_ptr<llama_mtp_rtx_chain> mtp_rtx_chain;
     bool publish_mtp_rtx_draft(int step);
+    bool mtp_q8_head_pair_rows = false;
     bool mtp_catchup_supported = false;
     bool mtp_history_kv_only = false;
     bool mtp_verify_three_enabled = false;

@@ -1,5 +1,6 @@
 #include "models.h"
 #include "qwen4exp-mtp-kv-only.h"
+#include "../../ggml/src/ggml-mtp-q8-head.h"
 #include "../llama-mtp-catchup.h"
 #include "llama-expert-placement.h"
 #include "llama-impl.h"
@@ -756,6 +757,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
         cur = ggml_reshape_2d(ctx0, cur, model.vocab.n_tokens(), count);
     } else {
         cur = build_lora_mm(model.output, cur, model.output_s);
+        if (params.mtp_q8_head_pair_rows && cur->op == GGML_OP_MUL_MAT && cur->src[0] == model.output &&
+                model.output->type == GGML_TYPE_Q8_0 && cur->ne[1] == 1) {
+            ggml_mtp_q8_head_set_pair_rows(cur);
+        }
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;

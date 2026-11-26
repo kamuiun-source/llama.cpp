@@ -86,3 +86,5 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 試作ブランチ `codex/rocm-mtp3-catchup-kv-only` では、同じモードファイルに `CATCHUP_FIRST_DRAFT=kv-only` を指定すると、catch-upの履歴行をKVとQSAプールの更新に限る。対照は採用済みの `CATCHUP_FIRST_DRAFT=on`。モード間で生成トークンや文面に差が出る。通常起動は `on`。[比較結果](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
 
 試作ブランチ `codex/rocm-mtp3-rtx-draft-chain` の `CATCHUP_FIRST_DRAFT=rtx-chain` は、固定3幅のgreedyで第1候補のIDと隠れ状態をRTX上の第2段へ渡す。KV専用処理はOFF。比較は `on` に切り替え、`LLAMA_MTP_RTX_CHAIN_TRACE=1` で候補間と最後の読み戻しを記録する。切り替えで生成トークンや文面が変わることがある。[比較結果](../research/mtp3-efficiency-20261125.md#固定3幅の第1候補から第2候補へのrtx内受け渡し)
+
+試作ブランチ `codex/rocm-mtp-q8-head` の `LLAMA_MTP_Q8_HEAD_MODE_FILE` は、ファイル内の `MTP_Q8_HEAD=pair` でAdaの1入力行・全語彙Q8_0ドラフト出力射影に2行グループを使う。`MTP_Q8_HEAD=off` で従来経路に戻る。設定はリクエスト間で読む。既定OFF、単体計測で再現性のある短縮は見られず保留。[試作と計測](../research/mtp3-efficiency-20261125.md#全語彙q8_0-lm_headの1入力行向け試作)

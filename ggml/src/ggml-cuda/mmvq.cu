@@ -2068,6 +2068,8 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+#include "mtp-q8-head.cuh"
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2256,6 +2258,9 @@ void ggml_cuda_mul_mat_vec_q(
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ids && !fusion && ggml_cuda_mtp_q8_head_pair_rows(ctx, src0, src1, dst, src1_q8_1.get(), s11, stream)) {
+        return;
+    }
     if (hc_down_split_k && hc_down_width3) {
         const int n = ne01 * ne11;
         ggml_cuda_pool_alloc<float> partial(ctx.pool(), n * hc_down_split_k_parts);

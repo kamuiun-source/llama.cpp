@@ -12,6 +12,7 @@
 #include "server-schema.h"
 #include "server-single-miss-cpu-mode.h"
 #include "server-mtp-catchup-mode.h"
+#include "server-mtp-q8-head-mode.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -3984,6 +3985,7 @@ private:
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
                         server_refresh_single_miss_cpu_mode(ctx_tgt, ctx_dft);
                         server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
+                        server_refresh_mtp_q8_head_mode(ctx_dft);
                     }
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks

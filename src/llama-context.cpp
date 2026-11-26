@@ -3712,6 +3712,7 @@ llm_graph_params llama_context::graph_params(
         /*.target_mtp_verify_three =*/ mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3,
         /*.target_mtp_verify_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
                 target_mtp_verify_width >= 3 && ubatch.n_tokens == target_mtp_verify_width,
+        /*.mtp_q8_head_pair_rows =*/ mtp_q8_head_pair_rows,
         /*.mtp_history_kv_only =*/ mtp_history_kv_only,
         /*.mtp_chain_embedding =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->embedding : nullptr,
         /*.mtp_chain_hidden =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->hidden : nullptr,
@@ -5895,6 +5896,18 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, true, false);
+}
+
+void llama_context::set_mtp_q8_head_pair_rows(bool enabled) {
+    if (model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            mtp_q8_head_pair_rows != enabled) {
+        synchronize();
+        mtp_q8_head_pair_rows = enabled;
+    }
+}
+
+void llama_set_mtp_q8_head_pair_rows(llama_context * ctx, bool enabled) {
+    ctx->set_mtp_q8_head_pair_rows(enabled);
 }
 
 bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
