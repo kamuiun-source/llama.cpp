@@ -11,6 +11,7 @@
 - ROCmの通常実行・GPU別の処理時間・直近の比較結果は [最新計測サマリ](../rocm/latest-performance.md) を参照する。計測完了時に該当項目を更新する。
 
 - `codex/rocm-integrated-test` の `cde1afc09` から `codex/rocm-mtp3-catchup-first-draft` を作成。固定3幅・2候補で、確定したcatch-upだけを次の第1候補の入力とまとめる。試作 `4336cdca7` は既定OFF。固定5問の各2回で生成56.60→60.85 tok/s、ドラフト＋catch-up 6.39→5.60 ms/検証。診断で採用0・1・2件のドラフトKV位置を確認。ONの第5問1回は43トークンで早期EOS。[条件、計測と調査](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
+  生成上限512・4K・会話KV再利用の各2回では57.55→60.20 tok/s、ドラフト＋catch-up 6.03→5.20 ms/検証。第5問は全4回で指定の4項目を含め自然に完結し、前回の途中EOSは再現せず。採用判断待ち。[512上限での計測](../research/mtp3-efficiency-20261125.md#会話kvを維持した512トークン上限の再計測)
 
 - packed ExpertのCPU並列計算と量子化共有を `codex/rocm-integrated-test` に統合。固定3幅の通常起動は `SINGLE_MISS_CPU=on`。物理コア数でCPUへ回す最大件数を決め、ほかのミスはMI50へ送る。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
 
