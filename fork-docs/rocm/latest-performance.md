@@ -87,6 +87,17 @@ GPU活動の各行では、コピーが同時進行している場合がある�
 
 MI50のカーネル表は同時トレースの部分集計。GPU活動の表に加算しない。採用設定でのRTXの型別時間は、今回のグラフ単位トレースでは未計測。
 
+## 同じGGUFによるPerplexityの短い比較
+
+Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 testを使用。コンテキスト・論理バッチ・マイクロバッチ512、先頭2区間、KVはF16、Flash AttentionとMTPはOFF。評価テキストのSHA-256は `173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`。両条件とも終了コード0。
+
+| 実行条件 | PPL |
+| --- | ---: |
+| `mxxm/llama-cpp-gfx906:rocm-727` 同梱ライブラリ（`b94959a64`、MI50＋CPU、自動配置） | 2.7831 ± 0.22903 |
+| 現行のROCm統合版（RTX＋MI50、通常のExpert配置、HIPプリフィルと対応するRTX融合を指定） | 2.7650 ± 0.22942 |
+
+比較元は同梱の `libllama-perplexity-impl.so` を最小のランチャーから呼んだ。現行版は同じ実行ソースの `d78d0ff09` で `llama-perplexity` をビルドし、MTP専用の直接tuple DMAなどは外した。現行版の最小設定でも表示精度で同じ2.7650だった。差は約0.65%で、2区間の予備比較とGPU配置の違いから品質の優劣は判断しない。固定3幅のMTP採用率やデコード単体の速度は別の計測で確認する。[比較元ログ](/home/t-saka/rocm-perplexity-20261126/pilot-baseline/run.log) · [統合版ログ](/home/t-saka/rocm-perplexity-20261126/pilot-current-hybrid-no-mtp-tuple/run.log)
+
 ## 最新の比較試作
 
 - **固定3幅のcatch-up＋第1候補の統合（通常起動ON）。** `codex/rocm-mtp3-catchup-first-draft` の `4336cdca7`。会話KV再利用、生成上限512、4K、device-pending有効の5問を同一サーバーでON/OFF各2回。生成57.55→60.20 tok/s（+4.6%）、ドラフト＋catch-up 6.03→5.20 ms/検証、MTP採用1,459/2,324→1,395/2,194。第5問は4回とも自然なEOSで、2K・上限128の試行で起きた43トークンの途中EOSは再現しなかった。以前の診断では両候補棄却後と第1候補だけ採用した場合のドラフトKV末尾を照合した。[手法・計測・出力](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)

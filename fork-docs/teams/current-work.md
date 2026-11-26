@@ -13,6 +13,7 @@
 - 上記59.37 tok/sのバイナリとライブラリをそのまま使い、同設定で新規サーバーから再実行。57.74 tok/s、MTP 699/1,124。ウォームアップは全8 ID一致、第1問は16トークン目から異なる。実行間の出力差を確認し、発生源は未特定。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行)
 - 同じ統合ビルドで `CATCHUP_FIRST_DRAFT=off` だけを変更し、固定5問を1回測定。生成56.15 tok/s、本体33.129 ms/回、ドラフト＋catch-up 6.049 ms/検証、MTP 720/1,158。新規サーバーでOFFのまま最初の2問を再実行すると、第1問の16トークン目でON同士と同じ `106806`→`159212` の出力差が再現した。発生源は未特定。[catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
 - catch-up統合は通常ONを継続。Astraが有効フラグと最新のJSONL・応答・別条件のlogitトレースを照合し、CPU Expertと次層先読みの組み合わせ、次点でプリフィルの常駐別グループ化を候補にした。第1問の分岐の原因は未特定。[採用一覧と数値差の候補](runtime-flags.md#現行の高速化一覧)
+- 同じFlash Next GGUFとWikiText-2の512トークン×2区間で、mxxm同梱の比較元はPPL 2.7831、現行のRTX＋MI50は2.7650。固定3幅専用経路はこの評価の対象外。[Perplexity計測](../rocm/latest-performance.md#同じggufによるperplexityの短い比較)
 - 固定3幅のMI50でIQ2_SとIQ4_NLを再調査。IQ2_Sは現行コードブックから符号込み4値LUTを7,232 Bで構成でき、全格子・全符号の復号一致をホストで確認。IQ4_NLはFurnaceのニブル・スケール別配置を現行2行のまま1層単体で比較する案。Furnaceの公開IQ4_NL経路は2次元重み向け、HerReiのExpert経路は1位置。新規GPU試作・計測は未実施。[論文と公開実装の再調査](../research/gfx906-iq2s-iq4nl-20261126.md)
 
 - `codex/rocm-integrated-test` の `cde1afc09` から `codex/rocm-mtp3-catchup-first-draft` を作成。固定3幅・2候補で、確定したcatch-upだけを次の第1候補の入力とまとめる。試作 `4336cdca7` は既定OFF。固定5問の各2回で生成56.60→60.85 tok/s、ドラフト＋catch-up 6.39→5.60 ms/検証。診断で採用0・1・2件のドラフトKV位置を確認。ONの第5問1回は43トークンで早期EOS。[条件、計測と調査](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
