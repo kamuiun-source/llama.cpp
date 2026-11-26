@@ -28,7 +28,8 @@ inline void server_refresh_single_miss_cpu_mode(llama_context * target, llama_co
     static int active = 0;
     const int requested = mode == "SINGLE_MISS_CPU=off" ? 0 : mode == "SINGLE_MISS_CPU=on" ? 1 :
             mode == "SINGLE_MISS_CPU=2" ? 2 : mode == "SINGLE_MISS_CPU=4" ? 4 :
-            mode == "SINGLE_MISS_CPU=2-shared" ? 6 : mode == "SINGLE_MISS_CPU=4-shared" ? 8 : -1;
+            mode == "SINGLE_MISS_CPU=2-shared" ? 6 : mode == "SINGLE_MISS_CPU=4-shared" ? 8 :
+            mode == "SINGLE_MISS_CPU=4-shared-pair" ? 9 : -1;
     if (!input.eof() || input.bad() || requested < 0) {
         if (!invalid) {
             LOG_WRN("invalid HIP single CPU miss mode file: %s\n", path);

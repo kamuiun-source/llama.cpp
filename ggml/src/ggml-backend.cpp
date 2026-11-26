@@ -1338,7 +1338,7 @@ struct ggml_backend_sched_single_miss {
 static std::atomic<int> hip_single_miss_cpu_mode{0};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
-    if (mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 8) {
+    if (mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 8 || mode == 9) {
         hip_single_miss_cpu_mode.store(mode, std::memory_order_relaxed);
     }
 }
