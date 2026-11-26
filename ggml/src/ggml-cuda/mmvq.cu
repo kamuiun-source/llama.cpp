@@ -1224,7 +1224,11 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
 #ifdef GGML_USE_HIP
     if constexpr (iq3_share) {
-        const int32_t route = iq3_route_plan[token_idx * ggml_hip_iq3_route_plan::ranks + channel_dst];
+        int32_t route = iq3_route_plan[token_idx * ggml_hip_iq3_route_plan::ranks + channel_dst];
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+        // Each gfx906 wave has one token and rank.
+        route = __builtin_amdgcn_readfirstlane(route);
+#endif
         if (iq3_share_project<c_rows_per_block, iq_row_groups, iq_lds_activation_blocks>(
                 vx, vgate, route, dst, staged_all_y, staged_grid, channel_x, blocks_per_row_x,
                 stride_row_x, stride_channel_x, stride_channel_dst, stride_col_dst)) {
