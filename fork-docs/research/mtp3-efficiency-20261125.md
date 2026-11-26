@@ -85,3 +85,15 @@
 ### 統合後の通常起動確認
 
 統合版 `405a676d6` は `4336cdca7` と実行ソースが一致し、ハッシュ照合した同じバイナリでONを1回確認。固定3幅、上限512、4K、会話KV再利用。全5問が自然なEOSで完結し、第5問は276トークンで指定の4項目を含んだ。第2〜5問の再利用トークン数は59 / 642 / 990 / 1,340。5問合算58.61 tok/s（1,274生成トークン）、第2〜5問合算61.36 tok/s。第1〜5問の速度は48.89 / 60.53 / 61.46 / 60.84 / 61.57 tok/s。ドラフト＋catch-up 5.43 ms/検証（557回）、MTP採用714/1,114。ON切替と統合発動を確認。応答中のスワップアウト0、サーバー終了コード0。[統合後の確認ログ](/home/t-saka/rocm-mtp3-catchup-adopted-20261126/session-batch-01)
+
+## HyperFlareを参考にした固定3幅MTPの次の統合候補
+
+2026-11-26、統合版 `39185d9cd` のソースと保存済みログを確認。固定3幅の実測557検証でドラフトのGGMLグラフは1,114回、スケジューラのsplitは2,228回。ドラフト区間は4.81 ms/検証で `cudaStreamSynchronize` 呼び出し内が4.05 ms/検証。同期の中にはGPU計算完了待ちも含む。catch-upは0.61 ms/検証で、プリフィル時・応答終端の反映も含む。これらのグラフ回数はCUDA APIの実起動回数とは別。採用前のNsight Systemsグラフ単位トレースも確認し、ドラフト281区間で `cudaGraphLaunch` は552回（272区間が各2回）、そのCPU API時間は平均約38 µs/区間だった。現在の統合バッチ形状でのCUDA起動・再capture回数は未計測。[採用後ログ](/home/t-saka/rocm-mtp3-catchup-adopted-20261126/session-batch-01) · [採用前Nsight](/home/t-saka/rocm-graph-granularity-20261126/profiled/cuda.sqlite)
+
+HyperFlareは、準備済みの形状と固定アドレスの作業領域を使い、ドラフト・本体検証・採用・状態確定をCUDA Graphに入れる。Qwen3.8の `PreparedMTP` はドラフト履歴だけを書き込む `cache_only` も持つ。確定履歴は、本体の実際の隠れ状態と採用トークンから作り直す。候補の再帰計算で得た近似状態は、そのまま確定キャッシュにはしない。[HyperFlare設計](https://github.com/NVIDIA/hyperflare-inference/blob/main/docs/mtp-design.md) · [Qwen3.8のPreparedMTP実装](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/recipes/qwen38/mtp.py)
+
+1. **履歴行のQSAとExpertを省略する。** 現在の `graph_mtp` は履歴行も第1候補の行もAttentionとFFN/MoEを通し、最後に語彙出力を1行へ絞る。単一MTP層では履歴行の先の層に渡す出力がない。全行のK/VとQSAの生キー・プール更新を維持し、query・選択・Attention出力・Expert計算は候補行に限る余地がある。既存の採用0/1/2件の統合回数134/132/288（ウォームアップ込み）では平均2.28行/統合が履歴専用。1行だけを計算する形にしても履歴行の入力投影やKV書き込みは必要。定常デコードを先に検証し、プール境界・棄却・会話KV再利用をまたいで位置と候補を照合する。
+2. **第1候補から第2候補への折り返しをRTX内に置く。** 現行のGreedyドラフトは既定でTop-Kをバックエンドに載せるが、CPUが `common_sampler_sample` で同期してIDを確定する。第1候補用の10,240要素のFP32隠れ状態をD2Hし、第2候補の入力へCPUから渡す。第2候補後にも隠れ状態の取得が走る。固定2候補かつ `p_min=0` の適格経路では、第1候補IDをGPUで選び、隠れ状態を永続バッファで第2段へ渡して、候補ID 2個を最後にまとめて受け取れる。第1候補の隠れ状態の往復（片方向40 KiB）、中間CPU同期待ち、未使用の第2候補隠れ状態の読み戻しが候補。Top-Kの同点処理と候補ID、正しい位置へのKV更新、失敗時の破棄を確認する。第2候補の演算は第1候補のIDと隠れ状態に依存するため順番に実行する。
+3. **CUDA Graphの形状を固定してドラフトの2段をまとめる。** 第2項がGPU内で完結し、入力・出力・一時領域のアドレスが安定したら、2段の順序を子グラフで結び、両段が別起動の場合にホスト発行を2回から1回へ減らせる。現状は履歴1〜3行に候補1行を足した2/3/4行と、第2候補の1行が交互に現れる。QSAの `can_reuse` は行数以外にもKV範囲・プール数・新規プール数を見る。既存の `LLAMA_MTP_DRAFT_GRAPH_CACHE2` の2枠では全状態を保持できず、過去の試行でも全体速度の改善は未確認。まず採用版で幅別の `cudaGraphLaunch`、capture/update、eagerカーネル、段間のGPU非活動を実測する。`MUL_MAT_ID` の同期フォールバックが発動すると現行バックエンドはcaptureを外すので、CUDA上のsplit構成も確認する。固定容量とマスクを使う場合は無効行がKVやQSAプールを書き換えない設計が必要。[CUDA 12.9 Graph APIとノード](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-c-programming-guide/index.html#cuda-graphs)
+
+本体の3位置検証全体を1つのCUDA Graphへ移す案は別設計。現行は48層でRTXとMI50のスケジュール、ホストのExpert選定と転送、CPUサンプラーによる採用、KV巻き戻しを挟む。RTX上のドラフト2段に範囲を絞る。さらに本体末尾のgreedy採用だけをRTXに置いて採用数と出力IDを返す方法は考えられるが、サンプラーの意味やEOS、巻き戻しの順序を維持する別変更になる。
