@@ -6,6 +6,28 @@
 
 単一バンク・Expert直接DMAのDocker設定は [固定3幅の採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)、機能別のON/OFFは [固定3幅の起動フラグ一覧](../rocm/10-decode-pipeline.md#固定3幅の起動フラグ一覧) を参照。移植を取り込んだ `codex/rocm-integrated-test` のMI50では、符号復号 `GGML_HIP_GFX906_IQ_SIGN_DECODE=1`、LDS先読み `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1`、3位置での出力4行 `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1` を採用する。
 
+### 現行の高速化一覧
+
+固定3幅の統合版で使用する設定。表の環境変数は `1`、モードファイルの値は `on`。
+
+| 対象 | 採用機能と設定 |
+| --- | --- |
+| MTP | 本体の固定3位置一括検証 `LLAMA_MTP_VERIFY_THREE`、確定位置の隠れ状態をRTX内で渡す `LLAMA_MTP_FIXED3_DEVICE_PENDING`、catch-upと第1候補の統合 `CATCHUP_FIRST_DRAFT=on` |
+| CPU Expert | `SINGLE_MISS_CPU=on`。実ミスの一部をCPUで並列計算し、gate/upとdownの量子化済み入力を共有。残りはMI50で計算 |
+| Expert配置・転送 | `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY`、`LLAMA_EXPERT_HIP_TUPLE_DMA`、`LLAMA_EXPERT_HIP_PINNED_UPLOAD`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP`。原本のページ固定はLinuxで自動適用 |
+| Expert先読み・プリフィル | `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH`、`LLAMA_EXPERT_HIP_PREFILL`。先読み8枠、実ミス優先、必要なヒットだけイベント待ち。対象層では現層のMI50投入後に次層Routerを発行 |
+| RTXとMI50の受け渡し | `GGML_SCHED_HIP_BATCH_DEVICE_INPUTS`、`GGML_SCHED_HIP_DUAL_PINNED_HANDOFF`、`GGML_SCHED_HIP_ASYNC_INPUT`、`GGML_SCHED_HIP_ASYNC_RETURN`、`GGML_SCHED_HIP_HOST_ROUTER_IDS`。対象形状で共有RAM直接書き込みと非同期の戻りを選択 |
+| RTX | Shared Expertの先行発行 `GGML_SCHED_HIP_SHARED_OVERLAP`。短いconcat `GGML_CUDA_CONCAT_SMALL`、SSMのsoftplusと係数乗算の融合 `GGML_CUDA_UNARY_MUL_BCAST`、GDNの正規化とゲートの融合 `GGML_CUDA_GDN_GATED_NORM` |
+| MI50 | 符号復号 `GGML_HIP_GFX906_IQ_SIGN_DECODE`、IQ2_SのQ8_1入力共有 `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT`、IQ3_XXSのLDS先読み・4行 `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH` と `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS`、IQ4_NL downの復号短縮 `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE` |
+
+### 出力の揺れを調べるON設定
+
+- **CPU Expertと次層先読みの併用。** CPUとMI50でExpert計算の量子化・内積経路が異なる。第1層の固定入力のIQ4_NL downで微小な数値差は観測済み。CPU候補は、常駐・仮置きに加え、先読みの転送を**発行済み**かで決まる。発行済みの転送は未完了でも先読み扱い。完了イベントは次に発行する候補を進めるので、発行済み集合を通じてCPUとMI50への配分を変え得る。今回の分岐との因果は未確認。[固定入力の比較](../rocm/03-expert-placement.md) · [転送キューの進行](../../src/llama-moe-cache.cpp#L2602) · [CPU配分](../../src/llama-moe-cache.cpp#L3598)
+- **非同期プリフィルと動的常駐。** Expertの常駐・仮置き状態でプリフィルのグループが分かれ、グループの幅で量子化行列演算のカーネル選択が変わり得る。別設定の保存済み診断では最初のプリフィル出力時点からスコア差があった。今回の同一ビルド再実行には層別の配分・カーネルの記録がない。[プリフィルのグループ化](../../src/llama-moe-cache.cpp#L2075) · [カーネル選択](../../ggml/src/ggml-cuda/ggml-cuda.cu#L2607)
+- **固定形状のカーネル改善。** IQ2_S入力共有は積和順を維持し、IQ3_XXSのLDS・4行とIQ4_NL復号短縮は固定入力の単体比較でビット一致を確認済み。今回の実行間の揺れを切り分ける優先度はCPU配分・プリフィルより低い。[MI50の比較記録](../rocm/10-decode-pipeline.md#固定3幅の起動フラグ一覧)
+
+統合版のJSONLは設定切替・リクエスト境界・メモリ統計を記録する。応答JSONにある第1問16トークン目の `106806` / `159212` の分岐はcatch-upのON同士・OFF同士で再現した。原因の切り分けは同じ接頭辞でCPU Expertだけ変更し、競合する2語の本体logit、実際のExpert計算先、必要ならプリフィルのグループ幅を照合する。通常の `CATCHUP_FIRST_DRAFT=on` は維持。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行) · [catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
+
 2026-11-24に、LDS先読みを通常起動で使う型はIQ3_XXSのみと確定した。IQ2_Sの先読みと4行は通常起動でOFFとし、他の改善を進める中でIQ2_Sがボトルネックになった場合に再調査する。[ON/OFFの実測](../rocm/10-decode-pipeline.md#両型lds先読みoffの追加2回)
 
 IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` で有効になり、`GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS=1` も指定すると4行になる。両変数の既定はOFF。IQ2_Sだけで試す場合はIQ3_XXSのLDSフラグをOFFにする。
