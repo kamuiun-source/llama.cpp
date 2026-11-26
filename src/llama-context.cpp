@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-mtp-catchup.h"
 
 #include "ggml.h"
 #include "../ggml/src/ggml-backend-mtp.h"
@@ -357,6 +358,9 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    mtp_catchup_supported = llama_mtp_catchup_mode_file() && model.arch == LLM_ARCH_QWEN4EXP &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.causal_attn && cparams.n_seq_max == 1 &&
+            cparams.n_ubatch == 1 && cparams.n_rs_seq == 0 && cparams.n_batch >= 4;
     if (const auto * placement = model.expert_placement.get()) {
         if (placement->max_ubatch > 1 && cparams.n_seq_max != 1) {
             throw std::runtime_error("packed expert batching requires a single sequence");
@@ -1272,7 +1276,7 @@ uint32_t llama_context::n_ubatch_prefill() const {
 
 uint32_t llama_context::n_ubatch_reserve() const {
     const uint32_t n_verify = mtp_verify_four_enabled ? 4 : mtp_verify_three_enabled ? 3 : 0;
-    return std::max(n_ubatch_prefill(), n_verify);
+    return std::max(n_ubatch_prefill(), mtp_catchup_supported ? 4u : n_verify);
 }
 
 uint32_t llama_context::n_seq_max() const {
@@ -2580,7 +2584,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify,
-                          llama_mtp_draft_row draft_row) {
+                          llama_mtp_draft_row draft_row, bool mtp_catchup) {
+    if (mtp_catchup && (!mtp_catchup_supported || batch_inp.tokens.size() < 2 || batch_inp.tokens.size() > 4)) {
+        return -1;
+    }
     if (prefill && sched) {
         ggml_backend_sched_hip_verify_stage_poll_flush(sched.get());
     }
@@ -2726,7 +2733,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
     llama_memory_context_ptr mctx;
     const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() :
-            std::max(cparams.n_ubatch, target_mtp_verify_width);
+            mtp_catchup ? uint32_t(batch_inp.tokens.size()) : std::max(cparams.n_ubatch, target_mtp_verify_width);
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch, embd_all);
@@ -5868,6 +5875,10 @@ bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
 
 int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, false, true, true);
+}
+
+int32_t llama_process_mtp_catchup_first(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode(*batch, false, true, false, llama_mtp_draft_row::normal, true);
 }
 
 int32_t llama_process_mtp_first_draft(llama_context * ctx, llama_batch_ext * batch, bool lazy) {

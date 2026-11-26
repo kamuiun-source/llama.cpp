@@ -24,3 +24,9 @@
 - **適応幅と状態再計算。** AMTP/DISCOの第2候補の停止判断は、同じ履歴・同じ実装での2幅/3幅のコストと確定数を使うと検証できる。既存autoは遅延の出た問を除く過去比較で40.28対39.95 tok/sで、優先度は低い。ReplaySSMの大きな効果は主に多リクエスト条件で、B=1のQwen3.5-122Bの投機比較は幅によって0.87〜1.12倍。現状のGDN本体0.290 ms/検証を踏まえ、状態コピーが別途重いと確認できたときに検討する。[AMTP](https://arxiv.org/abs/2610.28619) · [DISCO](https://arxiv.org/abs/2405.04304) · [ReplaySSM](https://arxiv.org/html/2610.13778v1#A5.SS3)
 
 ドラフトグラフ再利用、バックエンドサンプリング切り替え、固定3幅device-pendingは検証済み。グラフ再利用は部分計時の差が小さく、サンプリング切り替えは候補順位・受理率が一致し、device-pendingはホスト往復を減らしても過去の8K生成速度の改善を確認できなかった。[既存の比較](../rocm/10-decode-pipeline.md)
+
+## 固定3幅でのcatch-up統合の追加調査
+
+- ds4-qwenのMetal版は、採用済み履歴の反映と次のドラフトを因果順に並べて同時に投入する。独立した予測器チェックでは1,324比較すべてで最上位トークンが一致し、最大logit差は0.000596だった。公開の生成速度差は別のカーネル改善も含む。RTX上でドラフトのバッチ形状を変えた場合にも、出力と採用数を個別に照合する。[ds4-qwenの計測と検証](https://github.com/Anemll/ds4-qwen/blob/qwen3.8-flash-next/speed-bench/qwen38-mtp-decode.md)
+- Castagna Veloceは候補1個に限定する。理由として、候補2個では採用数によって統合バッチが2〜4行となり、CUDA Graphの再利用率が下がったこと、別モデルの4行経路でコピーのアサートが発生したことを挙げている。ドラフトのフルチェックポイントを使う場合も、復元で遅延した履歴行を落とさないように統合を避けている。[Castagna Veloceの適用条件](https://github.com/benpeterson40/castagna-veloce/blob/3483d46/common/speculative.cpp#L1575-L1582) · [チェックポイントの条件](https://github.com/benpeterson40/castagna-veloce/blob/3483d46/common/speculative.cpp#L2143-L2151)
+- 固定3幅では第2候補が第1候補のトークンと隠れ状態に依存する。まとめる対象は採用済みcatch-up行と第1候補の入力まで。第1候補だけの採用、両候補の棄却、それと両候補採用時の行数を確認し、試作のタイマーはドラフトとcatch-upの合計も比較する。

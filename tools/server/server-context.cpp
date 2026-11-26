@@ -11,6 +11,7 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-single-miss-cpu-mode.h"
+#include "server-mtp-catchup-mode.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1367,6 +1368,11 @@ struct server_slot {
                         " promotions=%" PRIu64 " writeback_bytes=%" PRIu64 " supported=%d\n",
                         task->id, expert_rounds, expert_initial, uint64_t(stats.n_gen), expert_total.requests, expert_total.misses,
                         expert_total.uploads, expert_total.bytes, expert_total.promotions, expert_total.writeback_bytes, expert_supported);
+            }
+            if (server_mtp_catchup_first_draft() && !common_speculative_flush_mtp_catchup(spec)) {
+                SLT_WRN(*this, "%s", "discarding slot with unfinished MTP catch-up\n");
+                common_speculative_discard_mtp_catchup(spec);
+                prompt_clear();
             }
             common_speculative_discard_mtp_anchor(spec, id);
 
@@ -3977,6 +3983,7 @@ private:
                     refresh_gfx906_lds_modes();
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
                         server_refresh_single_miss_cpu_mode(ctx_tgt, ctx_dft);
+                        server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
                     }
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
@@ -4723,6 +4730,10 @@ private:
                     return;
                 }
 
+                if (server_mtp_catchup_first_draft() && !common_speculative_flush_mtp_catchup(spec.get())) {
+                    throw std::runtime_error("failed to flush committed MTP catch-up before context shift");
+                }
+
                 // Shift context
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
@@ -4901,13 +4912,19 @@ private:
                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && draft.size() == 1 &&
                     pos > 0 && pos - 1 == ckpt.pos_max && common_speculative_keep_mtp_anchor(spec.get(), slot.id, pos, slot.sampled);
             if (ctx_dft && !keep_anchor) {
-                const auto draft_tail = mtp_logit_trace ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
+                const bool catchup_diag = llama_mtp_catchup_diagnostics();
+                const auto draft_tail = mtp_logit_trace || catchup_diag ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                }
+                if (catchup_diag) {
+                    SLT_INF(slot, "mtp catch-up draft reset: mode=%d from=%d before=%d after=%d\n",
+                            server_mtp_catchup_first_draft(), ckpt.pos_max + 1, draft_tail,
+                            llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id));
                 }
                 if (mtp_logit_trace) {
                     SLT_INF(slot, "mtp logits draft reset: index=%zu from=%d to=-1 draft_before=%d draft_after=%d\n",
@@ -5770,6 +5787,9 @@ private:
                     }
                 }
             } prompt_trace_request{trace_experts, trace_experts ? llama_set_expert_prompt_trace_request(trace_request) : -1};
+            if (server_mtp_catchup_first_draft() && !common_speculative_flush_mtp_catchup(spec.get())) {
+                throw std::runtime_error("failed to flush committed MTP catch-up before target decode");
+            }
             if (mtp_verify && phase == server_decode_telemetry::verify) {
                 ret = llama_process_mtp_verify(ctx_tgt, batch.view.get());
             } else {
@@ -5846,7 +5866,12 @@ private:
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 server_decode_telemetry::scope measure(decode_telemetry, ctx_dft, server_decode_telemetry::catchup);
-                ok = common_speculative_process(spec.get(), batch.view);
+                const bool defer_catchup = server_mtp_catchup_first_draft() && slots.size() == 1 &&
+                        mtp_verify && phase == server_decode_telemetry::verify && view_width == 3 &&
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) >= 2 &&
+                        ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && !params_base.speculative.has_synth() &&
+                        !params_base.speculative.draft.probabilistic;
+                ok = common_speculative_process(spec.get(), batch.view, defer_catchup);
             });
 
             if (!ok) {
@@ -6235,6 +6260,11 @@ private:
                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id), draft_tail,
                         llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id));
             }
+            if (llama_mtp_catchup_diagnostics() && n_draft == 2 && ctx_dft) {
+                SLT_INF(slot, "mtp catch-up rollback: mode=%d proposed=%zu accepted=%zu discard_from=%d draft_end=%d\n",
+                        server_mtp_catchup_first_draft(), n_draft, n_accepted, discard_from,
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id));
+            }
             if (mtp_observe) {
                 slot.mtp_depth.observe(n_draft, n_accepted, ggml_time_us());
             }
@@ -6260,6 +6290,16 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.finish_expert_round(n_draft, n_accepted, "stopped", expert_position);
+                    if (server_mtp_catchup_first_draft()) {
+                        bool flushed = false;
+                        server_decode_telemetry::scope measure(decode_telemetry, ctx_dft, server_decode_telemetry::catchup);
+                        if (!common_speculative_flush_mtp_catchup(spec.get(), &flushed)) {
+                            throw std::runtime_error("failed to flush final committed MTP catch-up");
+                        }
+                        if (flushed) {
+                            llama_synchronize(ctx_dft);
+                        }
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();

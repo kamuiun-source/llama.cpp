@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-mtp-catchup.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -10,6 +11,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-mtp-catchup.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -208,6 +210,9 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
+    virtual bool process_mtp_catchup(const common_batch & batch) { return process(batch); }
+    virtual bool flush_mtp_catchup(bool *) { return true; }
+    virtual void discard_mtp_catchup() {}
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1587,6 +1592,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     mutable size_t pending_d2h = 0;
     size_t draft_host_rows = 0;
 
+    common_mtp_catchup catchup;
+    size_t catchup_rows[3]{};
+    size_t catchup_fallbacks = 0;
+
     bool reuse_draft_anchor = false;
     struct draft_anchor {
         llama_pos pos = -1;
@@ -1734,6 +1743,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (catchup_rows[0] || catchup_rows[1] || catchup_rows[2] || catchup_fallbacks) {
+            SPC_INF("MTP catch-up first draft: fused_accept0=%zu fused_accept1=%zu fused_accept2=%zu flush=%zu\n",
+                    catchup_rows[0], catchup_rows[1], catchup_rows[2], catchup_fallbacks);
+        }
         if (auto_draft_row_metrics) {
             const auto stats = llama_get_mtp_draft_row_stats(params.ctx_dft);
             SPC_INF("MTP auto first draft row: enabled=%d candidates=%" PRIu64 " d2h=%" PRIu64
@@ -1851,6 +1864,89 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
         }
+    }
+
+    bool process_mtp_catchup(const common_batch & input) override {
+        GGML_ASSERT(!catchup.count);
+        if (n_seq != 1 || n_max != 2 || n_mtp_layers != 1 || !fixed_three_pending_requested ||
+                !multi_draft_device_pending || input.size() != 3 || !input.has_token() || input.has_embd()) {
+            return process(input);
+        }
+        auto * mem = llama_get_memory(params.ctx_dft);
+        const auto pos = input.tokens[0].pos[0];
+        if (pos <= 0 || llama_memory_seq_pos_max(mem, 0) != pos - 1 || !ensure_pending_device_row()) {
+            return process(input);
+        }
+        for (int i = 0; i < input.size(); ++i) {
+            const auto & t = input.tokens[i];
+            if (t.seq_id != 0 || !t.seq_ids_extra.empty() || t.id == LLAMA_TOKEN_NULL || !t.output || t.pos[0] != pos + i) {
+                return process(input);
+            }
+            catchup.rows[i] = {t.id, t.pos[0], i == 0 ? n_batch_tgt : i - 1};
+        }
+        catchup.count = 3;
+        return true;
+    }
+
+    bool flush_mtp_catchup(bool * flushed = nullptr) override {
+        if (!catchup.count) {
+            return true;
+        }
+        if (!catchup.confirmed) {
+            return false;
+        }
+        const auto pre_tail = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), 0);
+        if (pre_tail != catchup.first() - 1) {
+            return false;
+        }
+        batch.clear();
+        catchup.append(batch);
+        if (llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            rollback_mtp_catchup();
+            return false;
+        }
+        if (!commit_mtp_catchup(false, pre_tail)) {
+            return false;
+        }
+        ++catchup_fallbacks;
+        if (flushed) {
+            *flushed = true;
+        }
+        return true;
+    }
+
+    void discard_mtp_catchup() override {
+        if (catchup.count) {
+            catchup = {};
+            std::fill(pending_h[0].begin(), pending_h[0].end(), 0.0f);
+            device_pending_valid = false;
+            multi_draft_pending_host_valid = true;
+            verify_h_rows[0] = 0;
+        }
+    }
+
+    void rollback_mtp_catchup() {
+        auto * mem = llama_get_memory(params.ctx_dft);
+        if (!llama_memory_seq_rm(mem, 0, catchup.first(), -1)) {
+            GGML_ABORT("failed to roll back MTP catch-up");
+        }
+    }
+
+    bool commit_mtp_catchup(bool fused, llama_pos pre_tail) {
+        if (llama_mtp_catchup_diagnostics()) {
+            SPC_INF("MTP catch-up KV: seq=0 fused=%d accepted=%d pre_tail=%d first=%d last=%d post_tail=%d expected=%d\n",
+                    fused, catchup.accepted_row(), pre_tail, catchup.first(), catchup.last(),
+                    llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), 0), catchup.last() + fused);
+        }
+        if (!save_multi_draft_pending_row(catchup.accepted_row())) {
+            rollback_mtp_catchup();
+            return false;
+        }
+        if (fused) {
+            ++catchup_rows[catchup.accepted_row()];
+        }
+        catchup = {};
+        return true;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -2042,7 +2138,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool anchor_has_prefix = reuse_draft_anchor && dparams[0].drafting && dparams[0].pos0 > 0 &&
                 llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) == dparams[0].pos0 - 1;
 
+        bool fused = catchup.count && catchup.confirmed && dparams[0].drafting &&
+                dparams[0].pos0 == catchup.last() + 1 && !dparams[0].chain_mtp && !params.probabilistic &&
+                llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) == catchup.first() - 1;
+        if (catchup.count && !fused && !flush_mtp_catchup()) {
+            throw std::runtime_error("could not flush committed MTP catch-up");
+        }
         batch.clear();
+        if (fused) {
+            catchup.append(batch);
+        }
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
@@ -2080,7 +2185,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            if (multi_draft_pending_row || (device_pending && ensure_pending_device_row())) {
+            if (fused) {
+                batch.set_embd_state_row(idx, catchup.accepted_row());
+            } else if (multi_draft_pending_row || (device_pending && ensure_pending_device_row())) {
                 batch.set_embd_state_row(idx, n_batch_tgt);
             } else {
                 batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
@@ -2114,8 +2221,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const bool track_first_row = auto_draft_row_metrics && i == 0 && batch.size() == 1 && dparams[0].chain_mtp;
-            int ret = track_first_row ? llama_process_mtp_first_draft(ctx_dft, batch.get(), auto_draft_row_lazy) :
-                    llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            int ret;
+            if (fused) {
+                ret = llama_process_mtp_catchup_first(ctx_dft, batch.get());
+                if (ret == 0 && !commit_mtp_catchup(true, catchup.first() - 1)) {
+                    throw std::runtime_error("could not publish accepted MTP hidden row");
+                }
+                if (ret != 0) {
+                    rollback_mtp_catchup();
+                    if (!flush_mtp_catchup()) {
+                        throw std::runtime_error("could not recover committed MTP catch-up");
+                    }
+                    batch.clear();
+                    const int idx = batch.add(dparams[0].id_last, dparams[0].pos0, 0, true);
+                    if (ensure_pending_device_row()) {
+                        batch.set_embd_state_row(idx, n_batch_tgt);
+                    } else {
+                        batch.set_embd_state(idx, {pending_h[0].data(), 1, size_t(n_embd)});
+                    }
+                    i_last[0] = idx;
+                    ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                }
+                fused = false;
+            } else {
+                ret = track_first_row ? llama_process_mtp_first_draft(ctx_dft, batch.get(), auto_draft_row_lazy) :
+                        llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2245,7 +2376,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (catchup.count) {
+            GGML_ASSERT(seq_id == 0 && !is_other && n_accepted < catchup.count && !catchup.confirmed);
+            catchup.count = n_accepted + 1;
+            catchup.confirmed = true;
+            return;
+        }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -3343,7 +3480,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -3351,10 +3488,32 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        result = result && (defer_catchup ? impl->process_mtp_catchup(batch) : impl->process(batch));
     }
 
     return result;
+}
+
+bool common_speculative_flush_mtp_catchup(common_speculative * spec, bool * flushed) {
+    if (flushed) {
+        *flushed = false;
+    }
+    if (spec) {
+        for (auto & impl : spec->impls) {
+            if (!impl->flush_mtp_catchup(flushed)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void common_speculative_discard_mtp_catchup(common_speculative * spec) {
+    if (spec) {
+        for (auto & impl : spec->impls) {
+            impl->discard_mtp_catchup();
+        }
+    }
 }
 
 void common_speculative_draft(common_speculative * spec) {
