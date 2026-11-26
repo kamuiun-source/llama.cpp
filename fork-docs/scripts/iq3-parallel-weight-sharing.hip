@@ -148,7 +148,7 @@ void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup,
 }
 
 template<int count, typename Launch>
-void time_row_overlap(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches) {
+void time_row_overlap(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches, bool paired_ablation = false) {
     // Rotating this order balances every arm position and ordered adjacency.
     constexpr int order[] = {0, 1, count - 1, 2, 4, 3};
     std::array<std::vector<double>, count> samples;
@@ -195,6 +195,12 @@ void time_row_overlap(Launch launch, hipEvent_t start, hipEvent_t stop, int warm
         report("synchronous_minus_full", 2, 1);
         report("overlap_minus_synchronous", 3, 2);
         report("overlap_minus_full", 3, 1);
+    } else if (paired_ablation) {
+        report("paired_minus_vector_copy_only", 2, 1);
+        report("paired_minus_vector_full", 4, 3);
+        report("paired_full_minus_direct", 4, 0);
+        report("paired_full_minus_paired_copy_only", 4, 2);
+        report("paired_full_minus_stock", 4, 5);
     } else {
         report("old_synchronous_minus_old_full", 1, 0);
         report("matched_full_minus_old_full", 2, 0);
@@ -210,10 +216,11 @@ int main(int argc, char ** argv) {
     const bool vector_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-vector-copy") == 0;
     const bool row_overlap = argc == 2 && std::strcmp(argv[1], "--ablate-row-overlap") == 0;
     const bool row_decomposition = argc == 2 && std::strcmp(argv[1], "--ablate-row-decomposition") == 0;
-    const bool copy_ablation = batch_ablation || vector_ablation || row_overlap || row_decomposition;
+    const bool paired_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-paired-plane-copy") == 0;
+    const bool copy_ablation = batch_ablation || vector_ablation || row_overlap || row_decomposition || paired_ablation;
     const bool ablation = copy_ablation || (argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0);
     if (argc != 1 && !ablation) {
-        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy|--ablate-row-overlap|--ablate-row-decomposition]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy|--ablate-row-overlap|--ablate-row-decomposition|--ablate-paired-plane-copy]\n", argv[0]);
         return 1;
     }
     constexpr int ncols = 2560, nrows = 640, experts = 30, tokens = 3, ranks = 10;
@@ -261,7 +268,8 @@ int main(int argc, char ** argv) {
     const auto baseline = mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>;
     const auto split = iq3_parallel_weights::gate_up<true, false, false, true>;
     const auto dot_control = iq3_parallel_weights::gate_up<false, false, false, false, true>;
-    const auto grouped = vector_ablation || row_overlap || row_decomposition ? iq3_parallel_weights::gate_up<true, false, true> :
+    const auto grouped = paired_ablation ? iq3_parallel_weights::gate_up<true, false, false, false, false, true> :
+            vector_ablation || row_overlap || row_decomposition ? iq3_parallel_weights::gate_up<true, false, true> :
             batch_ablation ? iq3_parallel_weights::gate_up<true, true> : iq3_parallel_weights::gate_up<true>;
     const char * copy_contrast = vector_ablation ? "vector_minus_batched" : batch_ablation ? "batched_minus_serial" : nullptr;
     for (int multiplicity = first_multiplicity; multiplicity <= last_multiplicity; ++multiplicity) {
@@ -303,7 +311,7 @@ int main(int argc, char ** argv) {
             // A and B execute the same instructions. B requests additional, untouched dynamic LDS.
             // C, D, and E use one runtime-switched kernel and reserve identical resources.
             size_t padding = 0;
-            const int arm_count = row_decomposition ? 6 : row_overlap ? 4 : ablation_arms;
+            const int arm_count = row_decomposition || paired_ablation ? 6 : row_overlap ? 4 : ablation_arms;
             if (row_decomposition) {
                 constexpr const char * labels[] = {"old_vector_full", "old_split_synchronous", "full_dot",
                         "full_dot_trailing_barrier", "split_dot", "split_dot_inter_half_barrier"};
@@ -326,15 +334,24 @@ int main(int argc, char ** argv) {
                                 'A' + arm, labels[arm], attrs.sharedSizeBytes, attrs.numRegs, blocks);
                 }
             } else if (copy_ablation) {
-                hipFuncAttributes attrs{};
+                hipFuncAttributes attrs{}, stock_attrs{};
                 check(hipFuncGetAttributes(&attrs, reinterpret_cast<const void *>(grouped)));
-                const int blocks = active_blocks(grouped, block.x * block.y, 0);
+                const int threads = block.x * block.y;
+                const int blocks = active_blocks(grouped, threads, 0);
+                int stock_blocks = 0;
+                if (paired_ablation) {
+                    check(hipFuncGetAttributes(&stock_attrs, reinterpret_cast<const void *>(baseline)));
+                    stock_blocks = active_blocks(baseline, threads, 0);
+                }
                 constexpr const char * batch_labels[] = {"direct", "serial_copy_only", "batched_copy_only", "serial_full", "batched_full"};
                 constexpr const char * vector_labels[] = {"direct", "batched_copy_only", "vector_copy_only", "batched_full", "vector_full"};
-                const auto * labels = vector_ablation ? vector_labels : batch_labels;
-                for (int arm = 0; arm < ablation_arms; ++arm) {
+                constexpr const char * paired_labels[] = {"direct", "vector_copy_only", "paired_copy_only", "vector_full", "paired_full", "stock"};
+                const auto * labels = paired_ablation ? paired_labels : vector_ablation ? vector_labels : batch_labels;
+                for (int arm = 0; arm < arm_count; ++arm) {
+                    const bool stock = paired_ablation && arm == 5;
+                    const auto & resources = stock ? stock_attrs : attrs;
                     std::printf("ablation_resources arm=%c mode=%s lds_static=%zu lds_dynamic=0 vgpr_per_thread=%d max_active_blocks_per_cu=%d\n",
-                                'A' + arm, labels[arm], attrs.sharedSizeBytes, attrs.numRegs, blocks);
+                                'A' + arm, labels[arm], resources.sharedSizeBytes, resources.numRegs, stock ? stock_blocks : blocks);
                 }
             } else {
                 padding = report_ablation_resources(baseline, grouped, block.x * block.y);
@@ -350,6 +367,8 @@ int main(int argc, char ** argv) {
                     const auto kernel = arm < 2 ? grouped : split;
                     constexpr weight_mode modes[] = {weights_direct, weights_share_vector, weights_wait_early, weights_direct};
                     kernel<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, modes[arm]);
+                } else if (paired_ablation && arm == 5) {
+                    launch_stock(0);
                 } else if (copy_ablation) {
                     constexpr weight_mode batch_modes[] = {
                         weights_direct, weights_stage, weights_stage_batched, weights_share, weights_share_batched,
@@ -357,7 +376,10 @@ int main(int argc, char ** argv) {
                     constexpr weight_mode vector_modes[] = {
                         weights_direct, weights_stage_batched, weights_stage_vector, weights_share_batched, weights_share_vector,
                     };
-                    const weight_mode mode = vector_ablation ? vector_modes[arm] : batch_modes[arm];
+                    constexpr weight_mode paired_modes[] = {
+                        weights_direct, weights_stage_vector, weights_stage_pair, weights_share_vector, weights_share_pair,
+                    };
+                    const weight_mode mode = paired_ablation ? paired_modes[arm] : vector_ablation ? vector_modes[arm] : batch_modes[arm];
                     grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, mode);
                 } else if (arm < 2) {
                     launch_stock(arm == 1 ? padding : 0);
@@ -382,8 +404,8 @@ int main(int argc, char ** argv) {
                     return 3;
                 }
             }
-            if (row_decomposition) {
-                time_row_overlap<6>(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch);
+            if (row_decomposition || paired_ablation) {
+                time_row_overlap<6>(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch, paired_ablation);
             } else if (row_overlap) {
                 time_row_overlap<4>(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch);
             } else {

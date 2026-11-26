@@ -146,10 +146,29 @@ static __device__ __forceinline__ void issue_weight_pair(
 #endif
 }
 
-static __device__ __forceinline__ void wait_weight_tail() {
+static __device__ __forceinline__ void wait_weight_loads() {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
+}
+
+static __device__ __forceinline__ void stage_weights_vector_pair(
+        weight_tile & up_dst, weight_tile & gate_dst, const block_iq3_xxs * up, const block_iq3_xxs * gate, int lane) {
+    constexpr int bytes = sizeof(uint4);
+    static_assert(bytes == 16 && sizeof(weight_tile) % bytes == 0 && nrows % rows_per_tile == 0);
+    auto * up_out = static_cast<unsigned char *>(__builtin_assume_aligned(&up_dst, bytes));
+    auto * gate_out = static_cast<unsigned char *>(__builtin_assume_aligned(&gate_dst, bytes));
+    const auto * up_in = static_cast<const unsigned char *>(__builtin_assume_aligned(up, bytes));
+    const auto * gate_in = static_cast<const unsigned char *>(__builtin_assume_aligned(gate, bytes));
+
+    for (int unit = lane; unit < int(sizeof(weight_tile) / bytes); unit += 64) {
+        const int i = unit * bytes;
+        uint4 up_value, gate_value;
+        issue_weight_pair(up_in + i, gate_in + i, up_value, gate_value);
+        wait_weight_loads();
+        __builtin_memcpy(up_out + i, &up_value, bytes);
+        __builtin_memcpy(gate_out + i, &gate_value, bytes);
+    }
 }
 
 static __device__ __forceinline__ void publish_weight_tail(
@@ -225,9 +244,12 @@ enum weight_mode : uint32_t {
     weights_split_dot = 32,
     weights_extra_barrier = 64,
     weights_split_dot_barrier = weights_split_dot | weights_extra_barrier,
+    weights_pair = 128,
+    weights_stage_pair = weights_stage | weights_pair,
+    weights_share_pair = weights_share | weights_pair,
 };
 
-template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false, bool dot_ablation = false>
+template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false, bool dot_ablation = false, bool paired_ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -236,8 +258,8 @@ static __global__ void gate_up(
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
     __shared__ uint32_t input[tokens][activation_words];
-    alignas(vector_ablation || split_rows || dot_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
-    alignas(vector_ablation || split_rows || dot_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
+    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
+    alignas(vector_ablation || split_rows || dot_ablation || paired_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
 
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
@@ -274,7 +296,7 @@ static __global__ void gate_up(
                 issue_weight_pair(up_src + 64 * 16, gate_src + 64 * 16, pending.up_next, pending.gate_next);
             }
             if (mode & weights_wait_early) {
-                wait_weight_tail();
+                wait_weight_loads();
             }
         }
 
@@ -289,7 +311,7 @@ static __global__ void gate_up(
         }
 
         if (owner) {
-            wait_weight_tail();
+            wait_weight_loads();
             publish_weight_tail(shared_up, shared_gate, pending, lane);
         }
         __syncthreads();
@@ -318,7 +340,14 @@ static __global__ void gate_up(
     } else if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
-        if constexpr (vector_ablation) {
+        if constexpr (paired_ablation) {
+            if (mode & weights_pair) {
+                stage_weights_vector_pair(shared_up, shared_gate, up + offset, gate + offset, lane);
+            } else {
+                stage_weights_vector(shared_up, up + offset, lane);
+                stage_weights_vector(shared_gate, gate + offset, lane);
+            }
+        } else if constexpr (vector_ablation) {
             if (mode & weights_vector) {
                 stage_weights_vector(shared_up, up + offset, lane);
                 stage_weights_vector(shared_gate, gate + offset, lane);
