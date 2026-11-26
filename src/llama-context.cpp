@@ -1,5 +1,6 @@
 #include "llama-context.h"
 #include "llama-mtp-catchup.h"
+#include "llama-mtp-rtx-chain.h"
 
 #include "ggml.h"
 #include "../ggml/src/ggml-backend-mtp.h"
@@ -827,6 +828,14 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     mtp_draft_graph_cache_reset();
+    if (mtp_rtx_chain) {
+        const auto & chain = *mtp_rtx_chain;
+        LLAMA_LOG_INFO("MTP RTX draft chain: applied=%zu fallback=%zu second_before_submit_ms=%.3f second_submit_ms=%.3f"
+                " second_stream_wait_ms=%.3f final_read_wait_ms=%.3f\n", chain.applied, chain.failed,
+                chain.second_before_submit_us / 1000.0, chain.second_submit_us / 1000.0,
+                chain.second_stream_wait_ns / 1000000.0, chain.finish_us / 1000.0);
+        mtp_rtx_chain.reset();
+    }
     if (mtp_draft_graph_cache2 || mtp_draft_graph_cache_switches != 0) {
         LLAMA_LOG_INFO("MTP draft graph cache2: switches=%" PRIu64 " hits=%" PRIu64 "\n",
                 mtp_draft_graph_cache_switches, mtp_draft_graph_cache_hits);
@@ -2309,6 +2318,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             prefetch.cache->begin_next_router_prefetch(sched.get(), res->t_next_router, res->t_next_router_scores);
         }
         ggml_backend_sched_hip_verify_stage_record(stage_sched, "router_prefetch_setup", stage_prefetch_setup, true);
+        if (mtp_rtx_chain && mtp_rtx_chain->step == 1) {
+            mtp_rtx_chain->second_launch_us = ggml_time_us();
+        }
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, profile);
         stage_prefetch_finish = ggml_backend_sched_hip_verify_stage_time(stage_sched);
     }
@@ -2733,8 +2745,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
-    memory_update(false);
+    const bool chain_decode = mtp_rtx_chain && mtp_rtx_chain->step >= 0;
+    const bool chain_second = chain_decode && mtp_rtx_chain->step == 1;
+
+    // The first draft applied pending shifts before enqueuing its forward.
+    if (!chain_second) {
+        memory_update(false);
+    }
 
     llama_memory_context_ptr mctx;
     const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() :
@@ -2758,7 +2775,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize) {
+                    if (!did_optimize && !chain_second) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -2948,7 +2965,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (!chain_decode && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3033,7 +3050,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             // the device buffer replaces the host extraction, see build_h_nextn_dev()
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
+            if (!chain_decode && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -3072,7 +3089,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
-        if (has_samplers) {
+        if (has_samplers && !chain_decode) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
@@ -3535,6 +3552,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
+    if (mtp_rtx_chain && mtp_rtx_chain->step == 1) {
+        return mtp_rtx_chain->result.get();
+    }
     return sched_draft_alt_active ? gf_res_draft_alt.get() : gf_res_prev[n_outputs > 0].get();
 }
 
@@ -3693,6 +3713,8 @@ llm_graph_params llama_context::graph_params(
         /*.target_mtp_verify_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
                 target_mtp_verify_width >= 3 && ubatch.n_tokens == target_mtp_verify_width,
         /*.mtp_history_kv_only =*/ mtp_history_kv_only,
+        /*.mtp_chain_token =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->first_id : nullptr,
+        /*.mtp_chain_hidden =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->hidden : nullptr,
     };
 }
 
@@ -5881,6 +5903,12 @@ bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {
 
 int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, false, true, true);
+}
+
+#include "llama-mtp-rtx-chain.inc"
+
+bool llama_process_mtp_rtx_chain(llama_context * ctx, llama_batch_ext * first, llama_batch_ext * second, llama_token * ids) {
+    return ctx->process_mtp_rtx_chain(*first, *second, ids);
 }
 
 int32_t llama_process_mtp_catchup_first(llama_context * ctx, llama_batch_ext * batch, bool history_kv_only) {

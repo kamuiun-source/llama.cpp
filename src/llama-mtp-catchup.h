@@ -15,3 +15,11 @@ inline bool llama_mtp_catchup_diagnostics() {
     }();
     return enabled;
 }
+
+inline bool llama_mtp_rtx_chain_trace() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_RTX_CHAIN_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}

@@ -1548,6 +1548,12 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    struct {
+        ggml_backend_t backend;
+        uint8_t * pinned;
+        size_t capacity;
+        size_t used;
+    } mtp_draft_chain_inputs;
     bool batch_host_inputs;
     size_t host_input_batches;
     size_t batched_host_inputs;
@@ -3819,6 +3825,8 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
     return last - first + 1;
 }
 
+#include "ggml-backend-mtp-draft-chain.inc"
+
 static int ggml_backend_sched_batch_host_inputs(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int first) {
     ggml_backend_buffer_t buffer = nullptr;
     ggml_tensor * copies[GGML_SCHED_MAX_SPLIT_INPUTS];
@@ -4383,6 +4391,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ++sched->shared_return_copies;
                     sched->shared_return_bytes += bytes;
                     sched->mtp_three_shared_return_copies += input->ne[1] == 3;
+                    continue;
+                }
+                if (sched->mtp_draft_chain_inputs.backend &&
+                        ggml_backend_sched_mtp_draft_chain_input(sched, split_backend, input,
+                            tensor_copy(input, split_backend_id, sched->cur_copy))) {
                     continue;
                 }
                 if (sched->batch_host_inputs && (input->flags & GGML_TENSOR_FLAG_INPUT)) {

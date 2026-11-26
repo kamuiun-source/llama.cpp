@@ -12,6 +12,7 @@ enum server_mtp_catchup_mode {
     SERVER_MTP_CATCHUP_OFF,
     SERVER_MTP_CATCHUP_ON,
     SERVER_MTP_CATCHUP_KV_ONLY,
+    SERVER_MTP_CATCHUP_RTX_CHAIN,
 };
 
 inline server_mtp_catchup_mode server_mtp_catchup_first_draft(bool refresh = false, llama_context * target = nullptr, llama_context * draft = nullptr) {
@@ -33,7 +34,7 @@ inline server_mtp_catchup_mode server_mtp_catchup_first_draft(bool refresh = fal
         mode.remove_suffix(1);
     }
     if (!file.eof() || file.bad() || (mode != "CATCHUP_FIRST_DRAFT=off" && mode != "CATCHUP_FIRST_DRAFT=on" &&
-            mode != "CATCHUP_FIRST_DRAFT=kv-only")) {
+            mode != "CATCHUP_FIRST_DRAFT=kv-only" && mode != "CATCHUP_FIRST_DRAFT=rtx-chain")) {
         if (!invalid) {
             LOG_WRN("invalid MTP catch-up mode file: %s\n", path);
             invalid = true;
@@ -41,7 +42,8 @@ inline server_mtp_catchup_mode server_mtp_catchup_first_draft(bool refresh = fal
         return active;
     }
     invalid = false;
-    const auto requested = mode == "CATCHUP_FIRST_DRAFT=kv-only" ? SERVER_MTP_CATCHUP_KV_ONLY :
+    const auto requested = mode == "CATCHUP_FIRST_DRAFT=rtx-chain" ? SERVER_MTP_CATCHUP_RTX_CHAIN :
+            mode == "CATCHUP_FIRST_DRAFT=kv-only" ? SERVER_MTP_CATCHUP_KV_ONLY :
             mode == "CATCHUP_FIRST_DRAFT=on" ? SERVER_MTP_CATCHUP_ON : SERVER_MTP_CATCHUP_OFF;
     if (requested != active) {
         llama_synchronize(target);

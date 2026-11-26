@@ -42,6 +42,8 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_mtp_rtx_chain;
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -172,6 +174,7 @@ struct llama_context {
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false,
                llama_mtp_draft_row draft_row = llama_mtp_draft_row::normal, bool mtp_catchup = false, bool mtp_history_kv_only = false);
+    bool process_mtp_rtx_chain(const llama_batch_ext & first, const llama_batch_ext & second, llama_token * ids);
     const float * read_mtp_first_draft_row(int32_t index);
     void discard_mtp_first_draft_row();
     llama_mtp_draft_row_stats get_mtp_draft_row_stats() const { return mtp_draft_row_stats; }
@@ -430,6 +433,8 @@ private:
     ggml_tensor * mtp_vocab_ids = nullptr;
 
     ggml_backend_sched_ptr sched;
+    std::unique_ptr<llama_mtp_rtx_chain> mtp_rtx_chain;
+    bool publish_mtp_rtx_draft(int step);
     bool mtp_catchup_supported = false;
     bool mtp_history_kv_only = false;
     bool mtp_verify_three_enabled = false;

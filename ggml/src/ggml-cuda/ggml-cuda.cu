@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "sync-telemetry.cuh"
+#include "mtp-draft-chain.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -7736,6 +7737,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_get_features;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_mtp_draft_chain") == 0) {
+        return (void *)ggml_backend_cuda_mtp_draft_chain;
+    }
     if (strcmp(name, "ggml_backend_cuda_get_wait_telemetry") == 0) {
         return (void *)ggml_backend_cuda_get_wait_telemetry;
     }

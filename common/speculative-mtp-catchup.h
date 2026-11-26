@@ -14,6 +14,7 @@ struct common_mtp_catchup {
     int count = 0;
     bool confirmed = false;
     bool history_kv_only = false;
+    bool rtx_chain = false;
 
     void append(common_batch & batch) const {
         for (int i = 0; i < count; ++i) {

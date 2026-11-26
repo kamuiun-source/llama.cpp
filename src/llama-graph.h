@@ -841,6 +841,8 @@ struct llm_graph_params {
     bool target_mtp_verify_three = false;
     bool target_mtp_verify_packed = false;
     bool mtp_history_kv_only = false;
+    ggml_tensor * mtp_chain_token = nullptr;
+    ggml_tensor * mtp_chain_hidden = nullptr;
     bool trace_next_router = false;
     int next_router_score_mode = 0;
 
@@ -924,6 +926,8 @@ struct llm_graph_params {
             trace_next_router == other.trace_next_router &&
             next_router_score_mode == other.next_router_score_mode &&
             mtp_history_kv_only == other.mtp_history_kv_only &&
+            mtp_chain_token == other.mtp_chain_token &&
+            mtp_chain_hidden == other.mtp_chain_hidden &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

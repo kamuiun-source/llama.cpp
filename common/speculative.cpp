@@ -210,7 +210,7 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
-    virtual bool process_mtp_catchup(const common_batch & batch, bool) { return process(batch); }
+    virtual bool process_mtp_catchup(const common_batch & batch, bool, bool) { return process(batch); }
     virtual bool flush_mtp_catchup(bool *) { return true; }
     virtual void discard_mtp_catchup() {}
 
@@ -1592,9 +1592,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     mutable size_t pending_d2h = 0;
     size_t draft_host_rows = 0;
 
+    common_batch rtx_second_batch;
     common_mtp_catchup catchup;
     size_t catchup_rows[3]{};
     size_t catchup_fallbacks = 0;
+    size_t rtx_chain_attempts = 0, rtx_chain_applied = 0;
+    size_t first_host_samples = 0;
+    int64_t first_host_sample_us = 0;
 
     bool reuse_draft_anchor = false;
     struct draft_anchor {
@@ -1743,6 +1747,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (first_host_samples || rtx_chain_attempts) {
+            SPC_INF("MTP RTX draft chain route: attempted=%zu applied=%zu first_host_samples=%zu first_host_sample_ms=%.3f\n",
+                    rtx_chain_attempts, rtx_chain_applied, first_host_samples, first_host_sample_us / 1000.0);
+        }
         if (catchup_rows[0] || catchup_rows[1] || catchup_rows[2] || catchup_fallbacks) {
             SPC_INF("MTP catch-up first draft: fused_accept0=%zu fused_accept1=%zu fused_accept2=%zu flush=%zu\n",
                     catchup_rows[0], catchup_rows[1], catchup_rows[2], catchup_fallbacks);
@@ -1866,7 +1874,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool process_mtp_catchup(const common_batch & input, bool history_kv_only) override {
+    bool process_mtp_catchup(const common_batch & input, bool history_kv_only, bool rtx_chain) override {
         GGML_ASSERT(!catchup.count);
         if (n_seq != 1 || n_max != 2 || n_mtp_layers != 1 || !fixed_three_pending_requested ||
                 !multi_draft_device_pending || input.size() != 3 || !input.has_token() || input.has_embd()) {
@@ -1886,6 +1894,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         catchup.count = 3;
         catchup.history_kv_only = history_kv_only;
+        catchup.rtx_chain = rtx_chain;
         return true;
     }
 
@@ -1933,11 +1942,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool commit_mtp_catchup(bool fused, llama_pos pre_tail) {
+    bool commit_mtp_catchup(bool fused, llama_pos pre_tail, int drafts = 1) {
         if (llama_mtp_catchup_diagnostics()) {
             SPC_INF("MTP catch-up KV: seq=0 fused=%d accepted=%d pre_tail=%d first=%d last=%d post_tail=%d expected=%d\n",
                     fused, catchup.accepted_row(), pre_tail, catchup.first(), catchup.last(),
-                    llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), 0), catchup.last() + fused);
+                    llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), 0), catchup.last() + (fused ? drafts : 0));
         }
         if (!save_multi_draft_pending_row(catchup.accepted_row())) {
             rollback_mtp_catchup();
@@ -2202,6 +2211,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (fused && catchup.rtx_chain && n_drafting == 1 && params.p_min == 0.0f && params.n_max == 2 &&
+                params.n_min <= 2 && dparams[0].n_max >= 2 && dparams[0].temp == 0.0f &&
+                backend_chains[0] && !llama_mtp_vocab_subset_enabled(ctx_dft)) {
+            if (!rtx_second_batch.batch) {
+                rtx_second_batch = common_batch(ctx_dft);
+            }
+            rtx_second_batch.clear();
+            rtx_second_batch.add(dparams[0].id_last, dparams[0].pos0 + 1, 0, true);
+            llama_token ids[2];
+            ++rtx_chain_attempts;
+            if (llama_process_mtp_rtx_chain(ctx_dft, batch.get(), rtx_second_batch.get(), ids)) {
+                if (!commit_mtp_catchup(true, catchup.first() - 1, 2)) {
+                    throw std::runtime_error("could not publish accepted MTP hidden row");
+                }
+                ++rtx_chain_applied;
+                auto * smpl = smpls[0].get();
+                for (llama_token id : ids) {
+                    common_sampler_accept(smpl, id, true);
+                    dparams[0].result->push_back(id);
+                }
+                return;
+            }
+            rollback_mtp_catchup();
+        }
+
+        static const bool measure_first_host = llama_mtp_catchup_mode_file() != nullptr;
+        const bool trace_fused = fused && llama_mtp_rtx_chain_trace();
+        const bool trace_fallback = catchup.rtx_chain;
         int i = 0;
 
         while (n_drafting > 0) {
@@ -2265,10 +2302,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int64_t sample_start = i == 0 && measure_first_host ? ggml_time_us() : 0;
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const bool defer_hidden_row = dparams[seq_id].chain_mtp != nullptr;
                 const float * h_row = device_pending || defer_hidden_row ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                if (sample_start) {
+                    ++first_host_samples;
+                    const auto sample_us = ggml_time_us() - sample_start;
+                    first_host_sample_us += sample_us;
+                    if (trace_fused) {
+                        SPC_INF("MTP RTX draft boundary: mode=%s first_host_sample_us=%" PRId64 "\n",
+                                trace_fallback ? "rtx-chain-fallback" : "on", sample_us);
+                    }
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -3481,7 +3528,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup, bool history_kv_only) {
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup, bool history_kv_only, bool rtx_chain) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -3489,7 +3536,7 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && (defer_catchup ? impl->process_mtp_catchup(batch, history_kv_only) : impl->process(batch));
+        result = result && (defer_catchup ? impl->process_mtp_catchup(batch, history_kv_only, rtx_chain) : impl->process(batch));
     }
 
     return result;

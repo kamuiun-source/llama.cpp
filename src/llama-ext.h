@@ -26,6 +26,7 @@ struct llama_mtp_draft_row_stats {
     uint64_t fallback    = 0;
 };
 
+LLAMA_API bool llama_process_mtp_rtx_chain(struct llama_context * ctx, struct llama_batch_ext * first, struct llama_batch_ext * second, llama_token * ids);
 LLAMA_API int32_t llama_process_mtp_catchup_first(struct llama_context * ctx, struct llama_batch_ext * batch, bool history_kv_only);
 LLAMA_API int32_t llama_process_mtp_first_draft(struct llama_context * ctx, struct llama_batch_ext * batch, bool lazy);
 LLAMA_API const float * llama_read_mtp_first_draft_row(struct llama_context * ctx, int32_t index);
