@@ -7755,6 +7755,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
 #endif
 #ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_hip_is_gfx906") == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20;
+        };
+    }
     if (strcmp(name, "ggml_backend_hip_set_mtp3_compact_slot_map") == 0) {
         return (void *) ggml_hip_set_mtp3_compact_slot_map;
     }

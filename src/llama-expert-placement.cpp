@@ -18,12 +18,24 @@
 
 using namespace llama_expert_profile;
 
-std::vector<int32_t> llama_expert_placement::layer_map::scratch_slots(int32_t n_slots) const {
+std::vector<int32_t> llama_expert_placement::layer_map::scratch_slots(int32_t n_slots, bool cpu_zero) const {
     if (n_slots <= 0 || n_slots > n_experts - n_resident) {
         throw std::runtime_error("invalid packed expert scratch capacity");
     }
-    const int32_t n_gpu = n_resident + n_slots;
+    const int32_t zero_slot = n_resident + n_slots;
+    const bool has_pool = prefetch_slots.front() >= 0;
+    const int32_t n_gpu = zero_slot + (has_pool ? int(cpu_zero) + int(prefetch_slots.size()) : 0);
+    GGML_ASSERT(n_gpu <= n_experts);
     std::array<bool, n_experts> gpu_used{};
+    if (has_pool) {
+        if (cpu_zero) {
+            gpu_used[zero_slot] = true;
+        }
+        for (int32_t slot : prefetch_slots) {
+            GGML_ASSERT(slot >= 0 && slot < n_gpu && !gpu_used[slot]);
+            gpu_used[slot] = true;
+        }
+    }
     std::array<bool, n_experts - n_resident> host_used{};
     for (int32_t expert = 0; expert < n_experts; ++expert) {
         const int32_t gpu_slot = resident[expert];
@@ -116,7 +128,22 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
         const char * value = std::getenv("LLAMA_EXPERT_HIP_TUPLE_DMA");
         return value && std::strcmp(value, "1") == 0;
     }()), hip_single_miss_cpu(hip_tuple_dma && hip_mtp_verify_three && !hip_mtp_verify_four &&
-            !overlap && llama_single_miss_cpu_configured()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_four ? 4 : hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
+            !overlap && llama_single_miss_cpu_configured()), n_prefetch_in_place([&] {
+        const char * mode_file = std::getenv(llama_next_prefetch_in_place::mode_file_env);
+        const char * next_router = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH");
+        const char * hit_wait = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT");
+        const char * after_submit = std::getenv("LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT");
+        if (!mode_file || !*mode_file || !next_router || std::strcmp(next_router, "1") != 0 ||
+                (hit_wait && std::strcmp(hit_wait, "1") != 0) || (after_submit && std::strcmp(after_submit, "1") != 0) ||
+                !hip_tuple_dma || !hip_mtp_verify_three || hip_mtp_verify_four || !dynamic_resident || overlap || n_expert_used != 10) {
+            return 0;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(target);
+        using is_gfx906_t = bool (*)(ggml_backend_dev_t);
+        const auto is_gfx906 = reg ? reinterpret_cast<is_gfx906_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_is_gfx906")) : nullptr;
+        return is_gfx906 && is_gfx906(target) ? llama_next_prefetch_in_place::slots : 0;
+    }()), n_slots(packed_scratch_capacity(n_expert_used, hip_mtp_verify_four ? 4 : hip_mtp_verify_three ? 3 : max_ubatch)), prefill_tokens([&] {
         const char * value = std::getenv("LLAMA_EXPERT_PREFILL_32");
         const char * wide = std::getenv("LLAMA_EXPERT_PREFILL_512");
         const bool small = value && std::strcmp(value, "1") == 0;
@@ -213,7 +240,7 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
     auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1],
-            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots + int(hip_single_miss_cpu)));
+            overlap ? n_resident + 1 + int(hip_overlap_promotion) : packed_gpu_slots());
     auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
@@ -357,6 +384,7 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
     if (!tuple_host_ctx || !tuple_bank_ctx) {
         throw std::runtime_error("could not create HIP Expert tuple contexts");
     }
+    size_t prefetch_in_place_bytes = 0;
     for (int il = 0; il < n_layers; ++il) {
         if (gate_up_count[il] != 2 || down_count[il] != 1) {
             throw std::runtime_error("HIP Expert tuple DMA requires two gate/up planes and one down plane per layer");
@@ -364,7 +392,11 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
         auto & tuple = tuples[il];
         tuple.stride = (sizes[il] + alignments[il] - 1) / alignments[il] * alignments[il];
         tuple.host = ggml_new_tensor_1d(tuple_host_ctx.get(), GGML_TYPE_I8, (n_experts - n_resident) * tuple.stride);
-        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots + int(hip_single_miss_cpu)) * tuple.stride);
+        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, packed_gpu_slots() * tuple.stride);
+        for (int i = 0; i < n_prefetch_in_place; ++i) {
+            maps[il].prefetch_slots[i] = packed_gpu_slots() - n_prefetch_in_place + i;
+        }
+        prefetch_in_place_bytes += n_prefetch_in_place * tuple.stride;
         ggml_format_name(tuple.host, "expert_tuple_host.%d", il);
         ggml_format_name(tuple.device, "expert_tuple_bank.%d", il);
     }
@@ -394,6 +426,10 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
             ggml_backend_buffer_get_size(bank_buf.get()), resident_payload_bytes, ram_payload_bytes, mlock_requested);
     if (fallback_bytes) {
         throw std::runtime_error("HIP Expert tuple DMA allocation fell back to pageable memory");
+    }
+    if (n_prefetch_in_place) {
+        LLAMA_LOG_INFO("expert placement HIP next prefetch in-place: slots_per_layer=%d reserved_bytes=%zu\n",
+                n_prefetch_in_place, prefetch_in_place_bytes);
     }
 #ifdef __linux__
     auto locks = lock_tuple_host();

@@ -52,6 +52,14 @@ static void prompt_trace_array(std::ostream & out, const T & values) {
     out << ']';
 }
 
+namespace {
+std::atomic<bool> next_prefetch_in_place_enabled{false};
+}
+
+void llama_set_next_prefetch_in_place(bool enabled) {
+    next_prefetch_in_place_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
 // slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
 // CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
@@ -595,6 +603,11 @@ struct llama_moe_cache::impl {
     size_t next_prefetch_score_readback_fallback = 0;
     size_t next_prefetch_score_row_fallback = 0;
     std::array<int32_t, next_prefetch_slots> next_prefetch_ids{};
+    std::array<int32_t, next_prefetch_slots> next_prefetch_direct_slots{};
+    std::vector<ggml_backend_event_ptr> next_prefetch_reuse_events;
+    std::array<bool, llama_expert_profile::n_layers> next_prefetch_reuse_pending{};
+    bool next_prefetch_in_place = false;
+    std::array<llama_next_prefetch_in_place::totals, 2> next_prefetch_in_place_stats;
     std::array<ggml_backend_event_ptr, next_prefetch_slots> next_prefetch_events;
     std::array<int32_t, next_prefetch_slots> next_prefetch_source_slots{};
     size_t next_prefetch_sources = 0;
@@ -947,7 +960,7 @@ struct llama_moe_cache::impl {
                 }
                 l.packed_scratch.assign(placement->n_slots, -1);
                 if (placement->dynamic_resident) {
-                    l.packed_scratch_slots = placement->maps[il].scratch_slots(placement->n_slots);
+                    l.packed_scratch_slots = placement->maps[il].scratch_slots(placement->n_slots, placement->hip_single_miss_cpu);
                 }
                 if (placement->dynamic_resident || placement->hip_overlap_promotion) {
                     l.packed_last_used.assign(llama_expert_profile::n_experts, 0);
@@ -2492,6 +2505,17 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_WARN("packed expert HIP next Router prefetch: event queries unavailable, submitting all speculative transfers after split submit\n");
             }
         }
+        if (placement->n_prefetch_in_place && next_prefetch_demand_priority) {
+            next_prefetch_reuse_events.resize(placement->maps.size());
+            for (auto & event : next_prefetch_reuse_events) {
+                event.reset(ggml_backend_event_new(placement->target));
+                if (!event) {
+                    next_prefetch_reuse_events.clear();
+                    LLAMA_LOG_WARN("HIP MTP3 next Expert prefetch in-place: recycle events unavailable; using legacy bank\n");
+                    break;
+                }
+            }
+        }
         const char * async_demand = std::getenv("LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND");
         if (async_demand && std::strcmp(async_demand, "1") == 0) {
             if (next_prefetch_demand_priority && hip_mtp_slot_staging && hip_mtp_promotion_async) {
@@ -2631,6 +2655,21 @@ struct llama_moe_cache::impl {
         next_prefetch_score_empty += eligible == 0;
     }
 
+    int32_t reserve_next_prefetch_slot(int32_t layer, size_t index) {
+        if (!next_prefetch_in_place || index >= size_t(placement->n_prefetch_in_place) || next_prefetch_reuse_events.empty()) {
+            return -1;
+        }
+        if (next_prefetch_reuse_pending[layer]) {
+            // An unready recycle never delays speculation or the real demand stream.
+            if (!next_prefetch_event_ready(next_prefetch_backend.get(), next_prefetch_reuse_events[layer].get())) {
+                ++next_prefetch_in_place_stats[1].reuse_busy;
+                return -1;
+            }
+            next_prefetch_reuse_pending[layer] = false;
+        }
+        return placement->maps[layer].prefetch_slots[index];
+    }
+
     void submit_next_prefetch(int32_t layer, int32_t expert, int32_t host_slot, bool beyond_top10) {
         const auto & tuple = placement->tuples[layer];
         const auto * host = static_cast<const uint8_t *>(tuple.host->data);
@@ -2644,8 +2683,15 @@ struct llama_moe_cache::impl {
             next_prefetch_tail_pending = true;
         }
         const int64_t start = next_profile_start ? ggml_time_us() : 0;
-        ggml_backend_tensor_set_async(next_prefetch_backend.get(), next_prefetch_bank, host + host_slot * tuple.stride,
-                next_prefetch_count * tuple.stride, tuple.stride);
+        const int32_t direct = reserve_next_prefetch_slot(layer, next_prefetch_count);
+        next_prefetch_direct_slots[next_prefetch_count] = direct;
+        auto * bank = direct >= 0 ? tuple.device : next_prefetch_bank;
+        const size_t offset = (direct >= 0 ? size_t(direct) : next_prefetch_count) * tuple.stride;
+        ggml_backend_tensor_set_async(next_prefetch_backend.get(), bank, host + host_slot * tuple.stride, offset, tuple.stride);
+        if (direct >= 0) {
+            ++next_prefetch_in_place_stats[1].submitted;
+            demand_trace(layer, "prefetch_in_place_h2d", 1, tuple.stride);
+        }
         if (next_prefetch_hit_wait) {
             ggml_backend_event_record(next_prefetch_events[next_prefetch_count].get(), next_prefetch_backend.get());
         }
@@ -2982,6 +3028,11 @@ struct llama_moe_cache::impl {
             next_profile_d2d_submit_us += ggml_time_us() - start;
         }
         next_prefetch_d2d_bytes += tuple.stride;
+        if (placement->n_prefetch_in_place) {
+            auto & stats = next_prefetch_in_place_stats[next_prefetch_in_place];
+            ++stats.copied;
+            stats.copied_bytes += tuple.stride;
+        }
     }
 
 
@@ -3001,7 +3052,12 @@ struct llama_moe_cache::impl {
         size_t bytes = 0;
         size_t prefetch_hits = 0;
         size_t prefetch_top20_hits = 0;
-        std::array<moe_cache_lru::fill, next_prefetch_slots> needed;
+        struct prefetch_hit {
+            int32_t index;
+            int32_t slot;
+            int32_t scratch_index;
+        };
+        std::array<prefetch_hit, next_prefetch_slots> needed;
         int32_t last_needed = -1;
         const auto submit = [&](ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
             const int64_t start = callback_totals ? ggml_time_us() : 0;
@@ -3023,7 +3079,7 @@ struct llama_moe_cache::impl {
                     if (prefetched >= 0) {
                         if (next_prefetch_hit_wait) {
                             GGML_ASSERT(prefetch_hits < needed.size());
-                            needed[prefetch_hits] = {prefetched, slot};
+                            needed[prefetch_hits] = {prefetched, slot, fill.slot};
                             last_needed = std::max(last_needed, prefetched);
                         } else {
                             copy_next_prefetch(next_prefetch_backend.get(), tuple, prefetched, slot);
@@ -3066,9 +3122,31 @@ struct llama_moe_cache::impl {
                 demand_trace(il, "prefetch_prefix_wait", last_needed + 1);
                 ++next_prefetch_dependencies;
                 next_prefetch_dependency_slots += last_needed + 1;
+                if (placement->n_prefetch_in_place) {
+                    ++next_prefetch_in_place_stats[next_prefetch_in_place].prefix_waits;
+                }
+                bool recycled = false;
                 for (size_t i = 0; i < prefetch_hits; ++i) {
-                    copy_next_prefetch(backend, placement->tuples[il], needed[i].expert, needed[i].slot);
-                    demand_trace(il, "d2d_submit", 1, placement->tuples[il].stride);
+                    const auto & hit = needed[i];
+                    const int32_t direct = next_prefetch_direct_slots[hit.index];
+                    if (direct >= 0) {
+                        auto & tail = placement->maps[il].prefetch_slots[hit.index];
+                        auto & scratch = layers[il].packed_scratch_slots[hit.scratch_index];
+                        GGML_ASSERT(tail == direct && scratch == hit.slot && tail != scratch);
+                        std::swap(tail, scratch);
+                        recycled = true;
+                        ++next_prefetch_in_place_stats[1].used;
+                        next_prefetch_in_place_stats[1].avoided_bytes += placement->tuples[il].stride;
+                        demand_trace(il, "prefetch_in_place_hit", 1, placement->tuples[il].stride);
+                    } else {
+                        copy_next_prefetch(backend, placement->tuples[il], hit.index, hit.slot);
+                        demand_trace(il, "d2d_submit", 1, placement->tuples[il].stride);
+                    }
+                }
+                if (recycled) {
+                    // The current lookup excludes released slots. Prior readers precede this event.
+                    ggml_backend_event_record(next_prefetch_reuse_events[il].get(), backend);
+                    next_prefetch_reuse_pending[il] = true;
                 }
             }
         } catch (...) {
@@ -3815,14 +3893,15 @@ struct llama_moe_cache::impl {
                 if (profile && n_uploads == 1) {
                     upload_start_us = ggml_time_us();
                 }
-                const int32_t slot = packed_slot(l, scratch_index);
+                const int32_t prefetched = next_prefetch_in_place || trace_row ? next_prefetch_slot(il, expert) : -1;
+                const int32_t direct = prefetched >= 0 ? next_prefetch_direct_slots[prefetched] : -1;
+                const int32_t slot = direct >= 0 ? direct : packed_slot(l, scratch_index);
                 if (trace_row) {
                     auto & row = *trace_row;
                     row << (trace_uploads++ ? "," : "") << "{\"expert\":" << expert << ",\"slot\":" << slot;
                     if (trace_generation) {
-                        const bool prefetched = next_prefetch_slot(il, expert) >= 0;
-                        row << ",\"bytes\":" << (prefetched ? 0 : trace_tuple_bytes);
-                        if (prefetched) {
+                        row << ",\"bytes\":" << (prefetched >= 0 ? 0 : trace_tuple_bytes);
+                        if (prefetched >= 0) {
                             row << ",\"prefetched\":true";
                         }
                     }
@@ -3944,7 +4023,7 @@ struct llama_moe_cache::impl {
                     const int64_t prep_start = measure ? ggml_time_us() : 0;
                     int32_t * plan = staging + slot_entries;
                     const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
-                    strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu));
+                    strata::build(plan, ids.data(), slots.data(), zero_slot, placement->packed_gpu_slots());
                     if (measure) {
                         stats->prep_us += ggml_time_us() - prep_start;
                         ++stats->plans;
@@ -4322,6 +4401,16 @@ struct llama_moe_cache::impl {
                         compact_slot_map_layers, compact_slot_map_async + compact_slot_map_sync, compact_slot_map_async,
                         compact_slot_map_sync, compact_slot_map_bytes, compact_slot_map_saved_bytes, compact_slot_map_fallback);
             }
+            if (placement->n_prefetch_in_place) {
+                for (int mode = 0; mode < int(next_prefetch_in_place_stats.size()); ++mode) {
+                    const auto & stats = next_prefetch_in_place_stats[mode];
+                    LLAMA_LOG_INFO("packed HIP MTP3 next Expert prefetch in-place: mode=%s available=%d"
+                            " submitted_in_place=%zu used_in_place=%zu hit_d2d=%zu hit_d2d_bytes=%zu avoided_bytes=%zu"
+                            " prefix_waits=%zu reuse_busy_fallbacks=%zu\n",
+                            mode ? "on" : "off", !next_prefetch_reuse_events.empty(), stats.submitted, stats.used, stats.copied,
+                            stats.copied_bytes, stats.avoided_bytes, stats.prefix_waits, stats.reuse_busy);
+                }
+            }
             if (hip_mtp_slot_staging && hip_mtp_slot_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",
                         hip_mtp_async_maps, hip_mtp_async_map_bytes);
@@ -4563,6 +4652,7 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     auto & self = *pimpl;
     GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
+    self.next_prefetch_in_place = self.placement->n_prefetch_in_place && next_prefetch_in_place_enabled.load(std::memory_order_relaxed);
     self.next_readback_totals = self.next_readback.begin_graph(self.next_profile_start != 0);
     GGML_ASSERT(!self.next_prefetch_score_mode || scores.size() == predictions.size());
     self.next_prefetch_scores = self.next_prefetch_score_mode ? &scores : nullptr;

@@ -5,6 +5,8 @@
 #include "llama-mmap.h"
 #include "llama.h"
 
+#include "llama-next-prefetch-in-place.h"
+
 #include <atomic>
 
 struct llama_model_loader;
@@ -33,8 +35,9 @@ struct llama_expert_placement {
         std::array<int32_t, llama_expert_profile::n_experts> resident;
         std::array<int32_t, llama_expert_profile::n_experts> host;
         int32_t hip_spare_hot_slot = llama_expert_profile::n_resident + 1;
+        llama_next_prefetch_in_place::pool prefetch_slots = {-1, -1};
 
-        std::vector<int32_t> scratch_slots(int32_t n_slots) const;
+        std::vector<int32_t> scratch_slots(int32_t n_slots, bool cpu_zero) const;
     };
 
     llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used);
@@ -53,8 +56,12 @@ struct llama_expert_placement {
     const bool hip_mtp_direct_ram;
     const bool hip_tuple_dma;
     const bool hip_single_miss_cpu;
+    const int32_t n_prefetch_in_place;
     const int32_t n_slots;
     const int32_t prefill_tokens;
+    int32_t packed_gpu_slots() const {
+        return llama_expert_profile::n_resident + n_slots + int(hip_single_miss_cpu) + n_prefetch_in_place;
+    }
     int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;
     mutable std::atomic<bool> context_in_use{false};
     std::array<layer_map, llama_expert_profile::n_layers> maps;
