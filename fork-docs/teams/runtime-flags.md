@@ -28,6 +28,12 @@
 
 統合版のJSONLは設定切替・リクエスト境界・メモリ統計を記録する。応答JSONにある第1問16トークン目の `106806` / `159212` の分岐はcatch-upのON同士・OFF同士で再現した。原因の切り分けは同じ接頭辞でCPU Expertだけ変更し、競合する2語の本体logit、実際のExpert計算先、必要ならプリフィルのグループ幅を照合する。通常の `CATCHUP_FIRST_DRAFT=on` は維持。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行) · [catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
 
+### MTP固定3幅の機能単体比較
+
+- 通常の対話計測は固定3幅・自然な採用判定で行い、生成 tok/s、本体 ms/検証、候補別採用率、生成トークン/検証を記録する。機能による速度差を見るときは、そのカーネルまたは処理区間の時間と、通った回数・転送量を照合する。
+- 採用率やExpert選択の変動が大きい場合、単体では同じ入力・重み・Expert IDを使い、実グラフでは同じ履歴と2候補を使う固定3位置の比較を行う。既存のlogit診断は参照IDを指定でき、候補も一致させる無棄却の対照を作れる。診断はバックエンドサンプリングを無効にするため、通常速度の代用にはしない。catch-upや巻き戻しの比較には、棄却0・1・2候補を含む同じ検証列が必要。
+- `--spec-synth-rates` と `--spec-synth-len` は現行の専用固定3幅と併用できない。MTPを切ると3位置専用のGPU経路を比較できなくなる。[固定3幅の起動条件](../../tools/server/server-context.cpp#L2258) · [参照IDを使う診断](../../tools/server/server-context.cpp#L2299)
+
 2026-11-24に、LDS先読みを通常起動で使う型はIQ3_XXSのみと確定した。IQ2_Sの先読みと4行は通常起動でOFFとし、他の改善を進める中でIQ2_Sがボトルネックになった場合に再調査する。[ON/OFFの実測](../rocm/10-decode-pipeline.md#両型lds先読みoffの追加2回)
 
 IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` で有効になり、`GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS=1` も指定すると4行になる。両変数の既定はOFF。IQ2_Sだけで試す場合はIQ3_XXSのLDSフラグをOFFにする。
