@@ -147,13 +147,53 @@ void time_ablation(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup,
                 median(d_minus_e), *consume.first, *consume.second);
 }
 
+template<typename Launch>
+void time_row_overlap(Launch launch, hipEvent_t start, hipEvent_t stop, int warmup, int trials, int launches) {
+    constexpr int order[4][4] = {{0, 1, 3, 2}, {1, 2, 0, 3}, {2, 3, 1, 0}, {3, 0, 2, 1}};
+    std::array<std::vector<double>, 4> samples;
+    std::vector<double> split_minus_full, overlap_minus_split, overlap_minus_full;
+    for (int trial = -warmup; trial < trials; ++trial) {
+        const auto & arms = order[(trial + warmup) % 4];
+        std::array<double, 4> timings{};
+        for (int arm : arms) {
+            timings[arm] = time_batch([&] { launch(arm); }, start, stop, launches);
+        }
+        if (trial < 0) {
+            continue;
+        }
+        for (int arm = 0; arm < 4; ++arm) {
+            samples[arm].push_back(timings[arm]);
+        }
+        split_minus_full.push_back(timings[2] - timings[1]);
+        overlap_minus_split.push_back(timings[3] - timings[2]);
+        overlap_minus_full.push_back(timings[3] - timings[1]);
+        std::printf("ablation_sample trial=%d order=%c%c%c%c A_us=%.6f B_us=%.6f C_us=%.6f D_us=%.6f\n",
+                    trial, 'A' + arms[0], 'A' + arms[1], 'A' + arms[2], 'A' + arms[3],
+                    timings[0], timings[1], timings[2], timings[3]);
+    }
+    for (int arm = 0; arm < 4; ++arm) {
+        const auto bounds = std::minmax_element(samples[arm].begin(), samples[arm].end());
+        std::printf("ablation_timing arm=%c samples=%d launches_per_sample=%d median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                    'A' + arm, trials, launches, median(samples[arm]), *bounds.first, *bounds.second);
+    }
+    const auto report = [](const char * name, const std::vector<double> & timings) {
+        const auto bounds = std::minmax_element(timings.begin(), timings.end());
+        std::printf("ablation_paired_delta contrast=%s median_us=%.6f min_us=%.6f max_us=%.6f\n",
+                    name, median(timings), *bounds.first, *bounds.second);
+    };
+    report("synchronous_minus_full", split_minus_full);
+    report("overlap_minus_synchronous", overlap_minus_split);
+    report("overlap_minus_full", overlap_minus_full);
+}
+
 int main(int argc, char ** argv) {
     const bool batch_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-load-batching") == 0;
     const bool vector_ablation = argc == 2 && std::strcmp(argv[1], "--ablate-vector-copy") == 0;
-    const bool copy_ablation = batch_ablation || vector_ablation;
+    const bool row_overlap = argc == 2 && std::strcmp(argv[1], "--ablate-row-overlap") == 0;
+    const bool copy_ablation = batch_ablation || vector_ablation || row_overlap;
     const bool ablation = copy_ablation || (argc == 2 && std::strcmp(argv[1], "--ablate-lds") == 0);
     if (argc != 1 && !ablation) {
-        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--ablate-lds|--ablate-load-batching|--ablate-vector-copy|--ablate-row-overlap]\n", argv[0]);
         return 1;
     }
     constexpr int ncols = 2560, nrows = 640, experts = 30, tokens = 3, ranks = 10;
@@ -199,7 +239,8 @@ int main(int argc, char ** argv) {
     const int first_multiplicity = ablation ? 2 : 1;
     const int last_multiplicity = ablation ? 2 : 3;
     const auto baseline = mul_mat_vec_q_moe<GGML_TYPE_IQ3_XXS, 2, true, true, 3, 2, false, false, false>;
-    const auto grouped = vector_ablation ? iq3_parallel_weights::gate_up<true, false, true> :
+    const auto split = iq3_parallel_weights::gate_up<true, false, false, true>;
+    const auto grouped = vector_ablation || row_overlap ? iq3_parallel_weights::gate_up<true, false, true> :
             batch_ablation ? iq3_parallel_weights::gate_up<true, true> : iq3_parallel_weights::gate_up<true>;
     const char * copy_contrast = vector_ablation ? "vector_minus_batched" : batch_ablation ? "batched_minus_serial" : nullptr;
     for (int multiplicity = first_multiplicity; multiplicity <= last_multiplicity; ++multiplicity) {
@@ -241,7 +282,18 @@ int main(int argc, char ** argv) {
             // A and B execute the same instructions. B requests additional, untouched dynamic LDS.
             // C, D, and E use one runtime-switched kernel and reserve identical resources.
             size_t padding = 0;
-            if (copy_ablation) {
+            const int arm_count = row_overlap ? 4 : ablation_arms;
+            if (row_overlap) {
+                constexpr const char * labels[] = {"direct", "vector_full", "split_synchronous", "split_overlap"};
+                for (int arm = 0; arm < arm_count; ++arm) {
+                    const auto kernel = arm < 2 ? grouped : split;
+                    hipFuncAttributes attrs{};
+                    check(hipFuncGetAttributes(&attrs, reinterpret_cast<const void *>(kernel)));
+                    const int blocks = active_blocks(kernel, block.x * block.y, 0);
+                    std::printf("ablation_resources arm=%c mode=%s lds_static=%zu lds_dynamic=0 vgpr_per_thread=%d max_active_blocks_per_cu=%d\n",
+                                'A' + arm, labels[arm], attrs.sharedSizeBytes, attrs.numRegs, blocks);
+                }
+            } else if (copy_ablation) {
                 hipFuncAttributes attrs{};
                 check(hipFuncGetAttributes(&attrs, reinterpret_cast<const void *>(grouped)));
                 const int blocks = active_blocks(grouped, block.x * block.y, 0);
@@ -257,7 +309,11 @@ int main(int argc, char ** argv) {
             }
             const auto launch = [&](int arm) {
                 using namespace iq3_parallel_weights;
-                if (copy_ablation) {
+                if (row_overlap) {
+                    const auto kernel = arm < 2 ? grouped : split;
+                    constexpr weight_mode modes[] = {weights_direct, weights_share_vector, weights_wait_early, weights_direct};
+                    kernel<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, modes[arm]);
+                } else if (copy_ablation) {
                     constexpr weight_mode batch_modes[] = {
                         weights_direct, weights_stage, weights_stage_batched, weights_share, weights_share_batched,
                     };
@@ -273,7 +329,7 @@ int main(int argc, char ** argv) {
                     grouped<<<parallel_grid, block>>>(up_gpu, gate_gpu, input_gpu, ids_gpu, groups_gpu, out_gpu, modes[arm - 2]);
                 }
             };
-            for (int arm = 0; arm < ablation_arms; ++arm) {
+            for (int arm = 0; arm < arm_count; ++arm) {
                 if (arm != 0 || copy_ablation) {
                     copy_output([&] { launch(arm); }, on);
                 }
@@ -289,7 +345,11 @@ int main(int argc, char ** argv) {
                     return 3;
                 }
             }
-            time_ablation(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch, copy_contrast);
+            if (row_overlap) {
+                time_row_overlap(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch);
+            } else {
+                time_ablation(launch, event_start, event_stop, warmup_batches, measured_pairs, launches_per_batch, copy_contrast);
+            }
             check(hipFree(groups_gpu));
             check(hipFree(ids_gpu));
             continue;

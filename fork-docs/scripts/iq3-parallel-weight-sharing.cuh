@@ -107,19 +107,63 @@ static __device__ __forceinline__ void stage_weights_batched(weight_tile & dst, 
 #endif
 }
 
+template<int bytes_to_copy = sizeof(weight_tile)>
 static __device__ __forceinline__ void stage_weights_vector(weight_tile & dst, const block_iq3_xxs * src, int lane) {
     constexpr int bytes = sizeof(uint4);
-    constexpr int units = sizeof(weight_tile) / bytes;
-    static_assert(bytes == 16 && sizeof(weight_tile) % bytes == 0 && nrows % rows_per_tile == 0);
+    constexpr int units = bytes_to_copy / bytes;
+    static_assert(bytes == 16 && bytes_to_copy % bytes == 0 && bytes_to_copy <= sizeof(weight_tile) && nrows % rows_per_tile == 0);
     auto * out = static_cast<unsigned char *>(__builtin_assume_aligned(&dst, bytes));
     const auto * in = static_cast<const unsigned char *>(__builtin_assume_aligned(src, bytes));
 
-    // The final stride has only 53 valid lanes. Each valid lane copies one complete vector.
+    // Each valid lane copies a complete aligned vector.
     for (int unit = lane; unit < units; unit += 64) {
         __builtin_memcpy(out + unit * bytes, in + unit * bytes, bytes);
     }
 }
 
+constexpr int half_rows = rows_per_tile / 2;
+constexpr int weight_prefix_bytes = ((sizeof(weight_tile) / 2 + 15) / 16) * 16;
+constexpr int tail_second_lanes = (sizeof(weight_tile) - weight_prefix_bytes) / 16 - 64;
+static_assert(weight_prefix_bytes == 1968 && tail_second_lanes == 58);
+
+struct pending_weight_tail {
+    uint4 up, gate, up_next, gate_next;
+};
+
+static __device__ __forceinline__ void issue_weight_pair(
+        const unsigned char * up, const unsigned char * gate, uint4 & up_value, uint4 & gate_value) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+    asm volatile(
+        "global_load_dwordx4 %0, %2, off\n\t"
+        "global_load_dwordx4 %1, %3, off"
+        : "=&v"(up_value), "=&v"(gate_value)
+        : "v"(up), "v"(gate)
+        : "memory");
+#else
+    __builtin_memcpy(&up_value, up, sizeof(up_value));
+    __builtin_memcpy(&gate_value, gate, sizeof(gate_value));
+#endif
+}
+
+static __device__ __forceinline__ void wait_weight_tail() {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+}
+
+static __device__ __forceinline__ void publish_weight_tail(
+        weight_tile & up, weight_tile & gate, const pending_weight_tail & pending, int lane) {
+    auto * up_dst = static_cast<unsigned char *>(__builtin_assume_aligned(&up, 16)) + weight_prefix_bytes + lane * 16;
+    auto * gate_dst = static_cast<unsigned char *>(__builtin_assume_aligned(&gate, 16)) + weight_prefix_bytes + lane * 16;
+    __builtin_memcpy(up_dst, &pending.up, 16);
+    __builtin_memcpy(gate_dst, &pending.gate, 16);
+    if (lane < tail_second_lanes) {
+        __builtin_memcpy(up_dst + 64 * 16, &pending.up_next, 16);
+        __builtin_memcpy(gate_dst + 64 * 16, &pending.gate_next, 16);
+    }
+}
+
+template<int project_rows = rows_per_tile>
 static __device__ __forceinline__ void project(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
         const uint32_t * grid, float * out) {
@@ -133,7 +177,7 @@ static __device__ __forceinline__ void project(
     const auto & current = y[kbx * (QK_K / QK8_1)];
 
 #pragma unroll 1
-    for (int group = 0; group < rows_per_tile / 2; ++group) {
+    for (int group = 0; group < project_rows / 2; ++group) {
         float tmp[2] = {};
         float tmp_gate[2] = {};
 #pragma unroll
@@ -176,9 +220,10 @@ enum weight_mode : uint32_t {
     weights_vector = 8,
     weights_stage_vector = weights_stage | weights_vector,
     weights_share_vector = weights_share | weights_vector,
+    weights_wait_early = 16,
 };
 
-template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false>
+template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -187,8 +232,8 @@ static __global__ void gate_up(
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
     __shared__ uint32_t input[tokens][activation_words];
-    alignas(vector_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
-    alignas(vector_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
+    alignas(vector_ablation || split_rows ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
+    alignas(vector_ablation || split_rows ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
 
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
@@ -203,6 +248,58 @@ static __global__ void gate_up(
     }
     for (int i = lane; i < activation_words; i += 64) {
         input[token][i] = token_input[i];
+    }
+
+    if constexpr (split_rows) {
+        const bool shares = (shared >> token) & 1;
+        const bool owner = shared && token == __builtin_ctz(shared);
+        const int expert = rank < 0 ? 0 : ids[token * ranks + rank];
+        const int offset = (expert * nrows + row0) * weight_blocks;
+        if (owner) {
+            stage_weights_vector<weight_prefix_bytes>(shared_up, up + offset, lane);
+            stage_weights_vector<weight_prefix_bytes>(shared_gate, gate + offset, lane);
+        }
+        __syncthreads();
+
+        pending_weight_tail pending{};
+        if (owner) {
+            const auto * up_src = reinterpret_cast<const unsigned char *>(up + offset) + weight_prefix_bytes + lane * 16;
+            const auto * gate_src = reinterpret_cast<const unsigned char *>(gate + offset) + weight_prefix_bytes + lane * 16;
+            issue_weight_pair(up_src, gate_src, pending.up, pending.gate);
+            if (lane < tail_second_lanes) {
+                issue_weight_pair(up_src + 64 * 16, gate_src + 64 * 16, pending.up_next, pending.gate_next);
+            }
+            if (mode & weights_wait_early) {
+                wait_weight_tail();
+            }
+        }
+
+        const auto * token_activation = reinterpret_cast<const block_q8_1 *>(input[token]);
+        if (rank >= 0) {
+            auto * dst = out + (token * ranks + rank) * nrows + row0;
+            if (shares) {
+                project<half_rows>(shared_up, shared_gate, token_activation, grid, dst);
+            } else {
+                project<half_rows>(up + offset, gate + offset, token_activation, grid, dst);
+            }
+        }
+
+        if (owner) {
+            wait_weight_tail();
+            publish_weight_tail(shared_up, shared_gate, pending, lane);
+        }
+        __syncthreads();
+
+        if (rank >= 0) {
+            constexpr int tail_blocks = half_rows * weight_blocks;
+            auto * dst = out + (token * ranks + rank) * nrows + row0 + half_rows;
+            if (shares) {
+                project<half_rows>(shared_up + tail_blocks, shared_gate + tail_blocks, token_activation, grid, dst);
+            } else {
+                project<half_rows>(up + offset + tail_blocks, gate + offset + tail_blocks, token_activation, grid, dst);
+            }
+        }
+        return;
     }
 
     // The first participating wave copies one packed tile for all participating waves.
