@@ -210,7 +210,7 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
-    virtual bool process_mtp_catchup(const common_batch & batch) { return process(batch); }
+    virtual bool process_mtp_catchup(const common_batch & batch, bool) { return process(batch); }
     virtual bool flush_mtp_catchup(bool *) { return true; }
     virtual void discard_mtp_catchup() {}
 
@@ -1866,7 +1866,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool process_mtp_catchup(const common_batch & input) override {
+    bool process_mtp_catchup(const common_batch & input, bool history_kv_only) override {
         GGML_ASSERT(!catchup.count);
         if (n_seq != 1 || n_max != 2 || n_mtp_layers != 1 || !fixed_three_pending_requested ||
                 !multi_draft_device_pending || input.size() != 3 || !input.has_token() || input.has_embd()) {
@@ -1885,6 +1885,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             catchup.rows[i] = {t.id, t.pos[0], i == 0 ? n_batch_tgt : i - 1};
         }
         catchup.count = 3;
+        catchup.history_kv_only = history_kv_only;
         return true;
     }
 
@@ -2223,7 +2224,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const bool track_first_row = auto_draft_row_metrics && i == 0 && batch.size() == 1 && dparams[0].chain_mtp;
             int ret;
             if (fused) {
-                ret = llama_process_mtp_catchup_first(ctx_dft, batch.get());
+                ret = llama_process_mtp_catchup_first(ctx_dft, batch.get(), catchup.history_kv_only);
                 if (ret == 0 && !commit_mtp_catchup(true, catchup.first() - 1)) {
                     throw std::runtime_error("could not publish accepted MTP hidden row");
                 }
@@ -3480,7 +3481,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup) {
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup, bool history_kv_only) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -3488,7 +3489,7 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && (defer_catchup ? impl->process_mtp_catchup(batch) : impl->process(batch));
+        result = result && (defer_catchup ? impl->process_mtp_catchup(batch, history_kv_only) : impl->process(batch));
     }
 
     return result;

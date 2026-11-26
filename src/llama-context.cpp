@@ -2584,7 +2584,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool prefill_wide, bool target_mtp_verify,
-                          llama_mtp_draft_row draft_row, bool mtp_catchup) {
+                          llama_mtp_draft_row draft_row, bool mtp_catchup, bool history_kv_only) {
     if (mtp_catchup && (!mtp_catchup_supported || batch_inp.tokens.size() < 2 || batch_inp.tokens.size() > 4)) {
         return -1;
     }
@@ -2592,6 +2592,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
         ggml_backend_sched_hip_verify_stage_poll_flush(sched.get());
     }
     discard_mtp_first_draft_row();
+    struct history_kv_scope {
+        bool & active;
+        ~history_kv_scope() { active = false; }
+    } history_scope{mtp_history_kv_only};
+    mtp_history_kv_only = mtp_catchup && history_kv_only && cparams.embeddings_nextn_masked;
     const bool tracked_draft = draft_row != llama_mtp_draft_row::normal;
     mtp_draft_row_stats.candidates += tracked_draft;
     ggml_tensor * deferred_draft_row = nullptr;
@@ -3687,6 +3692,7 @@ llm_graph_params llama_context::graph_params(
         /*.target_mtp_verify_three =*/ mtp_verify_three_vulkan_waves && target_mtp_verify_width == 3,
         /*.target_mtp_verify_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
                 target_mtp_verify_width >= 3 && ubatch.n_tokens == target_mtp_verify_width,
+        /*.mtp_history_kv_only =*/ mtp_history_kv_only,
     };
 }
 
@@ -5877,8 +5883,8 @@ int32_t llama_process_mtp_verify(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, false, true, true);
 }
 
-int32_t llama_process_mtp_catchup_first(llama_context * ctx, llama_batch_ext * batch) {
-    return ctx->decode(*batch, false, true, false, llama_mtp_draft_row::normal, true);
+int32_t llama_process_mtp_catchup_first(llama_context * ctx, llama_batch_ext * batch, bool history_kv_only) {
+    return ctx->decode(*batch, false, true, false, llama_mtp_draft_row::normal, true, history_kv_only);
 }
 
 int32_t llama_process_mtp_first_draft(llama_context * ctx, llama_batch_ext * batch, bool lazy) {

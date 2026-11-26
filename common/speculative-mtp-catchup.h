@@ -13,6 +13,7 @@ struct common_mtp_catchup {
     std::array<row, 3> rows{};
     int count = 0;
     bool confirmed = false;
+    bool history_kv_only = false;
 
     void append(common_batch & batch) const {
         for (int i = 0; i < count; ++i) {

@@ -90,7 +90,7 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup = false);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch, bool defer_catchup = false, bool history_kv_only = false);
 bool common_speculative_flush_mtp_catchup(common_speculative * spec, bool * flushed = nullptr);
 void common_speculative_discard_mtp_catchup(common_speculative * spec);
 

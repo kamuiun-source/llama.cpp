@@ -840,6 +840,7 @@ struct llm_graph_params {
     llm_graph_result * res;
     bool target_mtp_verify_three = false;
     bool target_mtp_verify_packed = false;
+    bool mtp_history_kv_only = false;
     bool trace_next_router = false;
     int next_router_score_mode = 0;
 
@@ -922,6 +923,7 @@ struct llm_graph_params {
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
             next_router_score_mode == other.next_router_score_mode &&
+            mtp_history_kv_only == other.mtp_history_kv_only &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

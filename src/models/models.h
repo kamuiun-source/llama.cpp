@@ -2727,7 +2727,8 @@ struct llama_model_qwen4exp : public llama_model_base {
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                            int   il);
+                            int   il,
+                            bool  last_query = false);
 
         // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
@@ -2741,7 +2742,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
-        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb, int diagnostic_queries = 0);
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
         ggml_tensor * build_qsa_sel(
@@ -2749,7 +2750,8 @@ struct llama_model_qwen4exp : public llama_model_base {
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                            int   il);
+                            int   il,
+                            bool  last_query = false);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

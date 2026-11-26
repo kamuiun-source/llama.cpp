@@ -5871,7 +5871,8 @@ private:
                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) >= 2 &&
                         ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && !params_base.speculative.has_synth() &&
                         !params_base.speculative.draft.probabilistic;
-                ok = common_speculative_process(spec.get(), batch.view, defer_catchup);
+                ok = common_speculative_process(spec.get(), batch.view, defer_catchup,
+                        server_mtp_catchup_first_draft() == SERVER_MTP_CATCHUP_KV_ONLY);
             });
 
             if (!ok) {

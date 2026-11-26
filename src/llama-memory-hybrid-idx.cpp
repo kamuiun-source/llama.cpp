@@ -722,6 +722,10 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
     return kpool_pad(kpool_cur().n_pool_real);
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new_real() const {
+    return kpool_cur().n_new;
+}
+
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }

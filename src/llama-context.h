@@ -171,7 +171,7 @@ struct llama_context {
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false,
-               llama_mtp_draft_row draft_row = llama_mtp_draft_row::normal, bool mtp_catchup = false);
+               llama_mtp_draft_row draft_row = llama_mtp_draft_row::normal, bool mtp_catchup = false, bool mtp_history_kv_only = false);
     const float * read_mtp_first_draft_row(int32_t index);
     void discard_mtp_first_draft_row();
     llama_mtp_draft_row_stats get_mtp_draft_row_stats() const { return mtp_draft_row_stats; }
@@ -431,6 +431,7 @@ private:
 
     ggml_backend_sched_ptr sched;
     bool mtp_catchup_supported = false;
+    bool mtp_history_kv_only = false;
     bool mtp_verify_three_enabled = false;
     bool mtp_verify_four_enabled = false;
     bool mtp_verify_three_vulkan_waves = false;

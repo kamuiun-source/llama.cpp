@@ -8,9 +8,15 @@
 #include <fstream>
 #include <string_view>
 
-inline bool server_mtp_catchup_first_draft(bool refresh = false, llama_context * target = nullptr, llama_context * draft = nullptr) {
+enum server_mtp_catchup_mode {
+    SERVER_MTP_CATCHUP_OFF,
+    SERVER_MTP_CATCHUP_ON,
+    SERVER_MTP_CATCHUP_KV_ONLY,
+};
+
+inline server_mtp_catchup_mode server_mtp_catchup_first_draft(bool refresh = false, llama_context * target = nullptr, llama_context * draft = nullptr) {
     static const char * path = llama_mtp_catchup_mode_file();
-    static bool active = false;
+    static auto active = SERVER_MTP_CATCHUP_OFF;
     if (!path || !refresh) {
         return active;
     }
@@ -26,7 +32,8 @@ inline bool server_mtp_catchup_first_draft(bool refresh = false, llama_context *
     if (!mode.empty() && mode.back() == '\r') {
         mode.remove_suffix(1);
     }
-    if (!file.eof() || file.bad() || (mode != "CATCHUP_FIRST_DRAFT=off" && mode != "CATCHUP_FIRST_DRAFT=on")) {
+    if (!file.eof() || file.bad() || (mode != "CATCHUP_FIRST_DRAFT=off" && mode != "CATCHUP_FIRST_DRAFT=on" &&
+            mode != "CATCHUP_FIRST_DRAFT=kv-only")) {
         if (!invalid) {
             LOG_WRN("invalid MTP catch-up mode file: %s\n", path);
             invalid = true;
@@ -34,7 +41,8 @@ inline bool server_mtp_catchup_first_draft(bool refresh = false, llama_context *
         return active;
     }
     invalid = false;
-    const bool requested = mode == "CATCHUP_FIRST_DRAFT=on";
+    const auto requested = mode == "CATCHUP_FIRST_DRAFT=kv-only" ? SERVER_MTP_CATCHUP_KV_ONLY :
+            mode == "CATCHUP_FIRST_DRAFT=on" ? SERVER_MTP_CATCHUP_ON : SERVER_MTP_CATCHUP_OFF;
     if (requested != active) {
         llama_synchronize(target);
         if (draft && draft != target) {
