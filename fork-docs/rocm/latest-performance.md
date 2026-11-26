@@ -98,6 +98,12 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 比較元は同梱の `libllama-perplexity-impl.so` を最小のランチャーから呼んだ。現行版は同じ実行ソースの `d78d0ff09` で `llama-perplexity` をビルドし、MTP専用の直接tuple DMAなどは外した。現行版の最小設定でも表示精度で同じ2.7650だった。差は約0.65%で、2区間の予備比較とGPU配置の違いから品質の優劣は判断しない。固定3幅のMTP採用率やデコード単体の速度は別の計測で確認する。[比較元ログ](/home/t-saka/rocm-perplexity-20261126/pilot-baseline/run.log) · [統合版ログ](/home/t-saka/rocm-perplexity-20261126/pilot-current-hybrid-no-mtp-tuple/run.log)
 
+### 通常の採用設定と固定3幅でのPerplexity
+
+同じ統合版バイナリを `llama-server` で起動し、固定3幅・2候補、catch-up統合、CPU Expert自動配分、直接tuple DMA、次層先読みを有効にした。WikiText-2の上と同じ512トークン×2区間を、各257トークンの履歴と255トークンの正解列に分けた。トークンID指定の文法で正解列を通し、文法とサンプラーの適用前に本体が返す全語彙での確率から平均負対数尤度を計算した。生成IDと確率のIDの両方が正解と510/510一致し、各区間で固定3位置の本体検証を確認。PPLは **2.8780 ± 0.24514**。各区間は1.9510と4.2454で、サーバー終了コード0。
+
+コンテキスト512の初回は、末尾が1トークン切れたため除外。再実行ではサーバーのコンテキスト上限だけ1024とした。従来の `llama-perplexity` と比べ、今回の実行はFlash Attention自動選択で有効、マイクロバッチ2、確率取得用にホストサンプリングを使用した。同じトークンを採点した短い比較であり、2.7650との差から固定3幅だけの影響や品質差は判断しない。[固定3幅の実行結果](/home/t-saka/rocm-perplexity-mtp3-ctx1024-20261126/api/summary.json) · [サーバーログ](/home/t-saka/rocm-perplexity-mtp3-ctx1024-20261126/api/server.log)
+
 ## 最新の比較試作
 
 - **固定3幅のcatch-up＋第1候補の統合（通常起動ON）。** `codex/rocm-mtp3-catchup-first-draft` の `4336cdca7`。会話KV再利用、生成上限512、4K、device-pending有効の5問を同一サーバーでON/OFF各2回。生成57.55→60.20 tok/s（+4.6%）、ドラフト＋catch-up 6.03→5.20 ms/検証、MTP採用1,459/2,324→1,395/2,194。第5問は4回とも自然なEOSで、2K・上限128の試行で起きた43トークンの途中EOSは再現しなかった。以前の診断では両候補棄却後と第1候補だけ採用した場合のドラフトKV末尾を照合した。[手法・計測・出力](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
