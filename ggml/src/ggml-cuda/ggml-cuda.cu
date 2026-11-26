@@ -14,6 +14,7 @@
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
+#include "ggml-cuda/next-router-top10.cuh"
 #include "ggml-cuda/batch-get.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
@@ -4538,6 +4539,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_ARGSORT && ggml_cuda_next_router_top10_enabled() &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (auto * ids = ggml_cuda_match_next_router_top10(cgraph, i)) {
+            const auto * scores = node->src[0];
+            const auto src = reinterpret_cast<uintptr_t>(scores->data);
+            const auto dst = reinterpret_cast<uintptr_t>(ids->data);
+            if (src + ggml_nbytes(scores) <= dst || dst + ggml_nbytes(ids) <= src) {
+                ggml_cuda_launch_next_router_top10(static_cast<const float *>(scores->data),
+                        static_cast<int32_t *>(ids->data), cuda_ctx->stream());
+                static const bool logged = (GGML_LOG_INFO("CUDA next Router ranked Top-10 applied: experts=512 positions=3\n"), true);
+                GGML_UNUSED(logged);
+                return 2;
+            }
+        }
+    }
+
     static const bool hc_scale_silu = ggml_cuda_env_flag("GGML_CUDA_HC_SCALE_SILU_FUSE");
     if (hc_scale_silu && node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
@@ -6029,6 +6047,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cuda_ctx->cuda_graphs.erase(it);
         }
     }
+#elif !defined(GGML_USE_MUSA)
+    const bool next_router_top10 = ggml_cuda_next_router_top10_enabled() &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE;
+    const auto it = cuda_ctx->cuda_graphs.find(graph_key);
+    if (it != cuda_ctx->cuda_graphs.end() && it->second->next_router_top10 != next_router_top10) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_match_next_router_top10(cgraph, i)) {
+                cuda_ctx->cuda_graphs.erase(it);
+                break;
+            }
+        }
+    }
 #endif
 
     const bool graphs_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -6038,6 +6068,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         graph->gfx906_lds_modes = lds_modes;
         graph->gfx906_iq2_strata = iq2_strata;
         graph->gfx906_iq3_strata = iq3_strata;
+#elif !defined(GGML_USE_MUSA)
+        graph->next_router_top10 = next_router_top10;
 #endif
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
@@ -6201,6 +6233,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     // The fused GLU still reads the plan after GET_ROWS.
                     params->add_alloc_dep(params->user_data, map, glu);
                 }
+            }
+        }
+    }
+#elif !defined(GGML_USE_MUSA)
+    const char * top10_file = std::getenv("LLAMA_CUDA_NEXT_ROUTER_TOP10_MODE_FILE");
+    if (!disable_fusion && ((top10_file && *top10_file) || ggml_cuda_next_router_top10_enabled()) &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (auto * ids = ggml_cuda_match_next_router_top10(cgraph, i)) {
+                // CONT writes the final IDs before the fused kernel finishes reading SOFT_MAX.
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], ids);
             }
         }
     }
@@ -7680,6 +7723,9 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_set_next_router_top10") == 0) {
+        return (void *) ggml_cuda_set_next_router_top10;
+    }
     if (strcmp(name, "ggml_backend_cuda_is_ada") == 0) {
         return (void *)+[](ggml_backend_dev_t dev) {
             const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);

@@ -60,6 +60,8 @@ struct ggml_cuda_graph {
     int gfx906_lds_modes = -1;
     bool gfx906_iq2_strata = false;
     bool gfx906_iq3_strata = false;
+#elif !defined(GGML_USE_MUSA)
+    bool next_router_top10 = false;
 #endif
     struct node_properties {
         ggml_tensor node;

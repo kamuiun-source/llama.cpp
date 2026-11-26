@@ -2745,93 +2745,15 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il, bool defer = false) {
-        if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
-            return;
-        }
-        const int32_t target = il + 1;
-        if (next_prefetch_queue_layer >= 0) {
-            discard_next_prefetch_queue();
-        }
-        if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
-                (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
-            finish_next_prefetch();
-        }
-        auto * prediction = (*next_prefetch_predictions)[il];
-        if (ggml_backend_sched_flush_deferred_router(sched, prediction) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("could not submit the deferred next Router graph");
-        }
-        auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
-        GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
-        next_prefetch_routes predicted;
-        next_prefetch_logits logits;
-        bool read_scores = false;
-        const int ranks = next_prefetch_score_mode == 2 ? next_prefetch_priority_ranks : next_prefetch_ranks;
-        const size_t prediction_bytes = ranks * next_prefetch_tokens * sizeof(int32_t);
-        GGML_ASSERT(prediction->ne[0] == ranks && prediction->ne[1] == next_prefetch_tokens &&
-                ggml_nbytes(prediction) == prediction_bytes);
-        const bool measure_read = next_profile_start || next_readback_totals;
-        const int64_t read_start = measure_read ? ggml_time_us() : 0;
-        const bool pinned = next_readback.enabled && !next_prefetch_scores &&
-                next_readback.submit(producer, prediction, prediction_bytes);
-        if (!pinned) {
-            ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
-        }
-        if (next_prefetch_scores) {
-            auto * scores = (*next_prefetch_scores)[il];
-            read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
-                    scores->ne[0] == next_prefetch_experts && scores->ne[1] == next_prefetch_tokens &&
-                    ggml_nbytes(scores) == sizeof(logits) && ggml_backend_sched_get_tensor_backend(sched, scores) == producer;
-            if (read_scores) {
-                ggml_backend_tensor_get_async(producer, scores, logits.data(), 0, sizeof(logits));
-            } else {
-                ++next_prefetch_score_readback_fallback;
-            }
-        }
-        const int64_t wait_start = measure_read ? ggml_time_us() : 0;
-        if (pinned) {
-            next_readback.complete(predicted.data(), prediction_bytes);
-        } else {
-            ggml_backend_synchronize(producer);
-        }
-        if (measure_read) {
-            const int64_t wait_us = ggml_time_us() - wait_start;
-            const int64_t submit_us = wait_start - read_start;
-            if (next_profile_start) {
-                ++next_profile_readbacks;
-                next_profile_read_submit_us += submit_us;
-                next_profile_read_wait_us += wait_us;
-            }
-            if (next_readback_totals) {
-                ++next_readback_totals->reads;
-                next_readback_totals->applied += pinned;
-                next_readback_totals->submit_us += submit_us;
-                next_readback_totals->wait_us += wait_us;
-            }
-        }
-
-        if (next_prefetch_score_mode == 2) {
-            if (read_scores && priority_next_prefetch(target, predicted, logits, defer)) {
-                ++next_prefetch_priority_layers;
-                if (defer) {
-                    progress_next_prefetch();
-                }
-                return;
-            }
-            ++next_prefetch_priority_fallbacks;
-            read_scores = false;
-        }
-        next_prefetch_mask accepted;
-        if (read_scores) {
-            filter_next_prefetch(predicted, logits, target, accepted);
-        }
+    void stage_next_prefetch_routes(int32_t target, const next_prefetch_routes & predicted, int ranks,
+            const next_prefetch_mask * accepted, bool defer) {
         const auto & map = placement->maps[target];
         const auto & scratch = layers[target].packed_scratch;
         for (int rank = 0; rank < next_prefetch_ranks; ++rank) {
             for (int token = 0; token < next_prefetch_tokens; ++token) {
                 const int32_t expert = predicted[token * ranks + rank];
                 GGML_ASSERT(expert >= 0 && size_t(expert) < map.resident.size());
-                if (read_scores && !accepted[expert]) {
+                if (accepted && !(*accepted)[expert]) {
                     continue;
                 }
                 const int32_t host_slot = map.host[expert];
@@ -2859,6 +2781,111 @@ struct llama_moe_cache::impl {
         if (defer) {
             progress_next_prefetch();
         }
+    }
+
+    bool progress_next_router_readback() {
+        if (!next_readback.pending()) {
+            return false;
+        }
+        next_prefetch_routes predicted;
+        const int32_t target = next_readback.poll(-1, predicted.data());
+        if (target >= 0) {
+            const int64_t start = next_readback_totals ? ggml_time_us() : 0;
+            stage_next_prefetch_routes(target, predicted, next_prefetch_ranks, nullptr, true);
+            if (next_readback_totals) {
+                next_readback_totals->plan_cpu_us += ggml_time_us() - start;
+            }
+        }
+        return target >= 0;
+    }
+
+    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il, bool defer = false) {
+        if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
+            return;
+        }
+        const int32_t target = il + 1;
+        next_readback.discard_pending();
+        if (next_prefetch_queue_layer >= 0) {
+            discard_next_prefetch_queue();
+        }
+        if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
+                (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
+            finish_next_prefetch();
+        }
+        auto * prediction = (*next_prefetch_predictions)[il];
+        if (ggml_backend_sched_flush_deferred_router(sched, prediction) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("could not submit the deferred next Router graph");
+        }
+        auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
+        GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
+        next_prefetch_routes predicted;
+        next_prefetch_logits logits;
+        bool read_scores = false;
+        const int ranks = next_prefetch_score_mode == 2 ? next_prefetch_priority_ranks : next_prefetch_ranks;
+        const size_t prediction_bytes = ranks * next_prefetch_tokens * sizeof(int32_t);
+        GGML_ASSERT(prediction->ne[0] == ranks && prediction->ne[1] == next_prefetch_tokens &&
+                ggml_nbytes(prediction) == prediction_bytes);
+        const bool measure_read = next_profile_start || next_readback_totals;
+        const int64_t read_start = measure_read ? ggml_time_us() : 0;
+        const int32_t defer_layer = next_readback.deferred && defer ? target : -1;
+        const bool pinned = next_readback.enabled && !next_prefetch_scores &&
+                next_readback.submit(producer, prediction, prediction_bytes, defer_layer);
+        const bool deferred_read = next_readback.pending();
+        if (!pinned) {
+            ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
+        }
+        if (next_prefetch_scores) {
+            auto * scores = (*next_prefetch_scores)[il];
+            read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
+                    scores->ne[0] == next_prefetch_experts && scores->ne[1] == next_prefetch_tokens &&
+                    ggml_nbytes(scores) == sizeof(logits) && ggml_backend_sched_get_tensor_backend(sched, scores) == producer;
+            if (read_scores) {
+                ggml_backend_tensor_get_async(producer, scores, logits.data(), 0, sizeof(logits));
+            } else {
+                ++next_prefetch_score_readback_fallback;
+            }
+        }
+        const int64_t wait_start = measure_read ? ggml_time_us() : 0;
+        if (!pinned) {
+            ggml_backend_synchronize(producer);
+        } else if (!deferred_read) {
+            next_readback.complete(predicted.data(), prediction_bytes);
+        }
+        if (measure_read) {
+            const int64_t wait_us = deferred_read ? 0 : ggml_time_us() - wait_start;
+            const int64_t submit_us = wait_start - read_start;
+            if (next_profile_start) {
+                ++next_profile_readbacks;
+                next_profile_read_submit_us += submit_us;
+                next_profile_read_wait_us += wait_us;
+            }
+            if (next_readback_totals) {
+                ++next_readback_totals->reads;
+                next_readback_totals->applied += pinned;
+                next_readback_totals->submit_us += submit_us;
+                next_readback_totals->wait_us += wait_us;
+            }
+        }
+
+        if (deferred_read) {
+            return;
+        }
+        if (next_prefetch_score_mode == 2) {
+            if (read_scores && priority_next_prefetch(target, predicted, logits, defer)) {
+                ++next_prefetch_priority_layers;
+                if (defer) {
+                    progress_next_prefetch();
+                }
+                return;
+            }
+            ++next_prefetch_priority_fallbacks;
+            read_scores = false;
+        }
+        next_prefetch_mask accepted;
+        if (read_scores) {
+            filter_next_prefetch(predicted, logits, target, accepted);
+        }
+        stage_next_prefetch_routes(target, predicted, ranks, read_scores ? &accepted : nullptr, defer);
     }
 
     bool arm_next_prefetch_submit(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
@@ -3444,6 +3471,10 @@ struct llama_moe_cache::impl {
             // Publish a pending promotion before using the resident or scratch maps.
             ggml_backend_sched_wait_expert_copy(sched, true, false);
             finish_hip_mtp_promotion();
+        }
+        if (!early && src == l.slot_map && next_readback.pending()) {
+            // The demand callback owns the transfer queue from this point.
+            next_readback.poll(il, nullptr);
         }
         if (next_prefetch_queue_layer == il) {
             cancel_next_prefetch_queue(il);
@@ -4499,7 +4530,9 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     if (self.next_prefetch_demand_priority || self.hip_demand_trace) {
         ggml_backend_sched_set_before_split_submit(sched, [](void * data) {
             auto & self = *static_cast<impl *>(data);
-            self.progress_next_prefetch();
+            if (!self.progress_next_router_readback()) {
+                self.progress_next_prefetch();
+            }
             if (self.next_prefetch_submit_layer >= 0) {
                 self.demand_trace(self.next_prefetch_submit_layer, "dispatch_begin");
             }
@@ -4533,8 +4566,12 @@ void llama_moe_cache::end_next_router_prefetch(ggml_backend_sched_t sched) {
         }
         pimpl->hip_demand_trace_entries.clear();
     }
+    pimpl->next_readback.end_graph();
     pimpl->next_prefetch_predictions = nullptr;
-    pimpl->next_readback_totals = nullptr;
+    if (pimpl->next_readback_totals) {
+        pimpl->next_readback_totals->graph_cpu_us += ggml_time_us() - pimpl->next_profile_start;
+        pimpl->next_readback_totals = nullptr;
+    }
     pimpl->next_prefetch_scores = nullptr;
 }
 

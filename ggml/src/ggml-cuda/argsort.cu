@@ -306,3 +306,5 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
 #endif
 }
+
+#include "next-router-top10-kernel.cuh"
