@@ -16,6 +16,7 @@
   `codex/rocm-mtp3-catchup-kv-only` で、`CATCHUP_FIRST_DRAFT=kv-only` により履歴行はKV・QSAプール更新だけを実行する試作を比較。生成58.98→59.63 tok/s、ドラフト4.77→4.60 ms/検証。最後のOFFが最高速。QSAプールの棄却後の再構成と全20応答の完走を確認。既定OFF。[試作と比較](../research/mtp3-efficiency-20261125.md#catch-upの履歴行をkv更新だけにする試作)
   `codex/rocm-mtp3-rtx-draft-chain` ではKV専用OFFで、第1候補ID・隠れ状態をRTX内で受け渡す。初版では埋め込みのCPU lookupが待ちを残し、`47f7bb2bd` で選択行だけをRTXから読む経路に変更。候補間同期待ちが縮み、ドラフト4.79→4.51 ms/検証、生成60.57→60.17 tok/s。既定OFF。[試作と比較](../research/mtp3-efficiency-20261125.md#固定3幅の第1候補から第2候補へのrtx内受け渡し)
   追加CUDAトレースでは第1問・試作ONの最終読み戻し3.672 msのうち、先行カーネル実行が3.614 ms、最後の16バイトD2Hは0.834 µs。候補間から最後の同期へGPU計算待ちが移ったことを確認した。
+  RTXドラフトの候補別GPUカーネル時間は第1段2.142 ms、第2段1.915 ms。両段の合計の70.1%は全語彙Q8_0出力射影。起動削減では第1段のCUDA Graph再生（7/28回）が対象。[候補別の内訳](../research/mtp3-efficiency-20261125.md#rtxドラフトの候補別カーネル時間)
 
 - packed ExpertのCPU並列計算と量子化共有を `codex/rocm-integrated-test` に統合。固定3幅の通常起動は `SINGLE_MISS_CPU=on`。物理コア数でCPUへ回す最大件数を決め、ほかのミスはMI50へ送る。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
 
