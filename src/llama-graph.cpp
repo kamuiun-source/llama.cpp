@@ -2836,11 +2836,13 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         return value && std::strcmp(value, "1") == 0;
     }();
     namespace strata = ggml_hip_iq3_strata_plan;
-    if ((shared_iq3_weights || strata::has_tail(slot_map)) && target_mtp_verify_packed && !cold && prefill_wave < 0 &&
+    const bool legacy_iq3 = shared_iq3_weights && up_exps && up_exps->type == GGML_TYPE_IQ3_XXS;
+    if ((legacy_iq3 || strata::has_tail(slot_map)) && target_mtp_verify_packed && !cold && prefill_wave < 0 &&
             !moe_cache->get_cold_slot_map(il) && selected_experts->ne[0] == 10 && selected_experts->ne[1] == 3 &&
-            up_exps && gate_exps && up_exps->type == GGML_TYPE_IQ3_XXS && gate_exps->type == GGML_TYPE_IQ3_XXS &&
+            up_exps && gate_exps && up_exps->type == gate_exps->type &&
             up_exps->ne[0] == 2560 && up_exps->ne[1] == 640 && ggml_are_same_shape(up_exps, gate_exps)) {
-        ggml_set_name(slots, shared_iq3_weights ? strata::legacy_lookup_name : strata::lookup_name);
+        ggml_set_name(slots, legacy_iq3 ? strata::legacy_lookup_name :
+                up_exps->type == GGML_TYPE_IQ2_S ? strata::iq2_lookup_name : strata::lookup_name);
     }
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first

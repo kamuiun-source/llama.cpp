@@ -158,6 +158,19 @@ static __device__ __forceinline__ void gate_up_group(
     }
 }
 
+static __device__ __forceinline__ expert_group unpack_group(uint32_t encoded) {
+    expert_group group{};
+    group.expert = int(encoded >> ggml_hip_iq3_strata_plan::slot_shift) - 1;
+#pragma unroll
+    for (int token = 0; token < tokens; ++token) {
+        const int rank = int((encoded >> (token * ggml_hip_iq3_strata_plan::rank_bits)) & ggml_hip_iq3_strata_plan::rank_mask) - 1;
+        if (rank >= 0) {
+            group.routes[group.count++] = token * ranks + rank;
+        }
+    }
+    return group;
+}
+
 #ifdef GGML_USE_HIP
 __launch_bounds__(waves * wave, 1)
 static __global__ void gate_up_packed(
@@ -168,16 +181,7 @@ static __global__ void gate_up_packed(
     if (encoded == 0) {
         return;
     }
-    expert_group group{};
-    group.expert = int(encoded >> layout::slot_shift) - 1;
-#pragma unroll
-    for (int token = 0; token < tokens; ++token) {
-        const int rank = int((encoded >> (token * layout::rank_bits)) & layout::rank_mask) - 1;
-        if (rank >= 0) {
-            group.routes[group.count++] = token * ranks + rank;
-        }
-    }
-    gate_up_group(up, gate, activation, group, out, expert_stride);
+    gate_up_group(up, gate, activation, unpack_group(encoded), out, expert_stride);
 }
 #endif
 

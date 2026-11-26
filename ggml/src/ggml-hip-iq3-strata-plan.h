@@ -17,6 +17,9 @@ constexpr int map_entries = experts + routes;
 constexpr int rank_bits = 4;
 constexpr int rank_mask = (1 << rank_bits) - 1;
 constexpr int slot_shift = tokens * rank_bits;
+enum quant { iq2, iq3, quant_count };
+constexpr const char * iq2_lookup_name = "ffn_moe_mtp_iq2_strata";
+constexpr const char * iq2_mode_file_env = "LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE";
 constexpr const char * lookup_name = "ffn_moe_mtp_iq3_strata";
 constexpr const char * legacy_lookup_name = "ffn_moe_mtp_share_iq3_weights";
 constexpr const char * mode_file_env = "LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE";
@@ -26,14 +29,21 @@ inline bool has_tail(const ggml_tensor * map) {
         map->ne[2] == 1 && map->ne[3] == 1 && ggml_is_contiguous(map);
 }
 
-inline bool uses_plan(const ggml_tensor * lookup) {
-    return lookup && lookup->op == GGML_OP_GET_ROWS && has_tail(lookup->src[0]) &&
-        (std::strcmp(lookup->name, lookup_name) == 0 || std::strcmp(lookup->name, legacy_lookup_name) == 0);
+inline int lookup_quant(const ggml_tensor * lookup) {
+    if (!lookup || lookup->op != GGML_OP_GET_ROWS || !has_tail(lookup->src[0])) {
+        return -1;
+    }
+    if (std::strcmp(lookup->name, iq2_lookup_name) == 0) {
+        return iq2;
+    }
+    return std::strcmp(lookup->name, lookup_name) == 0 || std::strcmp(lookup->name, legacy_lookup_name) == 0 ? iq3 : -1;
 }
 
-inline ggml_tensor * map_from_ids(const ggml_tensor * ids) {
+inline ggml_tensor * map_from_ids(const ggml_tensor * ids, int expected_quant = -1) {
     const auto * lookup = ids ? ids->view_src : nullptr;
-    return uses_plan(lookup) && ids->ne[0] == ranks && ids->ne[1] == tokens ? lookup->src[0] : nullptr;
+    const int quant = lookup_quant(lookup);
+    return quant >= 0 && (expected_quant < 0 || quant == expected_quant) &&
+        ids->ne[0] == ranks && ids->ne[1] == tokens ? lookup->src[0] : nullptr;
 }
 
 inline void build(int32_t * groups, const int32_t * ids, const int32_t * slots, int32_t zero_slot, int32_t slot_count) {

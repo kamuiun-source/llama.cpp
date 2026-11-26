@@ -11,6 +11,7 @@
 - ROCmの通常実行・GPU別の処理時間・直近の比較結果は [最新計測サマリ](../rocm/latest-performance.md) を参照する。計測完了時に該当項目を更新する。
 - `codex/rocm-iq3-strata-reuse` を統合版から作成。保存済み固定3幅ログでMI50 IQ3_XXSの1・2・3位置の分布は64.68・20.81・14.51%。Strata単体の混在で130.58→105.96 µs。実モデルでCPU Expert自動配分ONのままOFF→ONが57.36→59.91 tok/s、IQ3_XXSのGPU時間2.809→2.545 ms/検証。追加ON3回は合算58.91 tok/s、全15応答完走、スワップアウト0。固定3幅の通常起動にONを採用。[調査と検証](../research/rocm-iq3-strata-reuse-20261126.md)
 - 同じブランチの固定3位置IQ2_S単体で、Q8_1入力共有を維持して位置間の重み再利用を比較。実ログに近い混在で163.15→122.16 µs、全3条件で各19,200出力がビット一致。56→227 VGPR、LDSなし。単体の `--iq2-s` で実行。[IQ2_Sの結果](../research/rocm-iq3-strata-reuse-20261126.md#iq2_s-gateupへの展開)
+- IQ2_Sにも独立の実モデルStrataモードを追加。固定3幅・CPU Expert自動配分・Q8_1共有・IQ3_XXS StrataをONにして5問を3回実行。58.62・61.09・60.06 tok/s、合算59.95 tok/s。過去のIQ3_XXSのみONは58.91 tok/s。全15応答完走・スワップアウト0。IQ2_Sの試作は既定OFF。[実モデルのON計測](../research/rocm-iq3-strata-reuse-20261126.md#iq2_sの実モデルでのon計測)
 - `codex/rocm-integrated-test` の `7e9dbd296` に戻し、増分ビルド後に固定3幅・採用設定で固定5問を1回確認。59.37 tok/s、本体33.315 ms/回、MTP 759/1,164、応答中スワップアウト0。前回の統合版58.61 tok/sと同じ実行ソースで、全問の生成ID・本文は異なった。[通常実行](../rocm/latest-performance.md#通常実行)
 - 上記59.37 tok/sのバイナリとライブラリをそのまま使い、同設定で新規サーバーから再実行。57.74 tok/s、MTP 699/1,124。ウォームアップは全8 ID一致、第1問は16トークン目から異なる。実行間の出力差を確認し、発生源は未特定。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行)
 - 同じ統合ビルドで `CATCHUP_FIRST_DRAFT=off` だけを変更し、固定5問を1回測定。生成56.15 tok/s、本体33.129 ms/回、ドラフト＋catch-up 6.049 ms/検証、MTP 720/1,158。新規サーバーでOFFのまま最初の2問を再実行すると、第1問の16トークン目でON同士と同じ `106806`→`159212` の出力差が再現した。発生源は未特定。[catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)

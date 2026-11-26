@@ -107,6 +107,8 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 `LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE=1` は終了時に表作成時間、発行にかかったホスト時間、追加バイト数とグループ数を出す。非同期H2Dの実時間はGPUトレースで別に確認する。[設計と計測](../research/rocm-iq3-strata-reuse-20261126.md#実モデルでの比較)
 
+IQ2_Sの試作は別の `LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE` に `IQ2_STRATA=on` または `IQ2_STRATA=off` を1行で指定する。未指定時はOFF。対象の固定3幅では既存の符号復号と `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` を使い、IQ2_SのLDS先読みと4行はOFF。IQ3_XXSのStrata設定は独立して維持する。計測時の `LLAMA_EXPERT_HIP_IQ2_STRATA_PROFILE=1` はIQ2_Sの表作成・発行時間と追加転送量を記録する。[IQ2_Sの実モデル計測](../research/rocm-iq3-strata-reuse-20261126.md#iq2_sの実モデルでのon計測)
+
 ### 固定3幅のMTP catch-upと第1候補
 
 | フラグ | 通常起動 | 説明 |

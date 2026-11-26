@@ -676,18 +676,21 @@ struct llama_moe_cache::impl {
     int64_t next_profile_h2d_submit_us = 0;
     int64_t next_profile_d2d_submit_us = 0;
     uint64_t next_profile_prefetch_waits = 0;
-    using iq3_strata_mode_t = int (*)(ggml_backend_dev_t);
-    iq3_strata_mode_t iq3_strata_mode = nullptr;
+    using iq_strata_mode_t = int (*)(ggml_backend_dev_t);
+    struct iq_strata_stats {
+        iq_strata_mode_t mode = nullptr;
+        bool profile = false;
+        size_t layers = 0;
+        size_t plans = 0;
+        size_t bytes = 0;
+        std::array<size_t, 3> groups{};
+        int64_t prep_us = 0;
+        int64_t async_submit_us = 0;
+        int64_t sync_copy_us = 0;
+    };
+    std::array<iq_strata_stats, ggml_hip_iq3_strata_plan::quant_count> iq_strata;
     size_t hip_mtp_slot_staging_stride = sizeof(llama_expert_placement::layer_map::resident);
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
-    bool profile_iq3_strata = false;
-    size_t iq3_strata_layers = 0;
-    size_t iq3_strata_plans = 0;
-    size_t iq3_strata_bytes = 0;
-    std::array<size_t, 3> iq3_strata_groups{};
-    int64_t iq3_strata_prep_us = 0;
-    int64_t iq3_strata_async_submit_us = 0;
-    int64_t iq3_strata_sync_copy_us = 0;
     bool hip_mtp_slot_async = false;
     bool hip_mtp4_slot_async = false;
     ggml_backend_buffer_ptr hip_mtp_promotion_staging;
@@ -851,16 +854,23 @@ struct llama_moe_cache::impl {
             }
             namespace strata = ggml_hip_iq3_strata_plan;
             const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
-            const char * strata_mode_file = std::getenv(strata::mode_file_env);
-            if (strata_mode_file && *strata_mode_file && target_reg && placement->hip_tuple_dma &&
-                    placement->hip_mtp_verify_three && !placement->overlap && model.hparams.n_expert == strata::experts) {
-                iq3_strata_mode = reinterpret_cast<iq3_strata_mode_t>(
-                        ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_hip_gfx906_iq3_strata_mode"));
-                if (iq3_strata_mode && iq3_strata_mode(placement->target) < 0) {
-                    iq3_strata_mode = nullptr;
+            if (target_reg && placement->hip_tuple_dma && placement->hip_mtp_verify_three && !placement->overlap &&
+                    model.hparams.n_expert == strata::experts) {
+                for (int quant = 0; quant < strata::quant_count; ++quant) {
+                    const bool iq2 = quant == strata::iq2;
+                    const char * mode_file = std::getenv(iq2 ? strata::iq2_mode_file_env : strata::mode_file_env);
+                    if (!mode_file || !*mode_file) {
+                        continue;
+                    }
+                    auto & stats = iq_strata[quant];
+                    stats.mode = reinterpret_cast<iq_strata_mode_t>(ggml_backend_reg_get_proc_address(target_reg,
+                            iq2 ? "ggml_backend_hip_gfx906_iq2_strata_mode" : "ggml_backend_hip_gfx906_iq3_strata_mode"));
+                    if (stats.mode && stats.mode(placement->target) < 0) {
+                        stats.mode = nullptr;
+                    }
+                    const char * profile = std::getenv(iq2 ? "LLAMA_EXPERT_HIP_IQ2_STRATA_PROFILE" : "LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE");
+                    stats.profile = stats.mode && profile && std::strcmp(profile, "1") == 0;
                 }
-                const char * profile = std::getenv("LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE");
-                profile_iq3_strata = iq3_strata_mode && profile && std::strcmp(profile, "1") == 0;
             }
             const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
@@ -878,10 +888,14 @@ struct llama_moe_cache::impl {
                 l.ig = 0;
                 const auto * up = weights.ffn_up_exps;
                 const auto * gate = weights.ffn_gate_exps;
-                const bool plan = iq3_strata_mode && up && gate && up->type == GGML_TYPE_IQ3_XXS && gate->type == GGML_TYPE_IQ3_XXS &&
+                const int quant = up && up->type == GGML_TYPE_IQ2_S ? strata::iq2 :
+                        up && up->type == GGML_TYPE_IQ3_XXS ? strata::iq3 : -1;
+                const bool plan = quant >= 0 && iq_strata[quant].mode && gate && gate->type == up->type &&
                         up->ne[0] == 2560 && up->ne[1] == 640 && ggml_are_same_shape(up, gate);
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, plan ? strata::map_entries : model.hparams.n_expert);
-                iq3_strata_layers += plan;
+                if (plan) {
+                    ++iq_strata[quant].layers;
+                }
                 hip_mtp_slot_staging_stride = std::max(hip_mtp_slot_staging_stride, ggml_nbytes(l.slot_map));
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
@@ -3816,8 +3830,9 @@ struct llama_moe_cache::impl {
                 telemetry_scope scope(set_telemetry_cause, "slot_map");
                 const int64_t map_start = fine_profile ? ggml_time_us() : 0;
                 namespace strata = ggml_hip_iq3_strata_plan;
-                const bool with_plan = fixed_three && iq3_strata_mode && strata::uses_plan(lookup) &&
-                        iq3_strata_mode(placement->target) > 0;
+                const int quant = fixed_three ? strata::lookup_quant(lookup) : -1;
+                auto * stats = quant >= 0 ? &iq_strata[quant] : nullptr;
+                const bool with_plan = stats && stats->mode && stats->mode(placement->target) > 0;
                 const size_t bytes_map = with_plan ? strata::map_entries * sizeof(int32_t) : sizeof(slots);
                 GGML_ASSERT(bytes_map <= ggml_nbytes(dst));
                 std::array<int32_t, strata::map_entries> sync_map;
@@ -3831,19 +3846,19 @@ struct llama_moe_cache::impl {
                     std::memcpy(staging, slots.data(), sizeof(slots));
                     map_data = staging;
                 }
-                const bool measure = with_plan && profile_iq3_strata;
+                const bool measure = with_plan && stats->profile;
                 if (with_plan) {
                     const int64_t prep_start = measure ? ggml_time_us() : 0;
                     int32_t * plan = staging + strata::experts;
                     const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
                     strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu));
                     if (measure) {
-                        iq3_strata_prep_us += ggml_time_us() - prep_start;
-                        ++iq3_strata_plans;
-                        iq3_strata_bytes += strata::routes * sizeof(int32_t);
+                        stats->prep_us += ggml_time_us() - prep_start;
+                        ++stats->plans;
+                        stats->bytes += strata::routes * sizeof(int32_t);
                         for (int i = 0; i < strata::routes && plan[i] != 0; ++i) {
                             const int count = int((plan[i] & 0xf) != 0) + int((plan[i] & 0xf0) != 0) + int((plan[i] & 0xf00) != 0);
-                            ++iq3_strata_groups[count - 1];
+                            ++stats->groups[count - 1];
                         }
                     }
                 }
@@ -3851,7 +3866,7 @@ struct llama_moe_cache::impl {
                     const int64_t submit_start = measure ? ggml_time_us() : 0;
                     ggml_backend_tensor_set_async(backend, dst, map_data, 0, bytes_map);
                     if (measure) {
-                        iq3_strata_async_submit_us += ggml_time_us() - submit_start;
+                        stats->async_submit_us += ggml_time_us() - submit_start;
                     }
                     demand_trace(il, "slot_map_submit", 1, bytes_map);
                     if (fixed_four) {
@@ -3864,7 +3879,7 @@ struct llama_moe_cache::impl {
                     const int64_t submit_start = measure ? ggml_time_us() : 0;
                     ggml_backend_tensor_set(dst, map_data, 0, bytes_map);
                     if (measure) {
-                        iq3_strata_sync_copy_us += ggml_time_us() - submit_start;
+                        stats->sync_copy_us += ggml_time_us() - submit_start;
                     }
                     packed_synchronous_maps += defer_slot_map_requested;
                 }
@@ -4198,12 +4213,14 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("packed expert HIP MTP3 direct RAM: steps=%zu planes=%zu bytes=%zu staging_bytes=0 completion_wait_us=%" PRIu64 "\n",
                         hip_direct_upload_steps, hip_direct_upload_planes, hip_direct_upload_bytes, hip_direct_upload_wait_us);
             }
-            if (profile_iq3_strata) {
-                LLAMA_LOG_INFO("packed HIP IQ3 Strata: eligible_layers=%zu plan_maps=%zu extra_h2d_bytes=%zu"
-                        " groups_1=%zu groups_2=%zu groups_3=%zu prep_us=%" PRId64 " async_submit_us=%" PRId64 " sync_copy_us=%" PRId64 "\n",
-                        iq3_strata_layers, iq3_strata_plans, iq3_strata_bytes,
-                        iq3_strata_groups[0], iq3_strata_groups[1], iq3_strata_groups[2],
-                        iq3_strata_prep_us, iq3_strata_async_submit_us, iq3_strata_sync_copy_us);
+            for (int quant = 0; quant < ggml_hip_iq3_strata_plan::quant_count; ++quant) {
+                const auto & stats = iq_strata[quant];
+                if (stats.profile) {
+                    LLAMA_LOG_INFO("packed HIP IQ%d Strata: eligible_layers=%zu plan_maps=%zu extra_h2d_bytes=%zu"
+                            " groups_1=%zu groups_2=%zu groups_3=%zu prep_us=%" PRId64 " async_submit_us=%" PRId64 " sync_copy_us=%" PRId64 "\n",
+                            quant == ggml_hip_iq3_strata_plan::iq2 ? 2 : 3, stats.layers, stats.plans, stats.bytes,
+                            stats.groups[0], stats.groups[1], stats.groups[2], stats.prep_us, stats.async_submit_us, stats.sync_copy_us);
+                }
             }
             if (hip_mtp_slot_staging && hip_mtp_slot_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",

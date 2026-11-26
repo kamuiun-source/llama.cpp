@@ -12,6 +12,8 @@ bool ggml_cuda_mmvq_trace_enabled(int device);
 #ifdef GGML_USE_HIP
 bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs);
 int ggml_hip_gfx906_lds_modes();
+bool ggml_hip_gfx906_iq2_strata_enabled();
+void ggml_hip_gfx906_set_iq2_strata(bool enabled);
 bool ggml_hip_gfx906_iq3_strata_enabled();
 void ggml_hip_gfx906_set_iq3_strata(bool enabled);
 

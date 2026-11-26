@@ -3984,7 +3984,8 @@ private:
                     refresh_gfx906_lds_modes();
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
                         server_refresh_single_miss_cpu_mode(ctx_tgt, ctx_dft);
-                        server_refresh_iq3_strata_mode(ctx_tgt, ctx_dft);
+                        server_refresh_iq_strata_mode<false>(ctx_tgt, ctx_dft);
+                        server_refresh_iq_strata_mode<true>(ctx_tgt, ctx_dft);
                         server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
                     }
                     if (task.is_parent()) {

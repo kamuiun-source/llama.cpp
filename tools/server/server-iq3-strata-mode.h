@@ -10,8 +10,9 @@
 #include <fstream>
 #include <string_view>
 
-inline void server_refresh_iq3_strata_mode(llama_context * target, llama_context * draft) {
-    static const char * path = std::getenv(ggml_hip_iq3_strata_plan::mode_file_env);
+template<bool iq2>
+inline void server_refresh_iq_strata_mode(llama_context * target, llama_context * draft) {
+    static const char * path = std::getenv(iq2 ? ggml_hip_iq3_strata_plan::iq2_mode_file_env : ggml_hip_iq3_strata_plan::mode_file_env);
     if (!path || !*path) {
         return;
     }
@@ -19,7 +20,7 @@ inline void server_refresh_iq3_strata_mode(llama_context * target, llama_context
     static const auto set_mode = []() -> set_mode_t {
         const auto reg = ggml_backend_reg_by_name("ROCm");
         return reg ? reinterpret_cast<set_mode_t>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_set_gfx906_iq3_strata")) : nullptr;
+                ggml_backend_reg_get_proc_address(reg, iq2 ? "ggml_backend_hip_set_gfx906_iq2_strata" : "ggml_backend_hip_set_gfx906_iq3_strata")) : nullptr;
     }();
     if (!set_mode) {
         return;
@@ -37,10 +38,11 @@ inline void server_refresh_iq3_strata_mode(llama_context * target, llama_context
     }
     static bool invalid = false;
     static int active = -1;
-    const int requested = mode == "IQ3_STRATA=off" ? 0 : mode == "IQ3_STRATA=on" ? 1 : -1;
+    const int requested = mode == (iq2 ? "IQ2_STRATA=off" : "IQ3_STRATA=off") ? 0 :
+            mode == (iq2 ? "IQ2_STRATA=on" : "IQ3_STRATA=on") ? 1 : -1;
     if (!input.eof() || input.bad() || requested < 0) {
         if (!invalid) {
-            LOG_WRN("invalid HIP gfx906 IQ3 Strata mode file: %s\n", path);
+            LOG_WRN("invalid HIP gfx906 IQ%d Strata mode file: %s\n", iq2 ? 2 : 3, path);
             invalid = true;
         }
         return;
@@ -56,5 +58,5 @@ inline void server_refresh_iq3_strata_mode(llama_context * target, llama_context
     }
     set_mode(requested != 0);
     active = requested;
-    LOG_INF("HIP gfx906 IQ3 Strata mode applied: %s\n", requested ? "on" : "off");
+    LOG_INF("HIP gfx906 IQ%d Strata mode applied: %s\n", iq2 ? 2 : 3, requested ? "on" : "off");
 }
