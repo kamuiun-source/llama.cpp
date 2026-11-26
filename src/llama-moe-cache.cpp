@@ -52,13 +52,7 @@ static void prompt_trace_array(std::ostream & out, const T & values) {
     out << ']';
 }
 
-namespace {
 std::atomic<bool> next_prefetch_in_place_enabled{false};
-}
-
-void llama_set_next_prefetch_in_place(bool enabled) {
-    next_prefetch_in_place_enabled.store(enabled, std::memory_order_relaxed);
-}
 
 // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
 // slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
@@ -358,6 +352,10 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+}
+
+void llama_set_next_prefetch_in_place(bool enabled) {
+    next_prefetch_in_place_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 struct llama_moe_cache::impl {
