@@ -1,6 +1,9 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#ifdef GGML_USE_HIP
+#include "ggml-hip-iq3-route-plan.h"
+#endif
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -6184,6 +6187,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
 
+#ifdef GGML_USE_HIP
+    if (!disable_fusion && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_GLU) {
+                ggml_tensor * glu = cgraph->nodes[i];
+                const ggml_tensor * up = glu->src[1];
+                if (up && up->op == GGML_OP_MUL_MAT_ID && up->src[0]->type == GGML_TYPE_IQ3_XXS) {
+                    if (auto * map = ggml_hip_iq3_route_plan::map_from_ids(up->src[2])) {
+                        // The fused GLU reads the map after GET_ROWS has finished.
+                        params->add_alloc_dep(params->user_data, map, glu);
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
         for (size_t i = start; i < last_node; ++i) {
@@ -7668,6 +7688,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #ifdef GGML_USE_HIP
     if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
         return (void *) ggml_hip_gfx906_set_lds_modes;
+    }
+    if (strcmp(name, "ggml_backend_hip_gfx906_iq3_route_plan_mode") == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) -> int {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            if (ggml_cuda_info().devices[dev_ctx->device].cc != GGML_CUDA_CC_VEGA20) {
+                return -1;
+            }
+            return ggml_hip_gfx906_iq3_share_launch_enabled(ggml_hip_gfx906_lds_modes());
+        };
     }
     if (strcmp(name, "ggml_backend_hip_gfx906_iq3_share_enabled") == 0) {
         return (void *) ggml_hip_gfx906_iq3_share_enabled;

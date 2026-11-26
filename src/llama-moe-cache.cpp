@@ -10,6 +10,7 @@
 #include "llama-single-miss-cpu.h"
 #include "llama-single-miss-topology.h"
 #include "../ggml/src/ggml-backend-mtp.h"
+#include "../ggml/src/ggml-hip-iq3-route-plan.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -675,6 +676,9 @@ struct llama_moe_cache::impl {
     int64_t next_profile_h2d_submit_us = 0;
     int64_t next_profile_d2d_submit_us = 0;
     uint64_t next_profile_prefetch_waits = 0;
+    using iq3_route_plan_mode_t = int (*)(ggml_backend_dev_t);
+    iq3_route_plan_mode_t iq3_route_plan_mode = nullptr;
+    size_t hip_mtp_slot_staging_stride = sizeof(llama_expert_placement::layer_map::resident);
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
     bool hip_mtp_slot_async = false;
     bool hip_mtp4_slot_async = false;
@@ -837,6 +841,15 @@ struct llama_moe_cache::impl {
                     placement->max_ubatch != 2 || n_expert_used != 10)) {
                 throw std::runtime_error("3-position MTP requires packed Expert capacity 300+20 and top-10 routing");
             }
+            namespace route_plan = ggml_hip_iq3_route_plan;
+            const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
+            if (placement->hip_mtp_verify_three && !placement->overlap && model.hparams.n_expert == route_plan::experts && target_reg) {
+                iq3_route_plan_mode = reinterpret_cast<iq3_route_plan_mode_t>(
+                        ggml_backend_reg_get_proc_address(target_reg, "ggml_backend_hip_gfx906_iq3_route_plan_mode"));
+                if (iq3_route_plan_mode && iq3_route_plan_mode(placement->target) < 0) {
+                    iq3_route_plan_mode = nullptr;
+                }
+            }
             const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
@@ -851,7 +864,13 @@ struct llama_moe_cache::impl {
                         !weights.ffn_gate_exps_s && !weights.ffn_up_exps_s && !weights.ffn_down_exps_s &&
                         model.hparams.swiglu_clamp_exp[il] <= 1e-6f;
                 l.ig = 0;
-                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                const auto * up = weights.ffn_up_exps;
+                const auto * gate = weights.ffn_gate_exps;
+                const bool iq3_plan = iq3_route_plan_mode && up && gate && up->type == GGML_TYPE_IQ3_XXS &&
+                        gate->type == GGML_TYPE_IQ3_XXS && up->ne[0] == 2560 && up->ne[1] == 640 && ggml_are_same_shape(up, gate);
+                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1,
+                        iq3_plan ? route_plan::map_entries : model.hparams.n_expert);
+                hip_mtp_slot_staging_stride = std::max(hip_mtp_slot_staging_stride, ggml_nbytes(l.slot_map));
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
                 for (int32_t wave = 0; wave < n_prefill_waves; ++wave) {
@@ -915,7 +934,6 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
-            const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
             const char * target_name = target_reg ? ggml_backend_reg_name(target_reg) : "";
             const auto reg = std::strcmp(target_name, "Vulkan") == 0 ? target_reg : nullptr;
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
@@ -1068,7 +1086,7 @@ struct llama_moe_cache::impl {
                 hip_mtp4_slot_async = placement->hip_mtp_verify_four && enabled(slot4);
                 if (hip_mtp_slot_async || hip_mtp4_slot_async) {
                     hip_mtp_slot_staging = allocate_pinned(hip_mtp_slot_async ? slot3 : slot4,
-                            placement->maps.size() * sizeof(placement->maps[0].resident));
+                            placement->maps.size() * hip_mtp_slot_staging_stride);
                 }
                 if (placement->hip_tuple_dma) {
                     hip_mtp_promotion_async = enabled("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION");
@@ -3783,15 +3801,29 @@ struct llama_moe_cache::impl {
                 ggml_backend_sched_wait_expert_copy(sched, true, true);
             }
             const auto write_slot_map = [&] {
+                namespace route_plan = ggml_hip_iq3_route_plan;
                 telemetry_scope scope(set_telemetry_cause, "slot_map");
                 const int64_t map_start = fine_profile ? ggml_time_us() : 0;
-                const size_t bytes_map = ggml_nbytes(dst);
+                const bool with_plan = fixed_three && route_plan::uses_plan(lookup) &&
+                        iq3_route_plan_mode && iq3_route_plan_mode(placement->target) > 0;
+                size_t bytes_map = sizeof(slots);
+                const int32_t * map_data = slots.data();
+                std::array<int32_t, route_plan::map_entries> map_with_plan;
+                if (with_plan) {
+                    const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
+                    const auto plan = rtx_expert ? std::array<int32_t, route_plan::routes>{} :
+                            route_plan::build(ids.data(), slots.data(), zero_slot);
+                    std::copy(slots.begin(), slots.end(), map_with_plan.begin());
+                    std::copy(plan.begin(), plan.end(), map_with_plan.begin() + route_plan::experts);
+                    map_data = map_with_plan.data();
+                    bytes_map = sizeof(map_with_plan);
+                }
+                GGML_ASSERT(bytes_map <= ggml_nbytes(dst));
                 if (async_map_dst) {
-                    GGML_ASSERT(bytes_map == sizeof(slots));
                     auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get()));
-                    staging += il * sizeof(slots);
+                    staging += il * hip_mtp_slot_staging_stride;
                     // This callback's destination wait has drained any prior use of this layer's staging.
-                    std::memcpy(staging, slots.data(), bytes_map);
+                    std::memcpy(staging, map_data, bytes_map);
                     ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
                     demand_trace(il, "slot_map_submit", 1, bytes_map);
                     if (fixed_four) {
@@ -3801,7 +3833,7 @@ struct llama_moe_cache::impl {
                         hip_mtp_async_map_bytes += bytes_map;
                     }
                 } else {
-                    ggml_backend_tensor_set(dst, slots.data(), 0, bytes_map);
+                    ggml_backend_tensor_set(dst, map_data, 0, bytes_map);
                     packed_synchronous_maps += defer_slot_map_requested;
                 }
                 if (fine_profile) {
