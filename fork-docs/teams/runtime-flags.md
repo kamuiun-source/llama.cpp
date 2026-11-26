@@ -101,13 +101,13 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 `--moe-cache-cpu-share F` は通常のMoEキャッシュが満杯になった後、ミスのうちCPUで計算する割合を指定する。packed Expert経路の条件は `F=0`（既定）で、正の値は初期化時に拒否される。
 
-### MI50 IQ3_XXSのStrata方式
+### MI50 IQ3_XXSとIQ2_SのStrata方式
 
 `codex/rocm-iq3-strata-reuse` の固定3幅の通常起動では、`LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE` に `IQ3_STRATA=on` を1行で記載したファイルを指定する。比較時は `IQ3_STRATA=off`、ファイルのパスを未指定にした場合もOFF。リクエスト間のアイドル時に読み直し、キャプチャ済みのHIP Graphは切り替え後に作り直す。対象はgfx906・固定3位置・単一バンク・直接tuple DMAのIQ3_XXS gate/up＋SwiGLU。CPU Expert自動配分は従来の設定を維持し、CPUが受け持つ位置はGPU側のゼロ枠の出力を生成する。ON時は各対象層の非同期スロット表に120 Bを追記する。[Dockerの通常起動設定](../rocm/10-decode-pipeline.md#mi50のiq3_xxsでstrata方式を有効にする)
 
 `LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE=1` は終了時に表作成時間、発行にかかったホスト時間、追加バイト数とグループ数を出す。非同期H2Dの実時間はGPUトレースで別に確認する。[設計と計測](../research/rocm-iq3-strata-reuse-20261126.md#実モデルでの比較)
 
-IQ2_Sの試作は別の `LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE` に `IQ2_STRATA=on` または `IQ2_STRATA=off` を1行で指定する。未指定時はOFF。対象の固定3幅では既存の符号復号と `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` を使い、IQ2_SのLDS先読みと4行はOFF。IQ3_XXSのStrata設定は独立して維持する。計測時の `LLAMA_EXPERT_HIP_IQ2_STRATA_PROFILE=1` はIQ2_Sの表作成・発行時間と追加転送量を記録する。[IQ2_Sの実モデル計測](../research/rocm-iq3-strata-reuse-20261126.md#iq2_sの実モデルでのon計測)
+IQ2_Sも通常起動でONを採用する。別の `LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE` に `IQ2_STRATA=on` を1行で指定する。比較時は `IQ2_STRATA=off`、ファイル未指定時もOFF。対象の固定3幅では既存の符号復号と `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` を使い、IQ2_SのLDS先読みと4行はOFF。IQ3_XXSのStrata設定は独立して維持する。計測時の `LLAMA_EXPERT_HIP_IQ2_STRATA_PROFILE=1` はIQ2_Sの表作成・発行時間と追加転送量を記録する。[IQ2_Sの通常起動設定](../rocm/10-decode-pipeline.md#mi50のiq2_sでstrata方式を有効にする) · [実モデル計測](../research/rocm-iq3-strata-reuse-20261126.md#iq2_sの実モデルでのon計測)
 
 ### 固定3幅のMTP catch-upと第1候補
 

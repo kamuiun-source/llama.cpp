@@ -289,6 +289,25 @@ printf '%s\n' 'IQ3_STRATA=on' > "$iq3_strata_mode_dir/mode"
 
 CPU Expert自動配分と既存のIQ3_XXS LDS設定を併用する。Strataの対象外の形状と、モードをOFFにしたときは従来の経路を使う。比較時は待機中にモードを `IQ3_STRATA=off` に更新する。環境変数を省略した場合のコード既定はOFF。**実モデルのON/OFF比較では生成ID・回答の文面・MTP採用数に差が出た。** [実モデルの計測](../research/rocm-iq3-strata-reuse-20261126.md#実モデルでの比較)
 
+##### MI50のIQ2_SでStrata方式を有効にする
+
+固定3幅の通常起動では、上記のIQ3_XXSに加えてIQ2_S gate/up＋SwiGLUのStrata方式も有効にする。既存の符号復号と `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` を使い、IQ2_SのLDS先読みと4行はOFFにする。
+
+```bash
+iq2_strata_mode_dir="$PWD/rocm-iq2-strata-mode"
+mkdir -p "$iq2_strata_mode_dir"
+printf '%s\n' 'IQ2_STRATA=on' > "$iq2_strata_mode_dir/mode"
+```
+
+同じ端末でDocker起動オプションに追加する。
+
+```bash
+  --mount "type=bind,src=$iq2_strata_mode_dir,dst=/iq2-strata-mode,readonly" \
+  -e LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE=/iq2-strata-mode/mode \
+```
+
+IQ2_Sだけ比較するときはサーバー待機中に `IQ2_STRATA=off` に更新する。モードファイル未指定時のコード既定はOFF。観測した3回の合算は、過去のIQ3_XXSのみONの58.91 tok/sに対して59.95 tok/sだった。生成ID・回答文・MTP採用数には差があった。[IQ2_Sの実モデル計測](../research/rocm-iq3-strata-reuse-20261126.md#iq2_sの実モデルでのon計測)
+
 ##### MTPのcatch-upと第1候補をまとめる設定
 
 固定3幅・greedyの2候補で使う `llama-server` の通常起動に採用する。ホストでモードファイルを作る。
@@ -1206,7 +1225,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 
 環境変数を省略した場合は各項目とも個別OFFと同じ。語彙プレフィックスを使うときは、ファイルで語彙を指定する `LLAMA_MTP_DRAFT_VOCAB` を未設定にする。全項目試験でもRTXのCUDA Graphsは有効にする。
 
-モードファイルで実行中に切り替える項目は、[CPU Expertの通常起動](#単一バンク固定3幅の採用設定)、[MI50のIQ3_XXSのStrata方式](#mi50のiq3_xxsでstrata方式を有効にする)、[MTPのcatch-upと第1候補をまとめる設定](#mtpのcatch-upと第1候補をまとめる設定)を参照する。
+モードファイルで実行中に切り替える項目は、[CPU Expertの通常起動](#単一バンク固定3幅の採用設定)、MI50のStrata方式（[IQ3_XXS](#mi50のiq3_xxsでstrata方式を有効にする)・[IQ2_S](#mi50のiq2_sでstrata方式を有効にする)）、[MTPのcatch-upと第1候補をまとめる設定](#mtpのcatch-upと第1候補をまとめる設定)を参照する。
 
 LDS先読みと出力4行は量子型ごとに独立して切り替える。`IQ2_S` のLDS先読みと出力4行は実3位置が対象。どちらの型も符号復号を有効にし、出力4行には同じ型のLDS先読みも有効にする。`IQ2_S` だけで先読みを試す場合は `GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` にし、IQ3_XXSのLDSフラグ2つは `0` にする。
 
