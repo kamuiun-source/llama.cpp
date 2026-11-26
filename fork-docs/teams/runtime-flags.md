@@ -12,6 +12,8 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 
 `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有。統合ブランチの通常起動で採用する。比較時は `0`。符号復号をON、IQ2_SのLDS先読みとLDSなし4行をOFFにする。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
 
+`codex/rocm-iq2s-signed-lut` の `LLAMA_HIP_GFX906_IQ2_S_LUT_MODE_FILE` は上記の2行の共有経路向け。ファイルに `IQ2_S_LUT=on` または `IQ2_S_LUT=off` を書くとリクエスト間に切り替わる。既定OFF。単体で出力ビット一致、速度低下を確認。[比較結果](../research/gfx906-iq2s-iq4nl-20261126.md#iq2_sの符号込みlut試作)
+
 `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。統合ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
 
 RTXの固定3位置・Q8_0 HC down Split-Kは通常起動でOFF（未設定または `0`）。比較時は `GGML_CUDA_HC_DOWN_SPLIT_K=1` で有効化する。4分割した部分和のFP32加算順が変わり、丸め差で温度0でも出力文言・MTP採用数が変動し得る。[新しい5問の実測](../rocm/10-decode-pipeline.md#新しい独立5問でsplit-kを再比較)

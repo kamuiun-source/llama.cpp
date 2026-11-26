@@ -57,7 +57,7 @@ struct ggml_cuda_graph {
     const void * mapped_hc_data = nullptr;
     int64_t last_used_time = 0;
 #ifdef GGML_USE_HIP
-    int gfx906_lds_modes = -1;
+    int gfx906_mmvq_modes = 0;
 #endif
     struct node_properties {
         ggml_tensor node;

@@ -3,6 +3,10 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "iq2s-signed-lut-mode.h"
+#ifdef GGML_USE_HIP
+#include "iq2s-signed-lut.cuh"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -1198,7 +1202,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_down_compact(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
-          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false>
+          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false, bool iq2_signed_lut = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1228,6 +1232,7 @@ static __global__ void mul_mat_vec_q_moe(
     static_assert(iq_row_groups == 1 || (iq_row_groups == 2 && (iq_lds_tokens == 3 ||
         (iq_lds_tokens == 0 && type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion && packed_signs))));
 
+    static_assert(!iq2_signed_lut || iq2_paired_dot);
     static_assert(!iq2_paired_dot || (type == GGML_TYPE_IQ2_S && c_rows_per_block == 2 && has_fusion &&
         packed_signs && iq_lds_tokens == 0 && iq_row_groups == 1));
 
@@ -1358,7 +1363,14 @@ static __global__ void mul_mat_vec_q_moe(
                     if constexpr (iq2_paired_dot) {
                         const auto up = load_iq_mmvq_weights(static_cast<const block_iq2_s *>(vx)[weight], kqs);
                         const auto gate = load_iq_mmvq_weights(static_cast<const block_iq2_s *>(vgate)[weight], kqs);
-                        vec_dot_iq2_s_q8_1_pair(up, gate, y[kby + kqs/2], tmp[i], tmp_gate[i]);
+#ifdef GGML_USE_HIP
+                        if constexpr (iq2_signed_lut) {
+                            vec_dot_iq2_s_q8_1_lut_pair(up, gate, y[kby + kqs/2], tmp[i], tmp_gate[i]);
+                        } else
+#endif
+                        {
+                            vec_dot_iq2_s_q8_1_pair(up, gate, y[kby + kqs/2], tmp[i], tmp_gate[i]);
+                        }
                     } else {
                         tmp[i] += vec_dot_q_cuda(vx, &y[kby], weight, kqs);
                         if constexpr (has_fusion) {
@@ -1492,6 +1504,16 @@ static void mul_mat_vec_q_switch_fusion(
 // Pack both modes into one atomic so a launch cannot see a partially applied pair.
 static constexpr int gfx906_lds_mode_base = 5;
 static std::atomic<int> gfx906_lds_modes{-1};
+static std::atomic<int> gfx906_iq2s_signed_lut{-1};
+
+void ggml_hip_gfx906_set_iq2s_signed_lut(bool enabled) {
+    gfx906_iq2s_signed_lut.store(enabled, std::memory_order_relaxed);
+}
+
+int ggml_hip_gfx906_iq2s_signed_lut() {
+    return gfx906_iq2s_signed_lut.load(std::memory_order_relaxed);
+}
+
 
 bool ggml_hip_gfx906_set_lds_modes(int iq2_s, int iq3_xxs) {
     const auto valid_mode = [](int mode) { return mode == 0 || mode == 2 || mode == 4; };
@@ -1672,10 +1694,20 @@ static void mul_mat_vec_q_moe_launch(
                     return value && std::strcmp(value, "1") == 0;
                 }();
                 if (paired_dot && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
-                    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true>, launch_params,
-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-                        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        ncols_dst, ids_stride);
+                    const auto launch_paired = [&](auto use_lut) {
+                        constexpr bool signed_lut = decltype(use_lut)::value;
+                        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true, false, signed_lut>,
+                            launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            ncols_dst, ids_stride);
+                    };
+                    if (ggml_hip_gfx906_iq2s_signed_lut() == 1) {
+                        launch_paired(std::true_type{});
+                        static const bool logged_lut = (GGML_LOG_INFO("HIP gfx906 IQ2_S signed LUT applied: positions=3 rows_per_block=2\n"), true);
+                        GGML_UNUSED(logged_lut);
+                    } else {
+                        launch_paired(std::false_type{});
+                    }
                     static const bool logged = [] {
                         GGML_LOG_INFO("HIP gfx906 IQ2_S routed SwiGLU paired dot applied: positions=3 rows_per_block=2\n");
                         return true;

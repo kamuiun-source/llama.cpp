@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "sync-telemetry.cuh"
+#include "iq2s-signed-lut-mode.h"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -6014,9 +6015,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     graph_key = ggml_cuda_graph_get_key(cgraph);
 #ifdef GGML_USE_HIP
     const int lds_modes = ggml_hip_gfx906_lds_modes();
-    if (lds_modes >= 0 && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+    const int signed_lut = ggml_hip_gfx906_iq2s_signed_lut();
+    const int mmvq_modes = (lds_modes + 1) | (signed_lut == 1 ? 32 : 0);
+    if ((lds_modes >= 0 || signed_lut >= 0) && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
-        if (it != cuda_ctx->cuda_graphs.end() && it->second->gfx906_lds_modes != lds_modes) {
+        if (it != cuda_ctx->cuda_graphs.end() && it->second->gfx906_mmvq_modes != mmvq_modes) {
             // Captured launches contain the kernel selected under the previous mode.
             cuda_ctx->cuda_graphs.erase(it);
         }
@@ -6027,7 +6030,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graphs_enabled) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 #ifdef GGML_USE_HIP
-        graph->gfx906_lds_modes = lds_modes;
+        graph->gfx906_mmvq_modes = mmvq_modes;
 #endif
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
@@ -7662,6 +7665,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
 #endif
 #ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_hip_set_gfx906_iq2s_signed_lut") == 0) {
+        return (void *)ggml_hip_gfx906_set_iq2s_signed_lut;
+    }
     if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
         return (void *) ggml_hip_gfx906_set_lds_modes;
     }
