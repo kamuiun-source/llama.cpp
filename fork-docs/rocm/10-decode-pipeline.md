@@ -743,6 +743,16 @@ Qwen4expの固定3幅では、現層のFFN入力に次層Routerの重みを掛�
 
 再集計スクリプトとJSONはGit外の `/home/t-saka/rocm-integrated-bottlenecks-20261126/` の `analyze-submit-handoff.py` と `submit-handoff-breakdown.json`。
 
+###### CUDA Graph投入の公開事例と候補
+
+直前のトレースを再分類すると、274検証のRTX本体投入で `cudaGraphLaunch` 13,134回（47.93回/検証）、該当する本体スプリットはすべて1回ずつだった。別にRTXのスプリット準備区間で12,052回（43.99回/検証）、中央値19.28 µsを記録した。Shared Expert先行発行がこの区間にある。次層Routerの個別投入回数はこのトレースからは確定していない。GPUのカーネル数とホストからのグラフ起動回数は区別する。
+
+1. **計測負荷を分離する。** CUDA Graphsを有効にしたままNsightを `--cuda-graph-trace=graph` に変え、同じ5問で本体・Shared Expert・次層Routerの起動を区分する。通常実行でも短いホスト計時を集計し、起動APIの分布、本体検証時間、生成速度を確認する。公開例ではCUDA 12.6のAmpereで直列のカーネル専用グラフの再起動は約2.5 µs。今回の62.51 µsの比較対象としては計測条件とグラフ形状が異なる。[Nsight Systems User Guide](https://docs.nvidia.com/nsight-systems/UserGuide/index.html) · [NVIDIAのCUDA Graph計測](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/)
+2. **同じRTX側で起動をまとめる。** vLLMの固定形状のFull Decode Graphと部分キャプチャの使い分けを参考にする。この構成では層ごとに実Router IDをCPUが使ってMI50のExpertを準備し、MI50の結果とCPU側で処理したExpertの補正を次のRTX計算に渡す。まず同じMI50計算区間に投入できることを確認したRTX側の補助処理を候補とする。たとえば次層Router予測とShared Expertの入力・出力の寿命が両立する層で1グラフを試し、Shared Expertの先行時間・予測ヒット・本体検証時間を比較する。既存の `GGML_CUDA_GRAPH_CHUNK_SIZE=0` はスプリット内の追加分割を外せるが、今回のRTX本体はすでに1スプリット1起動なので、この変更だけで約48回を減らす見込みは薄い。[vLLMのCUDA Graph設計](https://docs.vllm.ai/en/stable/design/cuda_graphs/) · [NVIDIAの小規模グラフ分割の解説](https://docs.nvidia.com/dl-cuda-graph/latest/troubleshooting/performance-issues.html#too-many-small-cuda-graphs)
+3. **リプレイ自体が重ければグラフ形状を確認する。** RTX本体のノード種類、ルート数、ストリーム間イベント、分岐の数をキャプチャ時に数え、不要な依存や別ストリームへの分岐を候補にする。直列化でGPU側の並行性が落ちる場合があるため、ホスト起動時間と本体検証時間を両方測る。 `cudaGraphUpload` は初回を分ける用途を優先する。デバイス起動付きCUDA Graphは単一デバイスで、MI50側のHIP処理とCPU側のルーティングは引き続き別スケジューリングが必要。[CUDA 12.9プログラミングガイド](https://docs.nvidia.com/cuda/archive/12.9.2/cuda-c-programming-guide/index.html#device-graph-launch)
+
+優先は軽い再計測で、投入コストが残った場合に限定してRTX側の補助グラフの統合を試す。GPU間をまとめるための通知方式は、既存の30,720 B単体試験でCPU同期13.88 µs、GPU通知35.51 µsだった。固定3幅でShared Expert先行発行、次層Router後段発行、CPU Expert補正を維持する。
+
 #### RTXの量子化投影を集計する
 
 LinuxのAda向けビルドで `GGML_CUDA_MMVQ_TRACE=1` を指定すると、RTXのdense MMVQのNVTXに重み名・出力名・量子型・テンソル形状・起動形状が出る。Nsight Systemsは `--trace=cuda,nvtx --cuda-graph-trace=node` で起動時から採取し、SQLiteへエクスポートする。CUDA Graphは再生を継続する。再キャプチャ時だけ実行グラフを作り直し、古いノードIDへの誤対応を防ぐ。通常の速度比較ではこのフラグを外す。
