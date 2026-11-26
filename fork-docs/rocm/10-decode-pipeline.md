@@ -270,6 +270,25 @@ printf '%s\n' 'SINGLE_MISS_CPU=on' > "$cpu_expert_mode_dir/mode"
 
 Linuxで使える物理コア数から2コア分を残し、6コアなら最大2件、8コアなら最大3件の実ミスを同時にCPUで計算する。残りはMI50へ転送する。比較時はホスト側のmodeを `SINGLE_MISS_CPU=off` にしてリクエスト間で切り替える。通常MoEキャッシュの `--moe-cache-cpu-share` は既定の0を使う。[CPU Expert処理の自動配分](09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
 
+##### MI50のIQ3_XXSでStrata方式を有効にする
+
+`codex/rocm-iq3-strata-reuse` の固定3幅の通常起動では、IQ3_XXS gate/up＋SwiGLUで同じExpertを使う位置間の重み再利用を有効にする。ホストでモードファイルを作る。
+
+```bash
+iq3_strata_mode_dir="$PWD/rocm-iq3-strata-mode"
+mkdir -p "$iq3_strata_mode_dir"
+printf '%s\n' 'IQ3_STRATA=on' > "$iq3_strata_mode_dir/mode"
+```
+
+同じ端末でDocker起動オプションに追加する。
+
+```bash
+  --mount "type=bind,src=$iq3_strata_mode_dir,dst=/iq3-strata-mode,readonly" \
+  -e LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE=/iq3-strata-mode/mode \
+```
+
+CPU Expert自動配分と既存のIQ3_XXS LDS設定を併用する。Strataの対象外の形状と、モードをOFFにしたときは従来の経路を使う。比較時は待機中にモードを `IQ3_STRATA=off` に更新する。環境変数を省略した場合のコード既定はOFF。**実モデルのON/OFF比較では生成ID・回答の文面・MTP採用数に差が出た。** [実モデルの計測](../research/rocm-iq3-strata-reuse-20261126.md#実モデルでの比較)
+
 ##### MTPのcatch-upと第1候補をまとめる設定
 
 固定3幅・greedyの2候補で使う `llama-server` の通常起動に採用する。ホストでモードファイルを作る。
@@ -1187,7 +1206,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 
 環境変数を省略した場合は各項目とも個別OFFと同じ。語彙プレフィックスを使うときは、ファイルで語彙を指定する `LLAMA_MTP_DRAFT_VOCAB` を未設定にする。全項目試験でもRTXのCUDA Graphsは有効にする。
 
-モードファイルで実行中に切り替える項目は、[CPU Expertの通常起動](#単一バンク固定3幅の採用設定)と[MTPのcatch-upと第1候補をまとめる設定](#mtpのcatch-upと第1候補をまとめる設定)を参照する。
+モードファイルで実行中に切り替える項目は、[CPU Expertの通常起動](#単一バンク固定3幅の採用設定)、[MI50のIQ3_XXSのStrata方式](#mi50のiq3_xxsでstrata方式を有効にする)、[MTPのcatch-upと第1候補をまとめる設定](#mtpのcatch-upと第1候補をまとめる設定)を参照する。
 
 LDS先読みと出力4行は量子型ごとに独立して切り替える。`IQ2_S` のLDS先読みと出力4行は実3位置が対象。どちらの型も符号復号を有効にし、出力4行には同じ型のLDS先読みも有効にする。`IQ2_S` だけで先読みを試す場合は `GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` にし、IQ3_XXSのLDSフラグ2つは `0` にする。
 

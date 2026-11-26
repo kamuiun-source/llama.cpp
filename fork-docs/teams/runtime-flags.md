@@ -101,9 +101,9 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 `--moe-cache-cpu-share F` は通常のMoEキャッシュが満杯になった後、ミスのうちCPUで計算する割合を指定する。packed Expert経路の条件は `F=0`（既定）で、正の値は初期化時に拒否される。
 
-### MI50 IQ3_XXSのStrata方式の試作
+### MI50 IQ3_XXSのStrata方式
 
-`codex/rocm-iq3-strata-reuse` では `LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE` に `IQ3_STRATA=off` または `IQ3_STRATA=on` を1行で記載したファイルを指定する。未指定時はOFF。リクエスト間のアイドル時に読み直し、キャプチャ済みのHIP Graphは切り替え後に作り直す。対象はgfx906・固定3位置・単一バンク・直接tuple DMAのIQ3_XXS gate/up＋SwiGLU。CPU Expert自動配分は従来の設定を維持し、CPUが受け持つ位置はGPU側のゼロ枠の出力を生成する。ON時は各対象層の非同期スロット表に120 Bを追記する。
+`codex/rocm-iq3-strata-reuse` の固定3幅の通常起動では、`LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE` に `IQ3_STRATA=on` を1行で記載したファイルを指定する。比較時は `IQ3_STRATA=off`、ファイルのパスを未指定にした場合もOFF。リクエスト間のアイドル時に読み直し、キャプチャ済みのHIP Graphは切り替え後に作り直す。対象はgfx906・固定3位置・単一バンク・直接tuple DMAのIQ3_XXS gate/up＋SwiGLU。CPU Expert自動配分は従来の設定を維持し、CPUが受け持つ位置はGPU側のゼロ枠の出力を生成する。ON時は各対象層の非同期スロット表に120 Bを追記する。[Dockerの通常起動設定](../rocm/10-decode-pipeline.md#mi50のiq3_xxsでstrata方式を有効にする)
 
 `LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE=1` は終了時に表作成時間、発行にかかったホスト時間、追加バイト数とグループ数を出す。非同期H2Dの実時間はGPUトレースで別に確認する。[設計と計測](../research/rocm-iq3-strata-reuse-20261126.md#実モデルでの比較)
 
