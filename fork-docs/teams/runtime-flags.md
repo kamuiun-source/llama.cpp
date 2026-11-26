@@ -92,6 +92,7 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。 |
 | `LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND` | 未設定（既定OFF） / `1`（試作） | 固定3幅の必要転送から融合までを計算ストリーム上で連結する。既存の先読み後発行・実ミス優先、非同期スロット表と非同期昇格が有効な構成で使う。 |
 | `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` | 未設定（通常） / `1`（詳細比較） | 試作ON/OFF両方に層ごとのホスト時刻を出す。GPU時刻はrocprofで照合する。 |
+| `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_READBACK=off` または `NEXT_ROUTER_READBACK=on` | 次層予測IDのD2HをRTXのピン留め受信枠で受け、完了イベントを待つ試作。固定3幅の通常Top-10が対象。リクエスト間で切り替え、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` でモード別の回数と時間を終了時に集計する。 |
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
 

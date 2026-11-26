@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
+#include "llama-next-router-readback.h"
 #include "llama-rtx-expert.h"
 #include "llama-single-miss-cpu.h"
 #include "llama-single-miss-topology.h"
@@ -580,6 +581,8 @@ struct llama_moe_cache::impl {
     const std::vector<ggml_tensor *> * next_prefetch_predictions = nullptr;
     const std::vector<ggml_tensor *> * next_prefetch_scores = nullptr;
     int next_prefetch_score_mode = 0;
+    llama_next_router_readback next_readback;
+    llama_next_router_readback::totals * next_readback_totals = nullptr;
     size_t next_prefetch_priority_layers = 0;
     size_t next_prefetch_priority_fallbacks = 0;
     size_t next_prefetch_top20_only = 0;
@@ -2767,8 +2770,13 @@ struct llama_moe_cache::impl {
         const size_t prediction_bytes = ranks * next_prefetch_tokens * sizeof(int32_t);
         GGML_ASSERT(prediction->ne[0] == ranks && prediction->ne[1] == next_prefetch_tokens &&
                 ggml_nbytes(prediction) == prediction_bytes);
-        const int64_t read_start = next_profile_start ? ggml_time_us() : 0;
-        ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
+        const bool measure_read = next_profile_start || next_readback_totals;
+        const int64_t read_start = measure_read ? ggml_time_us() : 0;
+        const bool pinned = next_readback.enabled && !next_prefetch_scores &&
+                next_readback.submit(producer, prediction, prediction_bytes);
+        if (!pinned) {
+            ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
+        }
         if (next_prefetch_scores) {
             auto * scores = (*next_prefetch_scores)[il];
             read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
@@ -2780,12 +2788,26 @@ struct llama_moe_cache::impl {
                 ++next_prefetch_score_readback_fallback;
             }
         }
-        const int64_t wait_start = read_start ? ggml_time_us() : 0;
-        ggml_backend_synchronize(producer);
-        if (read_start) {
-            ++next_profile_readbacks;
-            next_profile_read_submit_us += wait_start - read_start;
-            next_profile_read_wait_us += ggml_time_us() - wait_start;
+        const int64_t wait_start = measure_read ? ggml_time_us() : 0;
+        if (pinned) {
+            next_readback.complete(predicted.data(), prediction_bytes);
+        } else {
+            ggml_backend_synchronize(producer);
+        }
+        if (measure_read) {
+            const int64_t wait_us = ggml_time_us() - wait_start;
+            const int64_t submit_us = wait_start - read_start;
+            if (next_profile_start) {
+                ++next_profile_readbacks;
+                next_profile_read_submit_us += submit_us;
+                next_profile_read_wait_us += wait_us;
+            }
+            if (next_readback_totals) {
+                ++next_readback_totals->reads;
+                next_readback_totals->applied += pinned;
+                next_readback_totals->submit_us += submit_us;
+                next_readback_totals->wait_us += wait_us;
+            }
         }
 
         if (next_prefetch_score_mode == 2) {
@@ -3047,6 +3069,10 @@ struct llama_moe_cache::impl {
                     hip_direct_upload_wait_us += us;
                 }
             }
+        }
+        if (tuple_dma && next_readback_totals) {
+            next_readback_totals->demand_tuples += fills.size();
+            next_readback_totals->hit_tuples += prefetch_hits;
         }
         next_prefetch_top20_only_hits += prefetch_top20_hits;
         if (il == next_prefetch_layer && next_prefetch_hit_wait) {
@@ -4116,6 +4142,7 @@ struct llama_moe_cache::impl {
                     next_profile_d2d_submit_us, next_profile_prefetch_waits, next_prefetch_wait_us);
         }
         if (next_prefetch_bank) {
+            next_readback.log_stats();
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: launches=%zu hits=%zu unused=%zu h2d_bytes=%zu d2d_bytes=%zu wait_us=%" PRId64 "\n",
                     next_prefetch_launches, next_prefetch_hits, next_prefetch_unused,
                     next_prefetch_h2d_bytes, next_prefetch_d2d_bytes, next_prefetch_wait_us);
@@ -4463,6 +4490,7 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     auto & self = *pimpl;
     GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
+    self.next_readback_totals = self.next_readback.begin_graph(self.next_profile_start != 0);
     GGML_ASSERT(!self.next_prefetch_score_mode || scores.size() == predictions.size());
     self.next_prefetch_scores = self.next_prefetch_score_mode ? &scores : nullptr;
     if (self.hip_demand_trace) {
@@ -4506,6 +4534,7 @@ void llama_moe_cache::end_next_router_prefetch(ggml_backend_sched_t sched) {
         pimpl->hip_demand_trace_entries.clear();
     }
     pimpl->next_prefetch_predictions = nullptr;
+    pimpl->next_readback_totals = nullptr;
     pimpl->next_prefetch_scores = nullptr;
 }
 
