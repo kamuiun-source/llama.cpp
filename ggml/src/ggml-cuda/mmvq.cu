@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#ifdef GGML_USE_HIP
+#include "mmvq-iq3-strata.cuh"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -2232,6 +2235,32 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
 #ifdef GGML_USE_HIP
+    if (ggml_hip_gfx906_iq3_strata_enabled() && src0->type == GGML_TYPE_IQ3_XXS && ne00 == 2560 && ne01 == 640 &&
+            ne03 == 1 && ne13 == 1 && ne3 == 1 && ncols_dst == 3 && nchannels_y == 1 && nchannels_dst == 10 &&
+            s01 == iq3_strata_reuse::weight_blocks && s02 >= ne01 * s01 && s02 <= INT32_MAX && src0->nb[2] % ts_src0 == 0 &&
+            stride_col_y == iq3_strata_reuse::activation_blocks && ggml_is_contiguous(dst) &&
+            fusion_local.gate && fusion_local.glu_op == GGML_GLU_OP_SWIGLU &&
+            !fusion_local.x_bias && !fusion_local.gate_bias && !fusion_local.x_scale && !fusion_local.gate_scale &&
+            !fusion_local.shared_up && !fusion_local.shared_gate && !fusion_local.shared_dst &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VEGA20) {
+        namespace plan = ggml_hip_iq3_strata_plan;
+        namespace reuse = iq3_strata_reuse;
+        const auto * map = plan::map_from_ids(ids);
+        if (map && map->data) {
+            const auto * groups = static_cast<const int32_t *>(map->data) + plan::experts;
+            const ggml_cuda_kernel_launch_params params(dim3(reuse::nrows / reuse::rows_per_tile, plan::routes),
+                    dim3(reuse::waves * reuse::wave), 0, stream);
+            ggml_cuda_kernel_launch(reuse::gate_up_packed, params,
+                    static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                    reinterpret_cast<const block_q8_1 *>(src1_q8_1.get()), groups, dst_d, int(s02));
+            static const bool logged = [] {
+                GGML_LOG_INFO("HIP gfx906 IQ3_XXS Strata gate/up applied: MTP positions=3 top_k=10\n");
+                return true;
+            }();
+            GGML_UNUSED(logged);
+            return;
+        }
+    }
     const auto * lookup = ids ? ids->view_src : nullptr;
     if (lookup && lookup->op == GGML_OP_GET_ROWS && std::strcmp(lookup->name, "ffn_moe_mtp_share_iq3_weights") == 0 &&
             src0->type == GGML_TYPE_IQ3_XXS && ne00 == 2560 && ne01 == 640 && ncols_dst == 3 &&
