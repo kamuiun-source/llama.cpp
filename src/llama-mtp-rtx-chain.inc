@@ -31,15 +31,38 @@ bool llama_context::process_mtp_rtx_chain(const llama_batch_ext & first, const l
         if (!host_buft) {
             return false;
         }
+        const auto * table = model.tok_embd;
+        if (!table || !table->buffer || !table->data || table->type != GGML_TYPE_Q8_0 ||
+                !ggml_is_matrix(table) || !ggml_is_contiguous(table)) {
+            return false;
+        }
+        const auto table_buft = ggml_backend_buffer_get_type(table->buffer);
+        const auto device_buft = ggml_backend_get_default_buffer_type(chain->backend);
+        if (table_buft == device_buft) {
+            chain->embedding_table = table->data;
+        } else if (table_buft == host_buft) {
+            using map_fn = void * (*)(ggml_backend_dev_t, void *);
+            const auto map = reinterpret_cast<map_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_mapping"));
+            auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(table->buffer));
+            const auto offset = static_cast<uint8_t *>(table->data) - base;
+            auto * mapped = map ? static_cast<uint8_t *>(map(dev, base)) : nullptr;
+            if (!mapped) {
+                return false;
+            }
+            chain->embedding_table = mapped + offset;
+        } else {
+            return false;
+        }
+
         constexpr size_t host_capacity = 512 * 1024;
         chain->storage.reset(ggml_init({3 * ggml_tensor_overhead(), nullptr, true}));
         if (!chain->storage) {
             return false;
         }
         chain->ids = ggml_new_tensor_1d(chain->storage.get(), GGML_TYPE_I32, 4);
-        chain->first_id = ggml_view_1d(chain->storage.get(), chain->ids, 1, 0);
+        chain->embedding = ggml_new_tensor_2d(chain->storage.get(), GGML_TYPE_F32, table->ne[0], 1);
         chain->hidden = ggml_new_tensor_2d(chain->storage.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), 1);
-        ggml_set_name(chain->first_id, "mtp_rtx_first_id");
+        ggml_set_name(chain->embedding, "mtp_rtx_first_embedding");
         ggml_set_name(chain->hidden, "mtp_rtx_first_hidden");
         chain->device.reset(ggml_backend_alloc_ctx_tensors_from_buft(chain->storage.get(), ggml_backend_get_default_buffer_type(chain->backend)));
         chain->host.reset(ggml_backend_buft_alloc_buffer(host_buft, host_capacity));
@@ -48,6 +71,8 @@ bool llama_context::process_mtp_rtx_chain(const llama_batch_ext & first, const l
         }
         chain->result = std::make_unique<llm_graph_result>(gf_res_reserve->get_max_nodes());
         chain->scheduler = sched_create(sched_params_cur);
+        LLAMA_LOG_INFO("MTP RTX draft embedding: source=%s type=Q8_0 rows=%" PRId64 " row_bytes=%zu\n",
+                table_buft == host_buft ? "mapped_host" : "cuda", table->ne[1], table->nb[1]);
         mtp_rtx_chain = std::move(chain);
     }
 
@@ -138,6 +163,9 @@ bool llama_context::publish_mtp_rtx_draft(int step) {
             (step == 0 && !res->get_h_nextn())) {
         return false;
     }
-    return chain.publish(chain.backend, res->t_sampled_logits.front(), res->t_candidates.front(),
-            step == 0 ? res->get_h_nextn() : nullptr, chain.ids, chain.hidden, step, model.vocab.n_tokens());
+    const bool ok = chain.publish(chain.backend, res->t_sampled_logits.front(), res->t_candidates.front(),
+            step == 0 ? res->get_h_nextn() : nullptr, chain.ids, chain.hidden, step, model.vocab.n_tokens(),
+            model.tok_embd, chain.embedding_table, chain.embedding);
+    chain.embedding_rows += ok && step == 0;
+    return ok;
 }

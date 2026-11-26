@@ -831,9 +831,9 @@ llama_context::~llama_context() {
     if (mtp_rtx_chain) {
         const auto & chain = *mtp_rtx_chain;
         LLAMA_LOG_INFO("MTP RTX draft chain: applied=%zu fallback=%zu second_before_submit_ms=%.3f second_submit_ms=%.3f"
-                " second_stream_wait_ms=%.3f final_read_wait_ms=%.3f\n", chain.applied, chain.failed,
+                " second_stream_wait_ms=%.3f final_read_wait_ms=%.3f embedding_rows=%zu\n", chain.applied, chain.failed,
                 chain.second_before_submit_us / 1000.0, chain.second_submit_us / 1000.0,
-                chain.second_stream_wait_ns / 1000000.0, chain.finish_us / 1000.0);
+                chain.second_stream_wait_ns / 1000000.0, chain.finish_us / 1000.0, chain.embedding_rows);
         mtp_rtx_chain.reset();
     }
     if (mtp_draft_graph_cache2 || mtp_draft_graph_cache_switches != 0) {
@@ -3713,7 +3713,7 @@ llm_graph_params llama_context::graph_params(
         /*.target_mtp_verify_packed =*/ mtp_verify_three_enabled && !mtp_verify_three_vulkan_waves &&
                 target_mtp_verify_width >= 3 && ubatch.n_tokens == target_mtp_verify_width,
         /*.mtp_history_kv_only =*/ mtp_history_kv_only,
-        /*.mtp_chain_token =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->first_id : nullptr,
+        /*.mtp_chain_embedding =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->embedding : nullptr,
         /*.mtp_chain_hidden =*/ mtp_rtx_chain && mtp_rtx_chain->step == 1 ? mtp_rtx_chain->hidden : nullptr,
     };
 }

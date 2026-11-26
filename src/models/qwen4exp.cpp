@@ -663,9 +663,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
     ggml_tensor * tok_embd;
     ggml_tensor * h;
-    if (params.mtp_chain_token) {
+    if (params.mtp_chain_embedding) {
         GGML_ASSERT(n_tokens == 1 && params.mtp_chain_hidden);
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, params.mtp_chain_token);
+        tok_embd = params.mtp_chain_embedding;
         h = params.mtp_chain_hidden;
     } else {
         auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd_out());
@@ -681,7 +681,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
         h = inp->h;
         res->add_input(std::move(inp));
     }
-    cb(tok_embd, "mtp_tok_embd", il);
+    if (!params.mtp_chain_embedding) {
+        cb(tok_embd, "mtp_tok_embd", il);
+    }
 
     auto * inp_hyb = build_inp_mem_hybrid();
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
@@ -729,7 +731,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     // the next draft step reads this residual as its h
     ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
-    if (!params.mtp_chain_token) {
+    if (!params.mtp_chain_embedding) {
         res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
         cb(res->t_h_nextn, "h_nextn", il);
         ggml_build_forward_expand(gf, res->t_h_nextn);

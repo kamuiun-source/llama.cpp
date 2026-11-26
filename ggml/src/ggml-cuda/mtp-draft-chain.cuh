@@ -1,6 +1,7 @@
 #pragma once
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "getrows.cuh"
 static __global__ void ggml_cuda_mtp_draft_chain_kernel(const float * logits, const int32_t * candidates,
         int32_t * result, int32_t * valid, const float * hidden, float * next_hidden,
         int n_candidates, int n_hidden, int n_vocab) {
@@ -29,7 +30,7 @@ static __global__ void ggml_cuda_mtp_draft_chain_kernel(const float * logits, co
 
 static bool ggml_backend_cuda_mtp_draft_chain(ggml_backend_t backend, const ggml_tensor * logits,
         const ggml_tensor * candidates, const ggml_tensor * hidden, ggml_tensor * ids, ggml_tensor * next_hidden,
-        int step, int n_vocab) {
+        int step, int n_vocab, const ggml_tensor * table, void * mapped_table, ggml_tensor * embedding) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     const auto buft = ggml_backend_get_default_buffer_type(backend);
     const auto native = [buft](const ggml_tensor * t, ggml_type type, int64_t count) {
@@ -46,6 +47,11 @@ static bool ggml_backend_cuda_mtp_draft_chain(ggml_backend_t backend, const ggml
             ctx->curr_stream_no != 0) {
         return false;
     }
+    if (step == 0 && (!table || !mapped_table || table->type != GGML_TYPE_Q8_0 || !ggml_is_matrix(table) ||
+            !ggml_is_contiguous(table) || table->ne[1] != n_vocab ||
+            !native(embedding, GGML_TYPE_F32, table->ne[0]))) {
+        return false;
+    }
     ggml_cuda_set_device(ctx->device);
     auto * dst = static_cast<int32_t *>(ids->data);
     ggml_cuda_mtp_draft_chain_kernel<<<1, 256, 0, ctx->stream()>>>(
@@ -53,6 +59,18 @@ static bool ggml_backend_cuda_mtp_draft_chain(ggml_backend_t backend, const ggml
         dst + step, dst + step + 2, hidden ? static_cast<const float *>(hidden->data) : nullptr,
         hidden ? static_cast<float *>(next_hidden->data) : nullptr, 10, n_hidden, n_vocab);
     CUDA_CHECK(cudaGetLastError());
+    if (step == 0) {
+        // CUDA gets only the chosen row. The full table remains in its original buffer.
+        auto mapped = *table;
+        mapped.data = mapped_table;
+        auto index = *ids;
+        index.ne[0] = 1;
+        auto output = *embedding;
+        output.src[0] = &mapped;
+        output.src[1] = &index;
+        ggml_cuda_op_get_rows(*ctx, &output);
+        CUDA_CHECK(cudaGetLastError());
+    }
     return true;
 }
 #endif

@@ -4,7 +4,7 @@
 
 struct llama_mtp_rtx_chain {
     using publish_fn = bool (*)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
-            ggml_tensor *, ggml_tensor *, int, int);
+            ggml_tensor *, ggml_tensor *, int, int, const ggml_tensor *, void *, ggml_tensor *);
     using wait_fn = void (*)(uint64_t *);
 
     ggml_backend_t backend = nullptr;
@@ -14,7 +14,9 @@ struct llama_mtp_rtx_chain {
     ggml_backend_buffer_ptr device;
     ggml_backend_buffer_ptr host;
     ggml_tensor * ids = nullptr;
-    ggml_tensor * first_id = nullptr;
+    ggml_tensor * embedding = nullptr;
+    void * embedding_table = nullptr;
+    size_t embedding_rows = 0;
     ggml_tensor * hidden = nullptr;
     ggml_backend_sched_ptr scheduler;
     llm_graph_result_ptr result;
