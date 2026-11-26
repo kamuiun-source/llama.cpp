@@ -69,6 +69,6 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 
 ### Packed ExpertのCPU並列計算
 
-`codex/rocm-single-miss-cpu` のサーバー起動時に `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` にモードファイルのパスを渡す。値は `SINGLE_MISS_CPU=off`（既定）または `SINGLE_MISS_CPU=on`。リクエスト間で切り替わる。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ONではgate/upとdownの量子化共有を常に使う。使用可能な物理コアから2コア分を残し、実ミス1件なら最大4ワーカー、複数件なら1件あたり2ワーカーを使う。残りは通常のMI50転送。旧試作モードの計測結果は記録に残っている。[自動配分](../rocm/09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
+`codex/rocm-integrated-test` の固定3幅の通常起動では `LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE` に `SINGLE_MISS_CPU=on` を入れたモードファイルを渡す。比較時は `off` にし、リクエスト間で切り替える。変数の未指定時はコード既定OFF。固定3幅・単一バンク・直接tuple DMA・非同期の戻り転送が対象。ONではgate/upとdownの量子化共有を常に使う。使用可能な物理コアから2コア分を残し、実ミス1件なら最大4ワーカー、複数件なら1件あたり2ワーカーを使う。残りは通常のMI50転送。旧試作モードの計測結果は記録に残っている。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定) · [自動配分](../rocm/09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
 
 `--moe-cache-cpu-share F` は通常のMoEキャッシュが満杯になった後、ミスのうちCPUで計算する割合を指定する。packed Expert経路の条件は `F=0`（既定）で、正の値は初期化時に拒否される。

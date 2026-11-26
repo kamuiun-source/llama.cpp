@@ -253,6 +253,23 @@ RTXのQ8_0 HC down Split-Kは通常起動でOFF。環境変数は未設定また
 
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
 
+2026-11-26にpacked ExpertのCPU並列計算と量子化共有を取り込んだ。固定3幅の通常起動では、ホストでモードファイルを用意する。
+
+```bash
+cpu_expert_mode_dir="$PWD/rocm-cpu-expert-mode"
+mkdir -p "$cpu_expert_mode_dir"
+printf '%s\n' 'SINGLE_MISS_CPU=on' > "$cpu_expert_mode_dir/mode"
+```
+
+同じ端末のDocker起動オプションに、ディレクトリのマウントとモードファイルの指定を加える。
+
+```bash
+  --mount "type=bind,src=$cpu_expert_mode_dir,dst=/cpu-expert-mode,readonly" \
+  -e LLAMA_EXPERT_HIP_MTP3_SINGLE_MISS_CPU_MODE_FILE=/cpu-expert-mode/mode \
+```
+
+Linuxで使える物理コア数から2コア分を残し、6コアなら最大2件、8コアなら最大3件の実ミスを同時にCPUで計算する。残りはMI50へ転送する。比較時はホスト側のmodeを `SINGLE_MISS_CPU=off` にしてリクエスト間で切り替える。通常MoEキャッシュの `--moe-cache-cpu-share` は既定の0を使う。[CPU Expert処理の自動配分](09-single-bank-mtp3.md#cpu-expert計算のonoff統合と物理コア数による自動配分)
+
 ##### 共有RAM読み込みを含む固定3幅の通常起動
 
 `codex/rocm-integrated-test` では、上記の固定3幅の設定にShared Expert先行発行を追加する。次層Router予測の後段発行は、既存の非同期HIP入力を使う対象の固定3幅で自動適用する。RTXが活性値を共有RAMに直接書き、MI50のカーネルがVRAMに取り込む経路は、既存の非同期入力と共有ピン留めが利用可能な固定3幅で自動適用する。戻りはMI50が共有RAMに書き、RTXの計算ストリームに非同期H2Dを積む。[併用時の計測](#shared-expert先行発行との併用) · [次層Routerの追加計測](#次層routerのon追加計測と採用)

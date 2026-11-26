@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- packed ExpertのCPU並列計算と量子化共有を `codex/rocm-integrated-test` に統合。固定3幅の通常起動は `SINGLE_MISS_CPU=on`。物理コア数でCPUへ回す最大件数を決め、ほかのミスはMI50へ送る。[通常起動](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
+
 - 統合版 `403378601` から `codex/rocm-single-miss-cpu` を作成。固定3幅で、常駐・仮置き・先読みを除いた実ミスが1 Expertだけの層をCPUで処理する。固定5問のOFF→ON→OFFは51.36→56.02→56.78 tok/s。ONで2,186件・4.14 GiBのExpertアップロードを回避した。再実行OFFに比べH2D完了待ちが1.00 ms/検証短縮し、本体検証が1.03 ms/回増加。スワップアウトは全条件0。既定OFF。[試作と計測](../rocm/09-single-bank-mtp3.md#実ミス1件のexpertをcpuで計算する試作)
   ON・OFF各3回の再計測は53.36対54.33 tok/s。モデル起動直後の各1回を除くと55.38対56.08 tok/s。Expert H2D完了待ちは短縮したが、本体検証と生成はOFFが速かった。全30応答が完走し、スワップアウト0。[再計測](../rocm/09-single-bank-mtp3.md#onoff各3回の再計測)
   同じブランチでCPUワーカーとMI50を並列化。ON・OFF各3回は55.23対55.75 tok/s、モデル起動直後を除くと56.94対55.75 tok/s。MI50戻り完了後の残りは平均0.071 ms/件、実際の合流待ちは0.074 ms/件。全30応答が完走、スワップアウト0。既定OFF。[並列版](../rocm/09-single-bank-mtp3.md#cpuとmi50のexpert計算を重ねる試作)
