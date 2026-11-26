@@ -62,16 +62,49 @@ inline std::vector<uint32_t> group_routes(const std::array<int32_t, plan::routes
 
 using weight_tile = block_iq3_xxs[rows_per_tile * weight_blocks];
 
-static __device__ __forceinline__ void stage_weights(weight_tile & dst, const block_iq3_xxs * src, int lane) {
+static __device__ __forceinline__ void stage_weights(weight_tile & dst, const block_iq3_xxs * src, int lane, int start = 0) {
     static_assert(sizeof(weight_tile) % sizeof(uint32_t) == 0);
     auto * out = static_cast<unsigned char *>(__builtin_assume_aligned(&dst, alignof(uint32_t)));
     const auto * in = static_cast<const unsigned char *>(__builtin_assume_aligned(src, alignof(uint32_t)));
     // A complete tile is word-aligned even though individual IQ3_XXS blocks can start on a halfword.
-    for (int i = lane * sizeof(uint32_t); i < int(sizeof(weight_tile)); i += 64 * sizeof(uint32_t)) {
+    for (int i = start + lane * sizeof(uint32_t); i < int(sizeof(weight_tile)); i += 64 * sizeof(uint32_t)) {
         uint32_t word;
         __builtin_memcpy(&word, in + i, sizeof(word));
         __builtin_memcpy(out + i, &word, sizeof(word));
     }
+}
+
+static __device__ __forceinline__ void stage_weights_batched(weight_tile & dst, const block_iq3_xxs * src, int lane) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+    constexpr int wave_bytes = 64 * sizeof(uint32_t);
+    constexpr int batch_bytes = 4 * wave_bytes;
+    constexpr int full_batches_bytes = sizeof(weight_tile) / batch_bytes * batch_bytes;
+    auto * out = static_cast<unsigned char *>(__builtin_assume_aligned(&dst, alignof(uint32_t)));
+    const auto * in = static_cast<const unsigned char *>(__builtin_assume_aligned(src, alignof(uint32_t)));
+    static_assert(wave_bytes == 256);
+
+#pragma unroll 1
+    for (int i = lane * sizeof(uint32_t); i < full_batches_bytes; i += batch_bytes) {
+        uint32_t words[4];
+        // Issue four independent loads before waiting for the values used by the LDS stores.
+        asm volatile(
+            "global_load_dword %0, %4, off\n\t"
+            "global_load_dword %1, %4, off offset:256\n\t"
+            "global_load_dword %2, %4, off offset:512\n\t"
+            "global_load_dword %3, %4, off offset:768\n\t"
+            "s_waitcnt vmcnt(0)"
+            : "=&v"(words[0]), "=&v"(words[1]), "=&v"(words[2]), "=&v"(words[3])
+            : "v"(in + i)
+            : "memory");
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            __builtin_memcpy(out + i + j * wave_bytes, &words[j], sizeof(uint32_t));
+        }
+    }
+    stage_weights(dst, src, lane, full_batches_bytes);
+#else
+    stage_weights(dst, src, lane);
+#endif
 }
 
 static __device__ __forceinline__ void project(
@@ -124,9 +157,12 @@ enum weight_mode : uint32_t {
     weights_stage = 1,
     weights_read = 2,
     weights_share = weights_stage | weights_read,
+    weights_batch = 4,
+    weights_stage_batched = weights_stage | weights_batch,
+    weights_share_batched = weights_share | weights_batch,
 };
 
-template<bool ablation = false>
+template<bool ablation = false, bool batch_ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -157,8 +193,13 @@ static __global__ void gate_up(
     if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
-        stage_weights(shared_up, up + offset, lane);
-        stage_weights(shared_gate, gate + offset, lane);
+        if (batch_ablation && (mode & weights_batch)) {
+            stage_weights_batched(shared_up, up + offset, lane);
+            stage_weights_batched(shared_gate, gate + offset, lane);
+        } else {
+            stage_weights(shared_up, up + offset, lane);
+            stage_weights(shared_gate, gate + offset, lane);
+        }
     }
     __syncthreads();
 
