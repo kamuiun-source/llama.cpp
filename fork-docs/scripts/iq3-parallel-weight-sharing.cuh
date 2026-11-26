@@ -4,6 +4,7 @@
 #include "../../ggml/src/ggml-cuda/vecdotq.cuh"
 #include "../../ggml/src/ggml-hip-iq3-route-plan.h"
 
+#include <type_traits>
 #include <vector>
 
 namespace iq3_parallel_weights {
@@ -221,9 +222,12 @@ enum weight_mode : uint32_t {
     weights_stage_vector = weights_stage | weights_vector,
     weights_share_vector = weights_share | weights_vector,
     weights_wait_early = 16,
+    weights_split_dot = 32,
+    weights_extra_barrier = 64,
+    weights_split_dot_barrier = weights_split_dot | weights_extra_barrier,
 };
 
-template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false>
+template<bool ablation = false, bool batch_ablation = false, bool vector_ablation = false, bool split_rows = false, bool dot_ablation = false>
 __launch_bounds__(64 * tokens, 1)
 static __global__ void gate_up(
         const block_iq3_xxs * up, const block_iq3_xxs * gate, const block_q8_1 * activation,
@@ -232,8 +236,8 @@ static __global__ void gate_up(
     constexpr int activation_words = input_blocks * sizeof(block_q8_1) / sizeof(uint32_t);
     __shared__ uint32_t grid[grid_size];
     __shared__ uint32_t input[tokens][activation_words];
-    alignas(vector_ablation || split_rows ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
-    alignas(vector_ablation || split_rows ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
+    alignas(vector_ablation || split_rows || dot_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_up;
+    alignas(vector_ablation || split_rows || dot_ablation ? sizeof(uint4) : alignof(uint32_t)) __shared__ weight_tile shared_gate;
 
     const int lane = threadIdx.x;
     const int token = threadIdx.y;
@@ -303,7 +307,15 @@ static __global__ void gate_up(
     }
 
     // The first participating wave copies one packed tile for all participating waves.
-    if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
+    int dot_offset = 0;
+    if constexpr (dot_ablation) {
+        const int expert = rank < 0 ? 0 : ids[token * ranks + rank];
+        dot_offset = (expert * nrows + row0) * weight_blocks;
+        if (shared && token == __builtin_ctz(shared)) {
+            stage_weights_vector(shared_up, up + dot_offset, lane);
+            stage_weights_vector(shared_gate, gate + dot_offset, lane);
+        }
+    } else if ((!ablation || (mode & weights_stage)) && shared && token == __builtin_ctz(shared)) {
         const int expert = ids[token * ranks + rank];
         const int offset = (expert * nrows + row0) * weight_blocks;
         if constexpr (vector_ablation) {
@@ -323,6 +335,36 @@ static __global__ void gate_up(
         }
     }
     __syncthreads();
+
+    if constexpr (dot_ablation) {
+        const auto do_rows = [&](auto row_count, int row) {
+            if (rank < 0) {
+                return;
+            }
+            auto * dst = out + (token * ranks + rank) * nrows + row0 + row;
+            const auto * token_activation = reinterpret_cast<const block_q8_1 *>(input[token]);
+            const int tile_offset = row * weight_blocks;
+            if ((shared >> token) & 1) {
+                project<decltype(row_count)::value>(shared_up + tile_offset, shared_gate + tile_offset, token_activation, grid, dst);
+            } else {
+                const int offset = dot_offset + tile_offset;
+                project<decltype(row_count)::value>(up + offset, gate + offset, token_activation, grid, dst);
+            }
+        };
+        if (mode & weights_split_dot) {
+            do_rows(std::integral_constant<int, half_rows>{}, 0);
+            if (mode & weights_extra_barrier) {
+                __syncthreads();
+            }
+            do_rows(std::integral_constant<int, half_rows>{}, half_rows);
+        } else {
+            do_rows(std::integral_constant<int, rows_per_tile>{}, 0);
+            if (mode & weights_extra_barrier) {
+                __syncthreads();
+            }
+        }
+        return;
+    }
 
     if (rank < 0) {
         return;
