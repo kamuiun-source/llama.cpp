@@ -9,6 +9,7 @@
 ## 現在の状態
 
 - ROCmの通常実行・GPU別の処理時間・直近の比較結果は [最新計測サマリ](../rocm/latest-performance.md) を参照する。計測完了時に該当項目を更新する。
+- `codex/rocm-integrated-test` の `7e9dbd296` に戻し、増分ビルド後に固定3幅・採用設定で固定5問を1回確認。59.37 tok/s、本体33.315 ms/回、MTP 759/1,164、応答中スワップアウト0。前回の統合版58.61 tok/sと同じ実行ソースで、全問の生成ID・本文は異なった。[通常実行](../rocm/latest-performance.md#通常実行)
 - 固定3幅のMI50でIQ2_SとIQ4_NLを再調査。IQ2_Sは現行コードブックから符号込み4値LUTを7,232 Bで構成でき、全格子・全符号の復号一致をホストで確認。IQ4_NLはFurnaceのニブル・スケール別配置を現行2行のまま1層単体で比較する案。Furnaceの公開IQ4_NL経路は2次元重み向け、HerReiのExpert経路は1位置。新規GPU試作・計測は未実施。[論文と公開実装の再調査](../research/gfx906-iq2s-iq4nl-20261126.md)
 
 - `codex/rocm-integrated-test` の `cde1afc09` から `codex/rocm-mtp3-catchup-first-draft` を作成。固定3幅・2候補で、確定したcatch-upだけを次の第1候補の入力とまとめる。試作 `4336cdca7` は既定OFF。固定5問の各2回で生成56.60→60.85 tok/s、ドラフト＋catch-up 6.39→5.60 ms/検証。診断で採用0・1・2件のドラフトKV位置を確認。ONの第5問1回は43トークンで早期EOS。[条件、計測と調査](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
