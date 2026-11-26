@@ -11,7 +11,7 @@ struct llama_next_router_readback {
     struct totals {
         uint64_t graphs = 0;
         uint64_t reads = 0;
-        uint64_t applied = 0;
+        uint64_t pinned = 0;
         uint64_t deferred = 0;
         uint64_t polls = 0;
         uint64_t ready = 0;
@@ -39,11 +39,10 @@ struct llama_next_router_readback {
     void log_stats() const;
 
     bool enabled = false;
-    bool deferred = false;
 
 private:
-    // Indexed by partial Top10, deferred consumption, and pinned readback.
-    totals by_mode[2][2][2];
+    // Indexed by partial Top10 and next Router readback mode.
+    totals by_mode[2][2];
     totals * measured = nullptr;
     bool in_flight = false;
     int32_t pending_layer = -1;

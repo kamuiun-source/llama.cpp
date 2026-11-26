@@ -14,36 +14,19 @@ namespace {
 
 std::atomic<bool> next_router_top10{false};
 
-struct readback_mode {
-    const char * path;
-    std::string_view off;
-    std::string_view on;
-    std::atomic<bool> enabled{false};
-    bool invalid = false;
+std::atomic<bool> next_router_readback_enabled{false};
 
-    explicit readback_mode(const char * env, std::string_view off, std::string_view on) :
-        path(std::getenv(env)), off(off), on(on) {}
-
-    bool configured() const {
-        return path && *path;
-    }
-
-    void refresh();
-};
-
-readback_mode & pinned_mode() {
-    static readback_mode mode("LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE",
-            "NEXT_ROUTER_READBACK=off", "NEXT_ROUTER_READBACK=on");
-    return mode;
+const char * next_router_readback_mode_file() {
+    static const char * path = std::getenv("LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE");
+    return path && *path ? path : nullptr;
 }
 
-readback_mode & defer_mode() {
-    static readback_mode mode("LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_DEFER_MODE_FILE", "NEXT_ROUTER_DEFER=off", "NEXT_ROUTER_DEFER=on");
-    return mode;
-}
+} // namespace
 
-void readback_mode::refresh() {
-    if (!configured()) {
+void llama_refresh_next_router_readback_mode(bool top10) {
+    next_router_top10.store(top10, std::memory_order_relaxed);
+    const char * path = next_router_readback_mode_file();
+    if (!path) {
         return;
     }
 
@@ -57,8 +40,9 @@ void readback_mode::refresh() {
     if (!mode.empty() && mode.back() == '\r') {
         mode.remove_suffix(1);
     }
-    const bool requested = mode == on;
-    if (!input.eof() || input.bad() || (!requested && mode != off)) {
+    static bool invalid = false;
+    const bool requested = mode == "NEXT_ROUTER_READBACK=on";
+    if (!input.eof() || input.bad() || (!requested && mode != "NEXT_ROUTER_READBACK=off")) {
         if (!invalid) {
             LLAMA_LOG_WARN("invalid HIP fixed-three next Router readback mode file: %s\n", path);
             invalid = true;
@@ -66,28 +50,19 @@ void readback_mode::refresh() {
         return;
     }
     invalid = false;
-    if (enabled.exchange(requested, std::memory_order_relaxed) != requested) {
+    if (next_router_readback_enabled.exchange(requested, std::memory_order_relaxed) != requested) {
         LLAMA_LOG_INFO("HIP fixed-three next Router readback mode applied: %.*s\n", int(mode.size()), mode.data());
     }
 }
 
-} // namespace
-
-void llama_refresh_next_router_readback_mode(bool top10) {
-    next_router_top10.store(top10, std::memory_order_relaxed);
-    pinned_mode().refresh();
-    defer_mode().refresh();
-}
-
 llama_next_router_readback::totals * llama_next_router_readback::begin_graph(bool measure) {
     GGML_ASSERT(!in_flight && pending_layer < 0);
-    deferred = defer_mode().enabled.load(std::memory_order_relaxed);
-    enabled = deferred || pinned_mode().enabled.load(std::memory_order_relaxed);
-    if (!measure || (!pinned_mode().configured() && !defer_mode().configured())) {
+    enabled = next_router_readback_enabled.load(std::memory_order_relaxed);
+    if (!measure || !next_router_readback_mode_file()) {
         return nullptr;
     }
     const bool top10 = next_router_top10.load(std::memory_order_relaxed);
-    measured = &by_mode[top10][deferred][enabled];
+    measured = &by_mode[top10][enabled];
     ++measured->graphs;
     return measured;
 }
@@ -203,35 +178,26 @@ void llama_next_router_readback::end_graph() {
 }
 
 void llama_next_router_readback::log_stats() const {
-    if (!pinned_mode().configured() && !defer_mode().configured()) {
+    if (!next_router_readback_mode_file()) {
         return;
     }
     for (int top10 = 0; top10 < 2; ++top10) {
-        const char * top10_mode = top10 ? "on" : "off";
         for (int mode = 0; mode < 2; ++mode) {
-            const auto & totals = by_mode[top10][0][mode];
+            const auto & totals = by_mode[top10][mode];
             if (top10 && !totals.graphs) {
                 continue;
             }
-            LLAMA_LOG_INFO("packed expert HIP next Router readback: mode=%s graphs=%" PRIu64 " reads=%" PRIu64
-                    " applied=%" PRIu64 " fallback=%" PRIu64 " submit_cpu_us=%" PRId64 " wait_cpu_us=%" PRId64
-                    " demand_tuples=%" PRIu64 " hit_tuples=%" PRIu64 " graph_cpu_us=%" PRId64 " top10=%s\n",
-                    mode ? "on" : "off", totals.graphs, totals.reads, totals.applied, mode ? totals.reads - totals.applied : 0,
-                    totals.submit_us, totals.wait_us, totals.demand_tuples, totals.hit_tuples, totals.graph_cpu_us, top10_mode);
+            LLAMA_LOG_INFO("packed expert HIP next Router readback: mode=%s top10=%s graphs=%" PRIu64
+                    " reads=%" PRIu64 " pinned=%" PRIu64 " applied=%" PRIu64 " fallback=%" PRIu64
+                    " polls=%" PRIu64 " ready=%" PRIu64 " deadline_ready=%" PRIu64 " late=%" PRIu64 " canceled=%" PRIu64
+                    " submit_cpu_us=%" PRId64 " wait_cpu_us=%" PRId64 " poll_cpu_us=%" PRId64
+                    " residence_us=%" PRId64 " cleanup_cpu_us=%" PRId64 " plan_cpu_us=%" PRId64 " graph_cpu_us=%" PRId64
+                    " demand_tuples=%" PRIu64 " hit_tuples=%" PRIu64 "\n",
+                    mode ? "on" : "off", top10 ? "on" : "off",
+                    totals.graphs, totals.reads, totals.pinned, totals.deferred, mode ? totals.reads - totals.deferred : 0,
+                    totals.polls, totals.ready, totals.deadline_ready, totals.late, totals.canceled,
+                    totals.submit_us, totals.wait_us, totals.poll_cpu_us, totals.residence_us, totals.cleanup_cpu_us,
+                    totals.plan_cpu_us, totals.graph_cpu_us, totals.demand_tuples, totals.hit_tuples);
         }
-        const auto & totals = by_mode[top10][1][1];
-        if (!defer_mode().configured() || (top10 && !totals.graphs)) {
-            continue;
-        }
-        LLAMA_LOG_INFO("packed expert HIP next Router deferred readback: mode=on graphs=%" PRIu64
-                " reads=%" PRIu64 " pinned=%" PRIu64 " applied=%" PRIu64 " fallback=%" PRIu64
-                " polls=%" PRIu64 " ready=%" PRIu64 " deadline_ready=%" PRIu64 " late=%" PRIu64 " canceled=%" PRIu64
-                " submit_cpu_us=%" PRId64 " wait_cpu_us=%" PRId64 " poll_cpu_us=%" PRId64
-                " residence_us=%" PRId64 " cleanup_cpu_us=%" PRId64 " plan_cpu_us=%" PRId64 " graph_cpu_us=%" PRId64
-                " demand_tuples=%" PRIu64 " hit_tuples=%" PRIu64 " top10=%s\n",
-                totals.graphs, totals.reads, totals.applied, totals.deferred, totals.reads - totals.deferred,
-                totals.polls, totals.ready, totals.deadline_ready, totals.late, totals.canceled,
-                totals.submit_us, totals.wait_us, totals.poll_cpu_us, totals.residence_us, totals.cleanup_cpu_us,
-                totals.plan_cpu_us, totals.graph_cpu_us, totals.demand_tuples, totals.hit_tuples, top10_mode);
     }
 }

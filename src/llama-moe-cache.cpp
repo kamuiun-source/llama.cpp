@@ -2827,7 +2827,7 @@ struct llama_moe_cache::impl {
                 ggml_nbytes(prediction) == prediction_bytes);
         const bool measure_read = next_profile_start || next_readback_totals;
         const int64_t read_start = measure_read ? ggml_time_us() : 0;
-        const int32_t defer_layer = next_readback.deferred && defer ? target : -1;
+        const int32_t defer_layer = defer ? target : -1;
         const bool pinned = next_readback.enabled && !next_prefetch_scores &&
                 next_readback.submit(producer, prediction, prediction_bytes, defer_layer);
         const bool deferred_read = next_readback.pending();
@@ -2861,7 +2861,7 @@ struct llama_moe_cache::impl {
             }
             if (next_readback_totals) {
                 ++next_readback_totals->reads;
-                next_readback_totals->applied += pinned;
+                next_readback_totals->pinned += pinned;
                 next_readback_totals->submit_us += submit_us;
                 next_readback_totals->wait_us += wait_us;
             }

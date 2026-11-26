@@ -92,9 +92,8 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` | `0`（既定） / `1`・`2`（比較用） | `1` は予測ロジットの閾値、`2` はTop-20のスコア順で既存Top-10と同じ件数（最大8）を発行。 |
 | `LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND` | 未設定（既定OFF） / `1`（試作） | 固定3幅の必要転送から融合までを計算ストリーム上で連結する。既存の先読み後発行・実ミス優先、非同期スロット表と非同期昇格が有効な構成で使う。 |
 | `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` | 未設定（通常） / `1`（詳細比較） | 試作ON/OFF両方に層ごとのホスト時刻を出す。GPU時刻はrocprofで照合する。 |
-| `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_READBACK=off` または `NEXT_ROUTER_READBACK=on` | 次層予測IDのD2HをRTXのピン留め受信枠で受け、完了イベントを待つ試作。固定3幅の通常Top-10が対象。リクエスト間で切り替え、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` でモード別の回数と時間を終了時に集計する。 |
+| `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_READBACK=off` または `NEXT_ROUTER_READBACK=on` | ONは固定3幅の通常次層予測IDをRTXのピン留め受信枠へ読み出し、後続の進行点で完了を確認する。後回しの対象外では即時ピン留め経路にフォールバックする。OFFは従来の読み戻し。リクエスト間で切り替え、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PROFILE=1` でモード別に終了時集計。 |
 | `LLAMA_CUDA_NEXT_ROUTER_TOP10_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_TOP10=off` または `NEXT_ROUTER_TOP10=on` | RTXで固定3幅の通常次層予測のTop-10を直接選ぶ試作。リクエスト間で切り替える。 |
-| `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_DEFER_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_DEFER=off` または `NEXT_ROUTER_DEFER=on` | 固定3幅の次層予測IDをピン留め受信枠へ発行し、後続の進行点で完了を確認する試作。リクエスト間で切り替える。比較時は元のピン留め経路を全条件でONにする。 |
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
 
