@@ -3,10 +3,14 @@
 #include "ggml-backend-impl.h"
 #ifdef GGML_USE_HIP
 #include "ggml-hip-iq3-strata-plan.h"
+#include "ggml-hip-mtp3-skip-cpu-zero.h"
 #endif
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#ifdef GGML_USE_HIP
+#include "ggml-cuda/mmvq-cpu-zero.cuh"
+#endif
 #include "sync-telemetry.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -6048,6 +6052,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool iq2_strata = gfx906 && ggml_hip_gfx906_iq2_strata_enabled();
     const bool iq3_strata = gfx906 && ggml_hip_gfx906_iq3_strata_enabled();
     const bool compact_slot_map = gfx906 && ggml_hip_mtp3_compact_slot_map_enabled();
+    const bool skip_cpu_zero = gfx906 && ggml_hip_mtp3_skip_cpu_zero::enabled();
     if (gfx906) {
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
         if (it != cuda_ctx->cuda_graphs.end() &&
@@ -6055,12 +6060,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                  it->second->gfx906_iq3_strata != iq3_strata)) {
             // Captured launches contain the kernel selected under the previous mode.
             cuda_ctx->cuda_graphs.erase(it);
-        } else if (it != cuda_ctx->cuda_graphs.end() && it->second->mtp3_compact_slot_map != compact_slot_map) {
+        } else if (it != cuda_ctx->cuda_graphs.end() && (it->second->mtp3_compact_slot_map != compact_slot_map || it->second->skip_cpu_zero != skip_cpu_zero)) {
+            const bool compact_changed = it->second->mtp3_compact_slot_map != compact_slot_map;
+            const bool skip_changed = it->second->skip_cpu_zero != skip_cpu_zero;
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const auto * node = cgraph->nodes[i];
                 const auto * ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr;
-                if (ggml_hip_mtp3_compact_slot_map::is_lookup(node) ||
-                        (ids && ggml_hip_mtp3_compact_slot_map::is_lookup(ids->view_src))) {
+                const auto * lookup = ids ? ids->view_src : nullptr;
+                if ((compact_changed && (ggml_hip_mtp3_compact_slot_map::is_lookup(node) ||
+                            ggml_hip_mtp3_compact_slot_map::is_lookup(lookup))) ||
+                        (skip_changed && ggml_hip_mtp3_skip_cpu_zero::lookup_slot(lookup) >= 0)) {
                     cuda_ctx->cuda_graphs.erase(it);
                     break;
                 }
@@ -6089,6 +6098,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         graph->gfx906_iq2_strata = iq2_strata;
         graph->gfx906_iq3_strata = iq3_strata;
         graph->mtp3_compact_slot_map = compact_slot_map;
+        graph->skip_cpu_zero = skip_cpu_zero;
 #elif !defined(GGML_USE_MUSA)
         graph->next_router_top10 = next_router_top10;
 #endif
@@ -7759,6 +7769,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)+[](ggml_backend_dev_t dev) {
             const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
             return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20;
+        };
+    }
+    namespace cpu_zero = ggml_hip_mtp3_skip_cpu_zero;
+    if (strcmp(name, cpu_zero::setter_proc) == 0) {
+        return (void *) cpu_zero::set_mode;
+    }
+    if (strcmp(name, cpu_zero::mode_proc) == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) -> int {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20 ?
+                    int(cpu_zero::enabled()) : -1;
         };
     }
     if (strcmp(name, "ggml_backend_hip_set_mtp3_compact_slot_map") == 0) {

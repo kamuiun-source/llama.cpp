@@ -96,6 +96,7 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 | `LLAMA_CUDA_NEXT_ROUTER_TOP10_MODE_FILE` | 未指定（既定OFF） / ファイルに `NEXT_ROUTER_TOP10=off` または `NEXT_ROUTER_TOP10=on` | RTXで固定3幅の通常次層予測のTop-10を直接選ぶ試作。リクエスト間で切り替える。 |
 | `LLAMA_EXPERT_HIP_MTP3_COMPACT_SLOT_MAP_MODE_FILE` | 未指定（既定OFF） / ファイルに `COMPACT_SLOT_MAP=off` または `COMPACT_SLOT_MAP=on` | gfx906の固定3幅・単一バンク・直接DMAで物理スロット30件を直接送る試作。リクエスト間で切り替える。[試作](../rocm/10-decode-pipeline.md#固定3幅のexpertスロット表を圧縮する試作) |
 | `LLAMA_EXPERT_HIP_MTP3_PREFETCH_IN_PLACE_MODE_FILE` | 未指定（既定OFF） / ファイルに `PREFETCH_IN_PLACE=off` または `PREFETCH_IN_PLACE=on` | gfx906の固定3幅・単一バンク・直接DMAの試作。ファイルを指定すると各層に2枠を確保し、ONのとき先読み枠のヒットを物理スロット交換で処理する。8件の先読み上限は維持する。リクエスト間で切り替える。[試作](../rocm/10-decode-pipeline.md#先読み済みのexpert枠を直接使う試作) |
+| `GGML_HIP_MTP3_SKIP_CPU_ZERO_MODE_FILE` | 未指定（既定OFF） / ファイルに `SKIP_CPU_ZERO=off` または `SKIP_CPU_ZERO=on` | gfx906の固定3幅・単一バンク・直接DMAの試作。CPU担当のゼロ枠だけ、MI50で内積を省いてゼロを書き込む。リクエスト間で切り替え、対象のHIP Graphを更新する。[試作](../rocm/10-decode-pipeline.md#cpu担当expertのmi50ゼロ枠内積を省く試作) |
 
 同層でExpert転送を隠す固定3幅の試作は専用フラグごと削除した。次層先読みには単一バンクとROCmの直接tuple DMAが必要。従来の分割配置を使う構成は対象外。
 

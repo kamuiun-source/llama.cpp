@@ -116,14 +116,26 @@ static __device__ __forceinline__ void gate_up_group(
 }
 
 #ifdef GGML_USE_HIP
+template<bool skip_cpu_zero = false>
 __launch_bounds__(waves * wave, 1)
 static __global__ void gate_up_packed(
         const block_iq2_s * up, const block_iq2_s * gate, const block_q8_1 * activation,
-        const int32_t * plan, float * out, int expert_stride) {
+        const int32_t * plan, float * out, int expert_stride, int zero_slot = -1) {
     const uint32_t encoded = plan[blockIdx.y];
-    if (encoded != 0) {
-        gate_up_group(up, gate, activation, unpack_group(encoded), out, expert_stride);
+    if (encoded == 0) {
+        return;
     }
+    const auto group = unpack_group(encoded);
+    if constexpr (skip_cpu_zero) {
+        // One packed group per block, so all threads take this path before any shared-memory barrier.
+        if (group.expert == zero_slot) {
+            ggml_hip_mtp3_skip_cpu_zero::store_group<nrows, rows_per_tile, subgroup>(out, group);
+            return;
+        }
+    } else {
+        GGML_UNUSED(zero_slot);
+    }
+    gate_up_group(up, gate, activation, group, out, expert_stride);
 }
 #endif
 

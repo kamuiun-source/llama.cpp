@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 #ifdef GGML_USE_HIP
 #include "mmvq-iq2-strata.cuh"
+#include "../ggml-hip-mtp3-skip-cpu-zero.h"
 #include "mtp3-compact-slot-map.cuh"
 #endif
 
@@ -1202,7 +1203,8 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_down_compact(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
-          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false>
+          int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false,
+          bool skip_cpu_zero = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1210,7 +1212,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const int zero_slot) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1308,6 +1310,25 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+#ifdef GGML_USE_HIP
+    if constexpr (skip_cpu_zero) {
+        static_assert(iq4_compact_decode ||
+                (type == GGML_TYPE_Q2_0 && !has_fusion) ||
+                (type == GGML_TYPE_IQ4_XS && has_fusion));
+        static_assert(iq_lds_tokens == 0 && iq_row_groups == 1);
+        if (channel_x == uint32_t(zero_slot)) {
+            if (threadIdx.x < c_rows_per_block) {
+                float * route_dst = dst + channel_dst * stride_channel_dst + token_idx * stride_col_dst;
+                const uint32_t row = c_rows_per_block * blockIdx.x + threadIdx.x;
+                ggml_hip_mtp3_skip_cpu_zero::store_wave(route_dst, row, nrows_x);
+            }
+            return;
+        }
+    } else
+#endif
+    {
+        GGML_UNUSED(zero_slot);
+    }
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -1562,7 +1583,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, cudaStream_t stream, const int zero_slot) {
 
 #ifdef GGML_USE_HIP
     int live_lds_mode = -1;
@@ -1600,7 +1621,7 @@ static void mul_mat_vec_q_moe_launch(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                     stride_row_x, stride_col_y, stride_col_dst,
                     stride_channel_x, stride_channel_y, stride_channel_dst,
-                    ncols_dst, ids_stride);
+                    ncols_dst, ids_stride, -1);
             };
             if (swiglu_rows_selected == 1) {
                 launch(std::integral_constant<int, 1>{});
@@ -1637,10 +1658,19 @@ static void mul_mat_vec_q_moe_launch(
         if (compact_decode && !has_fusion && !fusion.shared_up && ncols_x == 640 && nrows_x == 2560 &&
                 ncols_dst == 3 && nchannels_dst == 10 && nchannels_y.z == 10 &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, true>, launch_params,
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                ncols_dst, ids_stride);
+            if (zero_slot >= 0) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, true, true>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride, zero_slot);
+                static const bool skip_logged = (GGML_LOG_INFO("HIP gfx906 CPU zero-slot skip applied: IQ4_NL down\n"), true);
+                GGML_UNUSED(skip_logged);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, true>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride, -1);
+            }
             static const bool logged = [] {
                 GGML_LOG_INFO("HIP gfx906 IQ4_NL routed down compact decode applied: positions=3 rows_per_block=2\n");
                 return true;
@@ -1663,7 +1693,7 @@ static void mul_mat_vec_q_moe_launch(
                 ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, lds_tokens, row_groups>, launch_params_iq,
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                     stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                    ncols_dst, ids_stride);
+                    ncols_dst, ids_stride, -1);
                 if constexpr (lds_tokens != 0) {
                     static const bool logged_lds = [] {
                         constexpr const char * type_name = type == GGML_TYPE_IQ2_S ? "IQ2_S" : "IQ3_XXS";
@@ -1709,7 +1739,7 @@ static void mul_mat_vec_q_moe_launch(
                     ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true>, launch_params,
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                         stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        ncols_dst, ids_stride);
+                        ncols_dst, ids_stride, -1);
                     static const bool logged = [] {
                         GGML_LOG_INFO("HIP gfx906 IQ2_S routed SwiGLU paired dot applied: positions=3 rows_per_block=2\n");
                         return true;
@@ -1741,20 +1771,45 @@ static void mul_mat_vec_q_moe_launch(
             return;
         }
     }
+    if (zero_slot >= 0 && !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst &&
+            ncols_dst == 3 && nchannels_dst == 10) {
+        if constexpr (type == GGML_TYPE_Q2_0) {
+            if (!has_fusion && ncols_x == 640 && nrows_x == 2560 && nchannels_y.z == 10) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, false, true>,
+                    launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y,
+                    stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, zero_slot);
+                static const bool skip_logged = (GGML_LOG_INFO("HIP gfx906 CPU zero-slot skip applied: Q2_0 down\n"), true);
+                GGML_UNUSED(skip_logged);
+                return;
+            }
+        }
+        if constexpr (type == GGML_TYPE_IQ4_XS) {
+            if (fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU && !fusion.x_bias && !fusion.gate_bias &&
+                    !fusion.x_scale && !fusion.gate_scale && ncols_x == 2560 && nrows_x == 640 && nchannels_y.z == 1) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false, 0, 1, false, false, true>,
+                    launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y,
+                    stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, zero_slot);
+                static const bool skip_logged = (GGML_LOG_INFO("HIP gfx906 CPU zero-slot skip applied: IQ4_XS gate/up\n"), true);
+                GGML_UNUSED(skip_logged);
+                return;
+            }
+        }
+    }
 #endif
 
+    GGML_UNUSED(zero_slot);
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, -1);
     } else {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, -1);
     }
 }
 
@@ -1766,7 +1821,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const int zero_slot = -1) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -1854,7 +1909,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, stream, zero_slot);
         return;
     }
 
@@ -1957,7 +2012,7 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const int zero_slot = -1) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
@@ -1969,7 +2024,7 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, zero_slot);
             break;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_0>
@@ -2083,13 +2138,13 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, zero_slot);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, zero_slot);
             break;
         case GGML_TYPE_IQ3_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
@@ -2265,7 +2320,17 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    int zero_slot = -1;
 #ifdef GGML_USE_HIP
+    namespace cpu_zero = ggml_hip_mtp3_skip_cpu_zero;
+    if (cpu_zero::enabled() && ids && ids->ne[0] == 10 && ids->ne[1] == 3 &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VEGA20) {
+        const int tagged_slot = cpu_zero::lookup_slot(ids->view_src);
+        if (tagged_slot >= 0 && tagged_slot < ne02) {
+            zero_slot = tagged_slot;
+        }
+    }
+
     const bool iq2_strata = src0->type == GGML_TYPE_IQ2_S && ggml_hip_gfx906_iq2_strata_enabled();
     const bool iq3_strata = src0->type == GGML_TYPE_IQ3_XXS && ggml_hip_gfx906_iq3_strata_enabled();
     if ((iq2_strata || iq3_strata) && ne00 == 2560 && ne01 == 640 &&
@@ -2287,15 +2352,31 @@ void ggml_cuda_mul_mat_vec_q(
                     dim3(reuse::waves * reuse::wave), 0, stream);
             const auto * q8 = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());
             if (iq2_strata) {
-                ggml_cuda_kernel_launch(iq2_strata_reuse::gate_up_packed, params,
-                        static_cast<const block_iq2_s *>(src0->data), static_cast<const block_iq2_s *>(fusion_local.gate),
-                        q8, groups, dst_d, int(s02));
+                if (zero_slot >= 0) {
+                    ggml_cuda_kernel_launch(iq2_strata_reuse::gate_up_packed<true>, params,
+                            static_cast<const block_iq2_s *>(src0->data), static_cast<const block_iq2_s *>(fusion_local.gate),
+                            q8, groups, dst_d, int(s02), zero_slot);
+                    static const bool skip_logged = (GGML_LOG_INFO("HIP gfx906 CPU zero-slot skip applied: IQ2_S Strata gate/up\n"), true);
+                    GGML_UNUSED(skip_logged);
+                } else {
+                    ggml_cuda_kernel_launch(iq2_strata_reuse::gate_up_packed<false>, params,
+                            static_cast<const block_iq2_s *>(src0->data), static_cast<const block_iq2_s *>(fusion_local.gate),
+                            q8, groups, dst_d, int(s02), -1);
+                }
                 static const bool logged = (GGML_LOG_INFO("HIP gfx906 IQ2_S Strata gate/up applied: MTP positions=3 top_k=10\n"), true);
                 GGML_UNUSED(logged);
             } else {
-                ggml_cuda_kernel_launch(reuse::gate_up_packed, params,
-                        static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
-                        q8, groups, dst_d, int(s02));
+                if (zero_slot >= 0) {
+                    ggml_cuda_kernel_launch(reuse::gate_up_packed<true>, params,
+                            static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                            q8, groups, dst_d, int(s02), zero_slot);
+                    static const bool skip_logged = (GGML_LOG_INFO("HIP gfx906 CPU zero-slot skip applied: IQ3_XXS Strata gate/up\n"), true);
+                    GGML_UNUSED(skip_logged);
+                } else {
+                    ggml_cuda_kernel_launch(reuse::gate_up_packed<false>, params,
+                            static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                            q8, groups, dst_d, int(s02), -1);
+                }
                 static const bool logged = (GGML_LOG_INFO("HIP gfx906 IQ3_XXS Strata gate/up applied: MTP positions=3 top_k=10\n"), true);
                 GGML_UNUSED(logged);
             }
@@ -2439,7 +2520,7 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, zero_slot);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

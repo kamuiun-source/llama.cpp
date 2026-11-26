@@ -13,6 +13,7 @@
 #include "../ggml/src/ggml-backend-mtp.h"
 #include "../ggml/src/ggml-hip-iq3-strata-plan.h"
 #include "../ggml/src/ggml-hip-mtp3-compact-slot-map.h"
+#include "../ggml/src/ggml-hip-mtp3-skip-cpu-zero.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -708,6 +709,9 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
     using compact_slot_map_mode_t = int (*)(ggml_backend_dev_t);
     compact_slot_map_mode_t compact_slot_map_mode = nullptr;
+    compact_slot_map_mode_t skip_cpu_zero_mode = nullptr;
+    std::array<size_t, 2> cpu_zero_layers{};
+    std::array<size_t, 2> cpu_zero_routes{};
     size_t compact_slot_map_layers = 0;
     size_t compact_slot_map_async = 0;
     size_t compact_slot_map_sync = 0;
@@ -906,6 +910,17 @@ struct llama_moe_cache::impl {
                     compact_slot_map_mode = nullptr;
                 }
             }
+            namespace zero = ggml_hip_mtp3_skip_cpu_zero;
+            const char * skip_mode_file = std::getenv(zero::mode_file_env);
+            if (skip_mode_file && *skip_mode_file && target_reg && single_miss_cpu && placement->hip_tuple_dma &&
+                    placement->hip_mtp_verify_three && !placement->overlap && n_expert_used == 10 &&
+                    model.hparams.n_expert == strata::experts) {
+                skip_cpu_zero_mode = reinterpret_cast<compact_slot_map_mode_t>(
+                        ggml_backend_reg_get_proc_address(target_reg, zero::mode_proc));
+                if (skip_cpu_zero_mode && skip_cpu_zero_mode(placement->target) < 0) {
+                    skip_cpu_zero_mode = nullptr;
+                }
+            }
             const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
@@ -935,6 +950,9 @@ struct llama_moe_cache::impl {
                 if (compact_slot_map_mode) {
                     l.slot_map->op_params[0] = compact::tag;
                     ++compact_slot_map_layers;
+                }
+                if (skip_cpu_zero_mode && l.single_miss_cpu) {
+                    l.slot_map->op_params[zero::slot_param] = zero::encode_slot(llama_expert_profile::n_resident + placement->n_slots);
                 }
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
                 for (int32_t wave = 0; wave < n_prefill_waves; ++wave) {
@@ -3993,6 +4011,14 @@ struct llama_moe_cache::impl {
                 const bool with_plan = stats && stats->mode && stats->mode(placement->target) > 0;
                 namespace compact = ggml_hip_mtp3_compact_slot_map;
                 const bool try_compact = fixed_three && compact_slot_map_mode && compact_slot_map_mode(placement->target) > 0;
+                const int32_t zero_slot = ggml_hip_mtp3_skip_cpu_zero::lookup_slot(lookup);
+                if (fixed_three && skip_cpu_zero_mode && zero_slot >= 0) {
+                    const bool active = skip_cpu_zero_mode(placement->target) > 0;
+                    ++cpu_zero_layers[active];
+                    for (const int32_t expert : ids) {
+                        cpu_zero_routes[active] += slots[expert] == zero_slot;
+                    }
+                }
                 const bool compact_map = try_compact && compact::is_lookup(lookup);
                 const size_t slot_entries = compact_map ? compact::routes : slots.size();
                 const size_t bytes_map = (slot_entries + (with_plan ? strata::routes : 0)) * sizeof(int32_t);
@@ -4391,6 +4417,12 @@ struct llama_moe_cache::impl {
                             " groups_1=%zu groups_2=%zu groups_3=%zu prep_us=%" PRId64 " async_submit_us=%" PRId64 " sync_copy_us=%" PRId64 "\n",
                             quant == ggml_hip_iq3_strata_plan::iq2 ? 2 : 3, stats.layers, stats.plans, stats.bytes,
                             stats.groups[0], stats.groups[1], stats.groups[2], stats.prep_us, stats.async_submit_us, stats.sync_copy_us);
+                }
+            }
+            if (skip_cpu_zero_mode) {
+                for (size_t mode = 0; mode < cpu_zero_layers.size(); ++mode) {
+                    LLAMA_LOG_INFO("HIP MTP3 CPU zero-slot skip profile: mode=%s layer_maps=%zu cpu_zero_routes=%zu\n",
+                            mode ? "on" : "off", cpu_zero_layers[mode], cpu_zero_routes[mode]);
                 }
             }
             if (compact_slot_map_mode) {

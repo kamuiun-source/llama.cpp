@@ -14,6 +14,7 @@
 #include "src/llama-next-router-readback.h"
 #include "server-next-router-top10-mode.h"
 #include "server-mtp3-compact-slot-map-mode.h"
+#include "server-mtp3-skip-cpu-zero-mode.h"
 #include "server-next-prefetch-in-place-mode.h"
 #include "server-iq3-strata-mode.h"
 #include "server-mtp-catchup-mode.h"
@@ -3993,6 +3994,7 @@ private:
                         const bool next_router_top10 = server_refresh_next_router_top10_mode(ctx_tgt, ctx_dft);
                         llama_refresh_next_router_readback_mode(next_router_top10);
                         server_refresh_mtp3_compact_slot_map_mode(ctx_tgt, ctx_dft);
+                        server_refresh_mtp3_skip_cpu_zero_mode(ctx_tgt, ctx_dft);
                         server_refresh_next_prefetch_in_place_mode(ctx_tgt, ctx_dft);
                         server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
                     }

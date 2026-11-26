@@ -61,6 +61,7 @@ struct ggml_cuda_graph {
     bool gfx906_iq2_strata = false;
     bool gfx906_iq3_strata = false;
     bool mtp3_compact_slot_map = false;
+    bool skip_cpu_zero = false;
 #elif !defined(GGML_USE_MUSA)
     bool next_router_top10 = false;
 #endif
