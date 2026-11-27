@@ -24,6 +24,12 @@
 
 Perplexity試験と同じ `mxxm/llama-cpp-gfx906:rocm-727` 同梱版（`b94959a64`）で、同じQwen3.8 Flash Next UD-IQ3_XXSをMI50＋CPUの自動配置、MTPなし、温度0、seed 1234で実行した。固定5問の第4問だけを会話テンプレート付きの新規会話として1回入力し、146トークンでEOS、サーバー終了コード0。返答はPythonコードのみ。実行結果は60.00 ms、27.00 ms、55.00%で、数値を述べる説明文は付かなかった。統合版の5問を通した試行とは会話履歴と実行構成が異なるため、この1回から説明文の数値誤りの原因は判断しない。[返答全文](/home/t-saka/rocm-stock-q4-single-turn-20261127/response.txt) · [実行設定](/home/t-saka/rocm-stock-q4-single-turn-20261127/settings.json)
 
+### フォーク版の固定Expert配置で第4問だけ回答
+
+同じ第4問を統合版 `c3c0f3c7f` で新規会話として1回実行した。従来の配置プロファイルで通常層をRTX、各層の常駐Expert 300件をMI50、残りの原本をRAMに置く。動的昇格、直接tuple DMA、先読み、Strata、MTPなどの任意の高速化は外し、MI50のQSA用FP32互換設定を維持した。最初の `-b 1 -ub 1` はサーバーの起動時検査が2トークンを要求するため、推論前に終了した。論理バッチ512・マイクロバッチ1で起動し直し、リクエストは1回だけ実行した。
+
+同梱版と会話テンプレート適用後の入力、146生成ID、回答本文がすべて一致した。両版ともPythonコードのみを返し、出力値は60.00 ms、27.00 ms、55.00%。フォーク版はEOSで完了し、サーバー終了コード0。第4問単独の結果で、会話を続けた場合の挙動はこの試験では比較していない。[返答全文](/home/t-saka/rocm-fork-q4-static-placement-retry-20261127/response.txt) · [実行設定](/home/t-saka/rocm-fork-q4-static-placement-retry-20261127/settings.json)
+
 ### Strataと次層Router読み戻し取り込み前の測定
 
 `codex/rocm-integrated-test` の `7e9dbd296` を増分ビルドし、固定3幅、4K、生成上限512、会話KV再利用で5問を1回計測した。catch-up統合、CPU Expert、IQ3_XXS LDS先読み・4行を維持し、GPUプロファイラーなし。ビルド・サーバーとも終了コード0。全5問EOS、MTP採用759/1,164、応答中スワップアウト0。[今回の実測](/home/t-saka/rocm-integrated-sweep-20261126/session-batch-01) · [ビルドログ](/home/t-saka/rocm-integrated-sweep-20261126/build.log)
