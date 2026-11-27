@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-copy-api-batch.h"
 #include "ggml-backend-mtp.h"
 #include "ggml-backend-hip-return-wait.h"
 #include "ggml-alloc.h"
@@ -1336,6 +1337,12 @@ struct ggml_backend_sched_single_miss {
     unsigned mask = 0;
 };
 
+static std::atomic<bool> copy_api_batch_enabled{false};
+
+void ggml_backend_sched_set_copy_api_batch(bool enabled) {
+    copy_api_batch_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 static std::atomic<int> hip_single_miss_cpu_mode{0};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
@@ -1587,6 +1594,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_hip_handoff_stats hip_mtp4_return_stats;
     ggml_backend_t hip_async_input_pending;
     ggml_backend_sched_dual_pinned hip_handoff;
+    ggml_copy_api_batch copy_api_batch;
     ggml_backend_sched_hip_handoff_stats hip_handoff_stats[2];
     bool shared_host_return;
     ggml_backend_sched_shared_host shared_return;
@@ -3757,16 +3765,24 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         if (upload.compute) {
             sched->shared_input_pending = false;
         }
+        const auto read = [&](size_t n) {
+            if (copy_api_batch_enabled.load(std::memory_order_relaxed) && measure_hip &&
+                    strncmp(ggml_backend_name(src_backend), "CUDA", 4) == 0 &&
+                    sched->copy_api_batch.read(src_backend, srcs, staging, sizes, data_offsets, n, pinned != nullptr, mirrored >= 0)) {
+                return;
+            }
+            ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, n);
+        };
         handoff.read([&] {
             if (mirrored < 0) {
-                ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count);
+                read(count);
                 return;
             }
             // Keep the remaining router data as one D2H batch, even if the activation was in the middle.
             std::swap(srcs[mirrored], srcs[count - 1]);
             std::swap(sizes[mirrored], sizes[count - 1]);
             std::swap(data_offsets[mirrored], data_offsets[count - 1]);
-            ggml_backend_tensor_get_n(srcs, staging, offsets, sizes, data_offsets, count - 1);
+            read(count - 1);
             std::swap(data_offsets[mirrored], data_offsets[count - 1]);
             std::swap(sizes[mirrored], sizes[count - 1]);
             std::swap(srcs[mirrored], srcs[count - 1]);
@@ -5097,6 +5113,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_synchronize(sched->shared_input.vk);
     }
     ggml_backend_sched_drain_hip_async_input(sched);
+    sched->copy_api_batch.log();
     const auto & profile = sched->profile;
     if (profile.graphs > 0) {
         int64_t compute_us = 0;
