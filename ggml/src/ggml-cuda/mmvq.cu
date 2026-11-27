@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#ifdef GGML_USE_HIP
+#include "mmvq-iq2-strata.cuh"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -1506,12 +1509,48 @@ int ggml_hip_gfx906_lds_modes() {
     return gfx906_lds_modes.load(std::memory_order_relaxed);
 }
 
-static bool ggml_hip_gfx906_iq_sign_decode() {
+static bool ggml_hip_gfx906_iq_sign_decode_configured() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_HIP_GFX906_IQ_SIGN_DECODE");
         return value && std::strcmp(value, "1") == 0;
     }();
-    return enabled && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
+    return enabled;
+}
+
+static bool ggml_hip_gfx906_iq_sign_decode() {
+    return ggml_hip_gfx906_iq_sign_decode_configured() && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
+}
+
+static bool ggml_hip_gfx906_iq2_paired_dot() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_PAIRED_DOT");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_hip_gfx906_iq2_lds_prefetch() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_hip_gfx906_iq2_no_lds_row_groups() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_NO_LDS_ROW_GROUPS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool ggml_hip_gfx906_iq2_strata_enabled() {
+    const int modes = ggml_hip_gfx906_lds_modes();
+    return iq2_strata_mode.load(std::memory_order_relaxed) && ggml_hip_gfx906_iq_sign_decode_configured() &&
+        ggml_hip_gfx906_iq2_paired_dot() &&
+        (modes >= 0 ? modes / gfx906_lds_mode_base == 0 :
+            !ggml_hip_gfx906_iq2_lds_prefetch() && !ggml_hip_gfx906_iq2_no_lds_row_groups());
 }
 #endif
 
@@ -1646,16 +1685,14 @@ static void mul_mat_vec_q_moe_launch(
             };
             bool use_no_lds_row_groups = false;
             if constexpr (type == GGML_TYPE_IQ2_S) {
-                static const bool no_lds_row_groups = [] {
-                    const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_NO_LDS_ROW_GROUPS");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
-                use_no_lds_row_groups = live_lds_mode < 0 && no_lds_row_groups && ncols_dst == 3 &&
+                use_no_lds_row_groups = live_lds_mode < 0 && ggml_hip_gfx906_iq2_no_lds_row_groups() && ncols_dst == 3 &&
                     nrows_x % (2*rows_per_block) == 0;
             }
             static const bool lds_prefetch = [] {
-                const char * value = std::getenv(type == GGML_TYPE_IQ2_S ?
-                    "GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH" : "GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
+                if constexpr (type == GGML_TYPE_IQ2_S) {
+                    return ggml_hip_gfx906_iq2_lds_prefetch();
+                }
+                const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
                 return value && std::strcmp(value, "1") == 0;
             }();
             const bool use_lds = (live_lds_mode < 0 ? lds_prefetch : live_lds_mode != 0) &&
@@ -1667,11 +1704,7 @@ static void mul_mat_vec_q_moe_launch(
                         ggml_type_name(type), ncols_dst);
             });
             if constexpr (type == GGML_TYPE_IQ2_S) {
-                static const bool paired_dot = [] {
-                    const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_PAIRED_DOT");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
-                if (paired_dot && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
+                if (ggml_hip_gfx906_iq2_paired_dot() && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true>, launch_params,
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                         stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2232,6 +2265,40 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
 #ifdef GGML_USE_HIP
+    const bool iq2_strata = src0->type == GGML_TYPE_IQ2_S && ggml_hip_gfx906_iq2_strata_enabled();
+    const bool iq3_strata = src0->type == GGML_TYPE_IQ3_XXS && ggml_hip_gfx906_iq3_strata_enabled();
+    if ((iq2_strata || iq3_strata) && ne00 == 2560 && ne01 == 640 &&
+            ne03 == 1 && ne13 == 1 && ne3 == 1 && ncols_dst == 3 && nchannels_y == 1 && nchannels_dst == 10 &&
+            s01 == iq3_strata_reuse::weight_blocks && s02 >= ne01 * s01 && s02 <= INT32_MAX && src0->nb[2] % ts_src0 == 0 &&
+            stride_col_y == iq3_strata_reuse::activation_blocks && ggml_is_contiguous(dst) &&
+            fusion_local.gate && fusion_local.glu_op == GGML_GLU_OP_SWIGLU &&
+            !fusion_local.x_bias && !fusion_local.gate_bias && !fusion_local.x_scale && !fusion_local.gate_scale &&
+            !fusion_local.shared_up && !fusion_local.shared_gate && !fusion_local.shared_dst &&
+            ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VEGA20) {
+        namespace plan = ggml_hip_iq3_strata_plan;
+        namespace reuse = iq3_strata_reuse;
+        const auto * map = plan::map_from_ids(ids, iq2_strata ? plan::iq2 : plan::iq3);
+        if (map && map->data) {
+            const auto * groups = static_cast<const int32_t *>(map->data) + plan::experts;
+            const ggml_cuda_kernel_launch_params params(dim3(reuse::nrows / reuse::rows_per_tile, plan::routes),
+                    dim3(reuse::waves * reuse::wave), 0, stream);
+            const auto * q8 = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());
+            if (iq2_strata) {
+                ggml_cuda_kernel_launch(iq2_strata_reuse::gate_up_packed, params,
+                        static_cast<const block_iq2_s *>(src0->data), static_cast<const block_iq2_s *>(fusion_local.gate),
+                        q8, groups, dst_d, int(s02));
+                static const bool logged = (GGML_LOG_INFO("HIP gfx906 IQ2_S Strata gate/up applied: MTP positions=3 top_k=10\n"), true);
+                GGML_UNUSED(logged);
+            } else {
+                ggml_cuda_kernel_launch(reuse::gate_up_packed, params,
+                        static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
+                        q8, groups, dst_d, int(s02));
+                static const bool logged = (GGML_LOG_INFO("HIP gfx906 IQ3_XXS Strata gate/up applied: MTP positions=3 top_k=10\n"), true);
+                GGML_UNUSED(logged);
+            }
+            return;
+        }
+    }
     const auto * lookup = ids ? ids->view_src : nullptr;
     if (lookup && lookup->op == GGML_OP_GET_ROWS && std::strcmp(lookup->name, "ffn_moe_mtp_share_iq3_weights") == 0 &&
             src0->type == GGML_TYPE_IQ3_XXS && ne00 == 2560 && ne01 == 640 && ncols_dst == 3 &&

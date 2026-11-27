@@ -6,10 +6,12 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
+#include "llama-next-router-readback.h"
 #include "llama-rtx-expert.h"
 #include "llama-single-miss-cpu.h"
 #include "llama-single-miss-topology.h"
 #include "../ggml/src/ggml-backend-mtp.h"
+#include "../ggml/src/ggml-hip-iq3-strata-plan.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -579,6 +581,8 @@ struct llama_moe_cache::impl {
     const std::vector<ggml_tensor *> * next_prefetch_predictions = nullptr;
     const std::vector<ggml_tensor *> * next_prefetch_scores = nullptr;
     int next_prefetch_score_mode = 0;
+    llama_next_router_readback next_readback;
+    llama_next_router_readback::totals * next_readback_totals = nullptr;
     size_t next_prefetch_priority_layers = 0;
     size_t next_prefetch_priority_fallbacks = 0;
     size_t next_prefetch_top20_only = 0;
@@ -675,6 +679,20 @@ struct llama_moe_cache::impl {
     int64_t next_profile_h2d_submit_us = 0;
     int64_t next_profile_d2d_submit_us = 0;
     uint64_t next_profile_prefetch_waits = 0;
+    using iq_strata_mode_t = int (*)(ggml_backend_dev_t);
+    struct iq_strata_stats {
+        iq_strata_mode_t mode = nullptr;
+        bool profile = false;
+        size_t layers = 0;
+        size_t plans = 0;
+        size_t bytes = 0;
+        std::array<size_t, 3> groups{};
+        int64_t prep_us = 0;
+        int64_t async_submit_us = 0;
+        int64_t sync_copy_us = 0;
+    };
+    std::array<iq_strata_stats, ggml_hip_iq3_strata_plan::quant_count> iq_strata;
+    size_t hip_mtp_slot_staging_stride = sizeof(llama_expert_placement::layer_map::resident);
     ggml_backend_buffer_ptr hip_mtp_slot_staging;
     bool hip_mtp_slot_async = false;
     bool hip_mtp4_slot_async = false;
@@ -837,6 +855,26 @@ struct llama_moe_cache::impl {
                     placement->max_ubatch != 2 || n_expert_used != 10)) {
                 throw std::runtime_error("3-position MTP requires packed Expert capacity 300+20 and top-10 routing");
             }
+            namespace strata = ggml_hip_iq3_strata_plan;
+            const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
+            if (target_reg && placement->hip_tuple_dma && placement->hip_mtp_verify_three && !placement->overlap &&
+                    model.hparams.n_expert == strata::experts) {
+                for (int quant = 0; quant < strata::quant_count; ++quant) {
+                    const bool iq2 = quant == strata::iq2;
+                    const char * mode_file = std::getenv(iq2 ? strata::iq2_mode_file_env : strata::mode_file_env);
+                    if (!mode_file || !*mode_file) {
+                        continue;
+                    }
+                    auto & stats = iq_strata[quant];
+                    stats.mode = reinterpret_cast<iq_strata_mode_t>(ggml_backend_reg_get_proc_address(target_reg,
+                            iq2 ? "ggml_backend_hip_gfx906_iq2_strata_mode" : "ggml_backend_hip_gfx906_iq3_strata_mode"));
+                    if (stats.mode && stats.mode(placement->target) < 0) {
+                        stats.mode = nullptr;
+                    }
+                    const char * profile = std::getenv(iq2 ? "LLAMA_EXPERT_HIP_IQ2_STRATA_PROFILE" : "LLAMA_EXPERT_HIP_IQ3_STRATA_PROFILE");
+                    stats.profile = stats.mode && profile && std::strcmp(profile, "1") == 0;
+                }
+            }
             const int32_t map_count = 1 + placement->overlap + n_prefill_waves + 2 * mtp_verify_three_enabled;
             const ggml_init_params params{placement->maps.size() * ggml_tensor_overhead() * map_count, nullptr, true};
             ctx_host.reset(ggml_init(params));
@@ -851,7 +889,17 @@ struct llama_moe_cache::impl {
                         !weights.ffn_gate_exps_s && !weights.ffn_up_exps_s && !weights.ffn_down_exps_s &&
                         model.hparams.swiglu_clamp_exp[il] <= 1e-6f;
                 l.ig = 0;
-                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, model.hparams.n_expert);
+                const auto * up = weights.ffn_up_exps;
+                const auto * gate = weights.ffn_gate_exps;
+                const int quant = up && up->type == GGML_TYPE_IQ2_S ? strata::iq2 :
+                        up && up->type == GGML_TYPE_IQ3_XXS ? strata::iq3 : -1;
+                const bool plan = quant >= 0 && iq_strata[quant].mode && gate && gate->type == up->type &&
+                        up->ne[0] == 2560 && up->ne[1] == 640 && ggml_are_same_shape(up, gate);
+                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, plan ? strata::map_entries : model.hparams.n_expert);
+                if (plan) {
+                    ++iq_strata[quant].layers;
+                }
+                hip_mtp_slot_staging_stride = std::max(hip_mtp_slot_staging_stride, ggml_nbytes(l.slot_map));
                 ggml_format_name(l.slot_map, "moe_cache.packed_slots-%zu", il);
                 layer_of.emplace(l.slot_map, std::make_pair(static_cast<int32_t>(il), false));
                 for (int32_t wave = 0; wave < n_prefill_waves; ++wave) {
@@ -915,7 +963,6 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
-            const auto target_reg = ggml_backend_dev_backend_reg(placement->target);
             const char * target_name = target_reg ? ggml_backend_reg_name(target_reg) : "";
             const auto reg = std::strcmp(target_name, "Vulkan") == 0 ? target_reg : nullptr;
             const char * histogram = std::getenv("LLAMA_EXPERT_MISS_HISTOGRAM");
@@ -1068,7 +1115,7 @@ struct llama_moe_cache::impl {
                 hip_mtp4_slot_async = placement->hip_mtp_verify_four && enabled(slot4);
                 if (hip_mtp_slot_async || hip_mtp4_slot_async) {
                     hip_mtp_slot_staging = allocate_pinned(hip_mtp_slot_async ? slot3 : slot4,
-                            placement->maps.size() * sizeof(placement->maps[0].resident));
+                            placement->maps.size() * hip_mtp_slot_staging_stride);
                 }
                 if (placement->hip_tuple_dma) {
                     hip_mtp_promotion_async = enabled("LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION");
@@ -2698,74 +2745,15 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il, bool defer = false) {
-        if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
-            return;
-        }
-        const int32_t target = il + 1;
-        if (next_prefetch_queue_layer >= 0) {
-            discard_next_prefetch_queue();
-        }
-        if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
-                (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
-            finish_next_prefetch();
-        }
-        auto * prediction = (*next_prefetch_predictions)[il];
-        if (ggml_backend_sched_flush_deferred_router(sched, prediction) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("could not submit the deferred next Router graph");
-        }
-        auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
-        GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
-        next_prefetch_routes predicted;
-        next_prefetch_logits logits;
-        bool read_scores = false;
-        const int ranks = next_prefetch_score_mode == 2 ? next_prefetch_priority_ranks : next_prefetch_ranks;
-        const size_t prediction_bytes = ranks * next_prefetch_tokens * sizeof(int32_t);
-        GGML_ASSERT(prediction->ne[0] == ranks && prediction->ne[1] == next_prefetch_tokens &&
-                ggml_nbytes(prediction) == prediction_bytes);
-        const int64_t read_start = next_profile_start ? ggml_time_us() : 0;
-        ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
-        if (next_prefetch_scores) {
-            auto * scores = (*next_prefetch_scores)[il];
-            read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
-                    scores->ne[0] == next_prefetch_experts && scores->ne[1] == next_prefetch_tokens &&
-                    ggml_nbytes(scores) == sizeof(logits) && ggml_backend_sched_get_tensor_backend(sched, scores) == producer;
-            if (read_scores) {
-                ggml_backend_tensor_get_async(producer, scores, logits.data(), 0, sizeof(logits));
-            } else {
-                ++next_prefetch_score_readback_fallback;
-            }
-        }
-        const int64_t wait_start = read_start ? ggml_time_us() : 0;
-        ggml_backend_synchronize(producer);
-        if (read_start) {
-            ++next_profile_readbacks;
-            next_profile_read_submit_us += wait_start - read_start;
-            next_profile_read_wait_us += ggml_time_us() - wait_start;
-        }
-
-        if (next_prefetch_score_mode == 2) {
-            if (read_scores && priority_next_prefetch(target, predicted, logits, defer)) {
-                ++next_prefetch_priority_layers;
-                if (defer) {
-                    progress_next_prefetch();
-                }
-                return;
-            }
-            ++next_prefetch_priority_fallbacks;
-            read_scores = false;
-        }
-        next_prefetch_mask accepted;
-        if (read_scores) {
-            filter_next_prefetch(predicted, logits, target, accepted);
-        }
+    void stage_next_prefetch_routes(int32_t target, const next_prefetch_routes & predicted, int ranks,
+            const next_prefetch_mask * accepted, bool defer) {
         const auto & map = placement->maps[target];
         const auto & scratch = layers[target].packed_scratch;
         for (int rank = 0; rank < next_prefetch_ranks; ++rank) {
             for (int token = 0; token < next_prefetch_tokens; ++token) {
                 const int32_t expert = predicted[token * ranks + rank];
                 GGML_ASSERT(expert >= 0 && size_t(expert) < map.resident.size());
-                if (read_scores && !accepted[expert]) {
+                if (accepted && !(*accepted)[expert]) {
                     continue;
                 }
                 const int32_t host_slot = map.host[expert];
@@ -2793,6 +2781,111 @@ struct llama_moe_cache::impl {
         if (defer) {
             progress_next_prefetch();
         }
+    }
+
+    bool progress_next_router_readback() {
+        if (!next_readback.pending()) {
+            return false;
+        }
+        next_prefetch_routes predicted;
+        const int32_t target = next_readback.poll(-1, predicted.data());
+        if (target >= 0) {
+            const int64_t start = next_readback_totals ? ggml_time_us() : 0;
+            stage_next_prefetch_routes(target, predicted, next_prefetch_ranks, nullptr, true);
+            if (next_readback_totals) {
+                next_readback_totals->plan_cpu_us += ggml_time_us() - start;
+            }
+        }
+        return target >= 0;
+    }
+
+    void launch_next_prefetch(ggml_backend_sched_t sched, int32_t il, bool defer = false) {
+        if (size_t(il) >= next_prefetch_predictions->size() || size_t(il + 1) >= placement->maps.size()) {
+            return;
+        }
+        const int32_t target = il + 1;
+        next_readback.discard_pending();
+        if (next_prefetch_queue_layer >= 0) {
+            discard_next_prefetch_queue();
+        }
+        if (!next_prefetch_hit_wait || next_prefetch_layer >= 0 ||
+                (next_prefetch_tail_pending && target <= next_prefetch_source_layer)) {
+            finish_next_prefetch();
+        }
+        auto * prediction = (*next_prefetch_predictions)[il];
+        if (ggml_backend_sched_flush_deferred_router(sched, prediction) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("could not submit the deferred next Router graph");
+        }
+        auto * producer = ggml_backend_sched_get_tensor_backend(sched, prediction);
+        GGML_ASSERT(producer && ggml_is_contiguous(prediction) && prediction->type == GGML_TYPE_I32);
+        next_prefetch_routes predicted;
+        next_prefetch_logits logits;
+        bool read_scores = false;
+        const int ranks = next_prefetch_score_mode == 2 ? next_prefetch_priority_ranks : next_prefetch_ranks;
+        const size_t prediction_bytes = ranks * next_prefetch_tokens * sizeof(int32_t);
+        GGML_ASSERT(prediction->ne[0] == ranks && prediction->ne[1] == next_prefetch_tokens &&
+                ggml_nbytes(prediction) == prediction_bytes);
+        const bool measure_read = next_profile_start || next_readback_totals;
+        const int64_t read_start = measure_read ? ggml_time_us() : 0;
+        const int32_t defer_layer = defer ? target : -1;
+        const bool pinned = next_readback.enabled && !next_prefetch_scores &&
+                next_readback.submit(producer, prediction, prediction_bytes, defer_layer);
+        const bool deferred_read = next_readback.pending();
+        if (!pinned) {
+            ggml_backend_tensor_get_async(producer, prediction, predicted.data(), 0, prediction_bytes);
+        }
+        if (next_prefetch_scores) {
+            auto * scores = (*next_prefetch_scores)[il];
+            read_scores = scores && scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores) &&
+                    scores->ne[0] == next_prefetch_experts && scores->ne[1] == next_prefetch_tokens &&
+                    ggml_nbytes(scores) == sizeof(logits) && ggml_backend_sched_get_tensor_backend(sched, scores) == producer;
+            if (read_scores) {
+                ggml_backend_tensor_get_async(producer, scores, logits.data(), 0, sizeof(logits));
+            } else {
+                ++next_prefetch_score_readback_fallback;
+            }
+        }
+        const int64_t wait_start = measure_read ? ggml_time_us() : 0;
+        if (!pinned) {
+            ggml_backend_synchronize(producer);
+        } else if (!deferred_read) {
+            next_readback.complete(predicted.data(), prediction_bytes);
+        }
+        if (measure_read) {
+            const int64_t wait_us = deferred_read ? 0 : ggml_time_us() - wait_start;
+            const int64_t submit_us = wait_start - read_start;
+            if (next_profile_start) {
+                ++next_profile_readbacks;
+                next_profile_read_submit_us += submit_us;
+                next_profile_read_wait_us += wait_us;
+            }
+            if (next_readback_totals) {
+                ++next_readback_totals->reads;
+                next_readback_totals->pinned += pinned;
+                next_readback_totals->submit_us += submit_us;
+                next_readback_totals->wait_us += wait_us;
+            }
+        }
+
+        if (deferred_read) {
+            return;
+        }
+        if (next_prefetch_score_mode == 2) {
+            if (read_scores && priority_next_prefetch(target, predicted, logits, defer)) {
+                ++next_prefetch_priority_layers;
+                if (defer) {
+                    progress_next_prefetch();
+                }
+                return;
+            }
+            ++next_prefetch_priority_fallbacks;
+            read_scores = false;
+        }
+        next_prefetch_mask accepted;
+        if (read_scores) {
+            filter_next_prefetch(predicted, logits, target, accepted);
+        }
+        stage_next_prefetch_routes(target, predicted, ranks, read_scores ? &accepted : nullptr, defer);
     }
 
     bool arm_next_prefetch_submit(ggml_backend_sched_t sched, ggml_backend_t expert_backend, int32_t il) {
@@ -3003,6 +3096,10 @@ struct llama_moe_cache::impl {
                     hip_direct_upload_wait_us += us;
                 }
             }
+        }
+        if (tuple_dma && next_readback_totals) {
+            next_readback_totals->demand_tuples += fills.size();
+            next_readback_totals->hit_tuples += prefetch_hits;
         }
         next_prefetch_top20_only_hits += prefetch_top20_hits;
         if (il == next_prefetch_layer && next_prefetch_hit_wait) {
@@ -3374,6 +3471,10 @@ struct llama_moe_cache::impl {
             // Publish a pending promotion before using the resident or scratch maps.
             ggml_backend_sched_wait_expert_copy(sched, true, false);
             finish_hip_mtp_promotion();
+        }
+        if (!early && src == l.slot_map && next_readback.pending()) {
+            // The demand callback owns the transfer queue from this point.
+            next_readback.poll(il, nullptr);
         }
         if (next_prefetch_queue_layer == il) {
             cancel_next_prefetch_queue(il);
@@ -3785,14 +3886,45 @@ struct llama_moe_cache::impl {
             const auto write_slot_map = [&] {
                 telemetry_scope scope(set_telemetry_cause, "slot_map");
                 const int64_t map_start = fine_profile ? ggml_time_us() : 0;
-                const size_t bytes_map = ggml_nbytes(dst);
-                if (async_map_dst) {
-                    GGML_ASSERT(bytes_map == sizeof(slots));
-                    auto * staging = static_cast<uint8_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get()));
-                    staging += il * sizeof(slots);
+                namespace strata = ggml_hip_iq3_strata_plan;
+                const int quant = fixed_three ? strata::lookup_quant(lookup) : -1;
+                auto * stats = quant >= 0 ? &iq_strata[quant] : nullptr;
+                const bool with_plan = stats && stats->mode && stats->mode(placement->target) > 0;
+                const size_t bytes_map = with_plan ? strata::map_entries * sizeof(int32_t) : sizeof(slots);
+                GGML_ASSERT(bytes_map <= ggml_nbytes(dst));
+                std::array<int32_t, strata::map_entries> sync_map;
+                auto * staging = async_map_dst ?
+                        static_cast<int32_t *>(ggml_backend_buffer_get_base(hip_mtp_slot_staging.get())) +
+                            il * (hip_mtp_slot_staging_stride / sizeof(int32_t)) :
+                        sync_map.data();
+                const int32_t * map_data = slots.data();
+                if (with_plan || async_map_dst) {
                     // This callback's destination wait has drained any prior use of this layer's staging.
-                    std::memcpy(staging, slots.data(), bytes_map);
-                    ggml_backend_tensor_set_async(backend, dst, staging, 0, bytes_map);
+                    std::memcpy(staging, slots.data(), sizeof(slots));
+                    map_data = staging;
+                }
+                const bool measure = with_plan && stats->profile;
+                if (with_plan) {
+                    const int64_t prep_start = measure ? ggml_time_us() : 0;
+                    int32_t * plan = staging + strata::experts;
+                    const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
+                    strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu));
+                    if (measure) {
+                        stats->prep_us += ggml_time_us() - prep_start;
+                        ++stats->plans;
+                        stats->bytes += strata::routes * sizeof(int32_t);
+                        for (int i = 0; i < strata::routes && plan[i] != 0; ++i) {
+                            const int count = int((plan[i] & 0xf) != 0) + int((plan[i] & 0xf0) != 0) + int((plan[i] & 0xf00) != 0);
+                            ++stats->groups[count - 1];
+                        }
+                    }
+                }
+                if (async_map_dst) {
+                    const int64_t submit_start = measure ? ggml_time_us() : 0;
+                    ggml_backend_tensor_set_async(backend, dst, map_data, 0, bytes_map);
+                    if (measure) {
+                        stats->async_submit_us += ggml_time_us() - submit_start;
+                    }
                     demand_trace(il, "slot_map_submit", 1, bytes_map);
                     if (fixed_four) {
                         ++hip_mtp4_async_maps;
@@ -3801,7 +3933,11 @@ struct llama_moe_cache::impl {
                         hip_mtp_async_map_bytes += bytes_map;
                     }
                 } else {
-                    ggml_backend_tensor_set(dst, slots.data(), 0, bytes_map);
+                    const int64_t submit_start = measure ? ggml_time_us() : 0;
+                    ggml_backend_tensor_set(dst, map_data, 0, bytes_map);
+                    if (measure) {
+                        stats->sync_copy_us += ggml_time_us() - submit_start;
+                    }
                     packed_synchronous_maps += defer_slot_map_requested;
                 }
                 if (fine_profile) {
@@ -4037,6 +4173,7 @@ struct llama_moe_cache::impl {
                     next_profile_d2d_submit_us, next_profile_prefetch_waits, next_prefetch_wait_us);
         }
         if (next_prefetch_bank) {
+            next_readback.log_stats();
             LLAMA_LOG_INFO("packed expert HIP next Router prefetch: launches=%zu hits=%zu unused=%zu h2d_bytes=%zu d2d_bytes=%zu wait_us=%" PRId64 "\n",
                     next_prefetch_launches, next_prefetch_hits, next_prefetch_unused,
                     next_prefetch_h2d_bytes, next_prefetch_d2d_bytes, next_prefetch_wait_us);
@@ -4133,6 +4270,15 @@ struct llama_moe_cache::impl {
             if (placement->hip_mtp_direct_ram) {
                 LLAMA_LOG_INFO("packed expert HIP MTP3 direct RAM: steps=%zu planes=%zu bytes=%zu staging_bytes=0 completion_wait_us=%" PRIu64 "\n",
                         hip_direct_upload_steps, hip_direct_upload_planes, hip_direct_upload_bytes, hip_direct_upload_wait_us);
+            }
+            for (int quant = 0; quant < ggml_hip_iq3_strata_plan::quant_count; ++quant) {
+                const auto & stats = iq_strata[quant];
+                if (stats.profile) {
+                    LLAMA_LOG_INFO("packed HIP IQ%d Strata: eligible_layers=%zu plan_maps=%zu extra_h2d_bytes=%zu"
+                            " groups_1=%zu groups_2=%zu groups_3=%zu prep_us=%" PRId64 " async_submit_us=%" PRId64 " sync_copy_us=%" PRId64 "\n",
+                            quant == ggml_hip_iq3_strata_plan::iq2 ? 2 : 3, stats.layers, stats.plans, stats.bytes,
+                            stats.groups[0], stats.groups[1], stats.groups[2], stats.prep_us, stats.async_submit_us, stats.sync_copy_us);
+                }
             }
             if (hip_mtp_slot_staging && hip_mtp_slot_async) {
                 LLAMA_LOG_INFO("packed HIP MTP3 async slot map: copies=%zu bytes=%zu\n",
@@ -4375,6 +4521,7 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     auto & self = *pimpl;
     GGML_ASSERT(!self.next_prefetch_predictions && self.next_prefetch_layer < 0 && !self.next_prefetch_tail_pending);
     self.next_prefetch_predictions = &predictions;
+    self.next_readback_totals = self.next_readback.begin_graph(self.next_profile_start != 0);
     GGML_ASSERT(!self.next_prefetch_score_mode || scores.size() == predictions.size());
     self.next_prefetch_scores = self.next_prefetch_score_mode ? &scores : nullptr;
     if (self.hip_demand_trace) {
@@ -4383,7 +4530,9 @@ void llama_moe_cache::begin_next_router_prefetch(ggml_backend_sched_t sched, con
     if (self.next_prefetch_demand_priority || self.hip_demand_trace) {
         ggml_backend_sched_set_before_split_submit(sched, [](void * data) {
             auto & self = *static_cast<impl *>(data);
-            self.progress_next_prefetch();
+            if (!self.progress_next_router_readback()) {
+                self.progress_next_prefetch();
+            }
             if (self.next_prefetch_submit_layer >= 0) {
                 self.demand_trace(self.next_prefetch_submit_layer, "dispatch_begin");
             }
@@ -4417,7 +4566,12 @@ void llama_moe_cache::end_next_router_prefetch(ggml_backend_sched_t sched) {
         }
         pimpl->hip_demand_trace_entries.clear();
     }
+    pimpl->next_readback.end_graph();
     pimpl->next_prefetch_predictions = nullptr;
+    if (pimpl->next_readback_totals) {
+        pimpl->next_readback_totals->graph_cpu_us += ggml_time_us() - pimpl->next_profile_start;
+        pimpl->next_readback_totals = nullptr;
+    }
     pimpl->next_prefetch_scores = nullptr;
 }
 

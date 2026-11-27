@@ -1,6 +1,9 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#ifdef GGML_USE_HIP
+#include "ggml-hip-iq3-strata-plan.h"
+#endif
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -6014,9 +6017,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     graph_key = ggml_cuda_graph_get_key(cgraph);
 #ifdef GGML_USE_HIP
     const int lds_modes = ggml_hip_gfx906_lds_modes();
-    if (lds_modes >= 0 && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+    const bool gfx906 = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20;
+    const bool iq2_strata = gfx906 && ggml_hip_gfx906_iq2_strata_enabled();
+    const bool iq3_strata = gfx906 && ggml_hip_gfx906_iq3_strata_enabled();
+    if (gfx906) {
         const auto it = cuda_ctx->cuda_graphs.find(graph_key);
-        if (it != cuda_ctx->cuda_graphs.end() && it->second->gfx906_lds_modes != lds_modes) {
+        if (it != cuda_ctx->cuda_graphs.end() &&
+                (it->second->gfx906_lds_modes != lds_modes || it->second->gfx906_iq2_strata != iq2_strata ||
+                 it->second->gfx906_iq3_strata != iq3_strata)) {
             // Captured launches contain the kernel selected under the previous mode.
             cuda_ctx->cuda_graphs.erase(it);
         }
@@ -6028,6 +6036,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 #ifdef GGML_USE_HIP
         graph->gfx906_lds_modes = lds_modes;
+        graph->gfx906_iq2_strata = iq2_strata;
+        graph->gfx906_iq3_strata = iq3_strata;
 #endif
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
@@ -6179,6 +6189,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
+
+#ifdef GGML_USE_HIP
+    if (!disable_fusion && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            auto * glu = cgraph->nodes[i];
+            auto * up = glu->op == GGML_OP_GLU ? glu->src[1] : nullptr;
+            if (up && up->op == GGML_OP_MUL_MAT_ID &&
+                    (up->src[0]->type == GGML_TYPE_IQ2_S || up->src[0]->type == GGML_TYPE_IQ3_XXS)) {
+                if (auto * map = ggml_hip_iq3_strata_plan::map_from_ids(up->src[2])) {
+                    // The fused GLU still reads the plan after GET_ROWS.
+                    params->add_alloc_dep(params->user_data, map, glu);
+                }
+            }
+        }
+    }
+#endif
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
@@ -7662,6 +7688,26 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
 #endif
 #ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_hip_set_gfx906_iq2_strata") == 0) {
+        return (void *) ggml_hip_gfx906_set_iq2_strata;
+    }
+    if (strcmp(name, "ggml_backend_hip_gfx906_iq2_strata_mode") == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) -> int {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20 ?
+                    int(ggml_hip_gfx906_iq2_strata_enabled()) : -1;
+        };
+    }
+    if (strcmp(name, "ggml_backend_hip_set_gfx906_iq3_strata") == 0) {
+        return (void *) ggml_hip_gfx906_set_iq3_strata;
+    }
+    if (strcmp(name, "ggml_backend_hip_gfx906_iq3_strata_mode") == 0) {
+        return (void *)+[](ggml_backend_dev_t dev) -> int {
+            const auto * dev_ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_VEGA20 ?
+                    int(ggml_hip_gfx906_iq3_strata_enabled()) : -1;
+        };
+    }
     if (strcmp(name, "ggml_backend_hip_set_gfx906_lds_modes") == 0) {
         return (void *) ggml_hip_gfx906_set_lds_modes;
     }
