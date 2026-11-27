@@ -179,6 +179,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 ## 最新の比較試作
 
+- **宛先同期省略とCUDAコピー一括発行の併用を3回。** 固定3幅・5問・各512トークン。生成60.51 / 63.05 / 58.82 tok/s、合算60.77 tok/s。全OFFは60.58 tok/s。MI50→RTXの両待ち合計11.158→11.169 ms/検証。初回の生成IDと本文は全OFFと一致した。全15応答EOS、スワップアウト0。第4問のコードは全回正解、説明文には2回で数値誤り。採用保留。[併用計測](../research/rocm-transfer-optimization-integration-20261127.md#宛先同期省略とcudaコピー一括発行の併用を3回)
+
 - **転送3施策の単独ONを各2回。** 同じ `cad9ab0a2` のバイナリ・固定3幅・上限512で、合算生成は先読み予算59.60、RTX宛先同期省略61.19、CUDA読み戻し一括発行61.17 tok/s。前回の全OFFは60.58 tok/s。全30応答EOS、ホストのスワップアウト0。宛先待ちは送信元待ちに移り、一括発行のD2Hは0.413→0.376 ms/検証。第4問のコードは全回正しいが、説明文には3回で数値誤りがあった。[単独計測と内訳](../research/rocm-transfer-optimization-integration-20261127.md#3施策を単独で各2回)
 
 - **並列開発した転送3施策。** `codex/rocm-transfer-optimization` の `cad9ab0a2` を固定3幅・上限512・同一サーバーで全OFF→全ON。両条件5問EOS。生成60.58→61.72 tok/sで、MTP採用686/1,054→727/1,108。先読み予算・RTX宛先同期省略・CUDAコピー一括発行の作動を確認。1組なので採用判断は保留。[初回の問題、修正と再計測](../research/rocm-transfer-optimization-integration-20261127.md)
