@@ -13,6 +13,7 @@
 #include "ggml-backend-copy-api-batch.h"
 #include "ggml-backend-mtp.h"
 #include "ggml-backend-hip-return-wait.h"
+#include "ggml-backend-hip-return-ticket.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1584,6 +1585,9 @@ struct ggml_backend_sched {
     ggml_backend_cuda_return_stream_ordered_t hip_return_ordered_stream;
     ggml_backend_hip_return_wait_stats hip_return_wait_stats[2];
     bool hip_return_wait_pending_mode;
+    ggml_backend_hip_return_ticket hip_return_ticket;
+    size_t hip_return_ticket_applied;
+    size_t hip_return_ticket_fallback;
     ggml_backend_hip_verify_trace * hip_verify_trace;
     size_t mapped_hip_input_producers;
     size_t mapped_hip_input_after_shared_producers;
@@ -3029,6 +3033,26 @@ void ggml_backend_sched_wait_expert_copy(ggml_backend_sched_t sched, bool after_
     }
 }
 
+static void ggml_backend_sched_combine_hip_return(ggml_backend_sched_t sched, ggml_backend_sched_hip_return & pending,
+        ggml_backend_sched_single_miss & correction, int64_t mi50_done_us) {
+    const float * result = correction.resolve(correction.user_data, mi50_done_us);
+    GGML_ASSERT(result);
+    const int64_t combine_start = ggml_time_us();
+    // The previous H2D and the mapped HIP write to this slot have completed.
+    auto * output = reinterpret_cast<float *>(pending.data);
+    for (int t = 0; t < 3; ++t) {
+        if (correction.mask & (1u << t)) {
+            for (int j = 0; j < 2560; ++j) {
+                const int i = t * 2560 + j;
+                output[i] += result[i];
+            }
+        }
+    }
+    correction = {};
+    ++sched->single_miss_combined;
+    sched->single_miss_combine_us += ggml_time_us() - combine_start;
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
         struct ggml_tensor * input, ggml_backend_sched_host_copies * host_copies,
         ggml_backend_sched_hip_return * hip_return = nullptr) {
@@ -3208,22 +3232,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         if (use_hip_return) {
             GGML_ASSERT(!sched->hip_return_h2d_pending);
             if (combine_single_miss) {
-                const float * result = correction->resolve(correction->user_data, mi50_done_us);
-                GGML_ASSERT(result);
-                const int64_t combine_start = ggml_time_us();
-                // The previous H2D and the mapped HIP write to this slot have completed.
-                auto * output = reinterpret_cast<float *>(hip_return->data);
-                for (int t = 0; t < 3; ++t) {
-                    if (correction->mask & (1u << t)) {
-                        for (int j = 0; j < 2560; ++j) {
-                            const int i = t * 2560 + j;
-                            output[i] += result[i];
-                        }
-                    }
-                }
-                *correction = {};
-                ++sched->single_miss_combined;
-                sched->single_miss_combine_us += ggml_time_us() - combine_start;
+                ggml_backend_sched_combine_hip_return(sched, *hip_return, *correction, mi50_done_us);
             }
             handoff.read_start_us = hip_return->enqueue_start_us;
             handoff.read_end_us = hip_return->enqueue_end_us;
@@ -4285,6 +4294,8 @@ enum ggml_status ggml_backend_sched_flush_deferred_router(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+#include "ggml-backend-hip-return-ticket-sched.h"
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -4414,6 +4425,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const bool ticket_requested = hip_return.source && hip_return.mapped && hip_return_ticket_enabled.load(std::memory_order_relaxed);
+        const bool ticket_candidate = ticket_requested &&
+                ggml_backend_sched_hip_return_ticket_candidate(sched, split, hip_return, shared_return_input);
+        sched->hip_return_ticket_fallback += ticket_requested && !ticket_candidate;
+        ggml_tensor * ticket_input = nullptr;
         stage.next("nonweight_copy");
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
@@ -4450,6 +4466,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         continue;
                     }
                 }
+                if (ticket_candidate) {
+                    ticket_input = input;
+                    continue;
+                }
                 if (!profile.enabled) {
                     ggml_backend_sched_copy_input(sched, split, input, host_copies, &hip_return);
                     continue;
@@ -4469,7 +4489,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-        if (after_submit.single_miss.destination == split) {
+        if (!ticket_input && after_submit.single_miss.destination == split) {
             GGML_LOG_ERROR("packed HIP MTP3 single CPU miss: expected pinned return was not consumed\n");
             return GGML_STATUS_FAILED;
         }
@@ -4547,6 +4567,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_cgraph without_router;
         uint64_t without_router_mapped_uid = 0;
         bool without_router_after_shared = false;
+        auto try_ticket = [&](ggml_cgraph * graph, uint64_t uid, const ggml_tensor * mirror, void * mirror_data,
+                enum ggml_status * status) {
+            if (!ticket_input) {
+                return false;
+            }
+            auto * input = ticket_input;
+            ticket_input = nullptr;
+            if (ggml_backend_sched_hip_return_ticket_compute(sched, split, hip_return, graph, uid, mirror, mirror_data, status)) {
+                return true;
+            }
+            ++sched->hip_return_ticket_fallback;
+            ggml_backend_sched_copy_input(sched, split, input, host_copies, &hip_return);
+            return false;
+        };
         auto compute = [&](struct ggml_cgraph * graph) {
             const bool trace = sched->trace_handoff_graph != 0;
             const int64_t submit_start_us = profile.enabled || trace ? ggml_time_us() : 0;
@@ -4556,6 +4590,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } data{profile.cuda, backend_profile.name};
 
             if (graph_readback || upload.compute) {
+                GGML_ASSERT(!ticket_input);
                 bool recorded = false;
                 if (graph_readback) {
                     shared_return.backend = split_backend;
@@ -4613,25 +4648,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_sched_is_cuda_pair(split_backend, dst, "ROCm") &&
                         !sched->events[next.backend_id][sched->cur_copy] && dst->iface.set_tensor_async &&
                         ggml_backend_sched_device_input_buffer(split_backend, input, ggml_nbytes(input))) {
-                    if (sched->hip_async_input_pending) {
-                        // A reader still owns the slab. Keep the ordinary VRAM output and copy path.
+                    // The return ticket joins its HIP producer before CUDA can write the mirror again.
+                    if (sched->hip_async_input_pending &&
+                            (!ticket_input || sched->hip_async_input_pending != hip_return.source)) {
                         ++sched->mapped_hip_input_busy;
                     } else if (ggml_backend_sched_get_dual_pinned(sched, split_backend, dst) && pinned.cuda_mapped &&
-                            (!after_shared || pinned.hip_mapped) &&
-                            pinned.cuda_compute(split_backend, graph, mapped_input_uid, producer,
-                                pinned.cuda_mapped + (pinned.cuda_input_data - pinned.data), &mapped_status)) {
-                        ++sched->mapped_hip_input_producers;
-                        sched->mapped_hip_input_after_shared_producers += after_shared;
-                        mapped_input.source = split_backend;
-                        mapped_input.destination = &next;
-                        mapped_input.input = input;
-                        mapped_input.data = pinned.cuda_input_data;
-                        if (trace) {
-                            ggml_backend_sched_trace_submit(sched, split_id, split_backend, graph, submit_start_us, ggml_time_us());
+                            (!after_shared || pinned.hip_mapped)) {
+                        auto * mirror = pinned.cuda_mapped + (pinned.cuda_input_data - pinned.data);
+                        const bool ticket = try_ticket(graph, mapped_input_uid, producer, mirror, &mapped_status);
+                        if (ticket && mapped_status != GGML_STATUS_SUCCESS) {
+                            return mapped_status;
                         }
-                        return mapped_status;
+                        if (ticket || pinned.cuda_compute(split_backend, graph, mapped_input_uid, producer, mirror, &mapped_status)) {
+                            ++sched->mapped_hip_input_producers;
+                            sched->mapped_hip_input_after_shared_producers += after_shared;
+                            mapped_input.source = split_backend;
+                            mapped_input.destination = &next;
+                            mapped_input.input = input;
+                            mapped_input.data = pinned.cuda_input_data;
+                            if (trace && !ticket) {
+                                ggml_backend_sched_trace_submit(sched, split_id, split_backend, graph, submit_start_us, ggml_time_us());
+                            }
+                            return mapped_status;
+                        }
                     }
                 }
+            }
+            if (try_ticket(graph, graph->uid, nullptr, nullptr, &mapped_status)) {
+                return mapped_status;
             }
             if (async_return && split->mapped_hip_return_uid &&
                     ggml_backend_sched_prepare_hip_return(sched, hip_return, *split, splits[split_id + 1]) &&
@@ -4751,7 +4795,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->before_split_submit(sched->before_split_submit_user_data);
             }
             stage.next("graph_submit");
+            if (ticket_input && !main_graph->n_nodes) {
+                enum ggml_status unused;
+                try_ticket(main_graph, 0, nullptr, nullptr, &unused);
+            }
             enum ggml_status ec = dispatch(main_graph);
+            GGML_ASSERT(!ticket_input);
+            GGML_ASSERT(after_submit.single_miss.destination != split);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -5153,6 +5203,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         delete profile.cuda;
     }
     ggml_backend_sched_wait_hip_return_h2d(sched);
+    if (sched->hip_return_ticket.host) {
+        sched->hip_return_ticket.release(sched->hip_return_ticket.host);
+    }
     ggml_backend_event_free(sched->hip_return_h2d_event);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -5266,6 +5319,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->hip_return_h2d_applied, sched->hip_return_h2d_fallback, sched->hip_return_h2d_waits);
         sched->hip_return_wait_stats[0].log(false);
         sched->hip_return_wait_stats[1].log(true);
+        if (sched->hip_return_ticket_applied || sched->hip_return_ticket_fallback || hip_return_ticket_enabled.load(std::memory_order_relaxed)) {
+            GGML_LOG_INFO("packed HIP MTP3 mapped return ticket: applied=%zu fallback=%zu\n",
+                    sched->hip_return_ticket_applied, sched->hip_return_ticket_fallback);
+        }
     }
     if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
         const auto & stats = sched->hip_mtp4_input_stats;
