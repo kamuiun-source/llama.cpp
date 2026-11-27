@@ -40,6 +40,7 @@ public:
     bool next_router_prefetch_enabled() const;
     bool next_router_prefetch_supported() const;
     void set_next_router_prefetch(bool enabled);
+    int set_next_router_byte_budget(bool enabled);
     int next_router_score_mode() const;
     void begin_next_router_prefetch(ggml_backend_sched_t sched, const std::vector<ggml_tensor *> & predictions,
             const std::vector<ggml_tensor *> & scores);

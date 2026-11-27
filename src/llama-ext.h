@@ -16,6 +16,7 @@
 LLAMA_API int32_t llama_process_prefill_narrow(struct llama_context * ctx, struct llama_batch_ext * batch);
 // Call between requests. Returns 1 on change, 0 if unchanged, and -1 if enabling is unavailable.
 LLAMA_API int llama_set_expert_hip_next_router_prefetch(struct llama_context * ctx, bool enabled);
+LLAMA_API int llama_set_expert_hip_next_router_byte_budget(struct llama_context * ctx, bool enabled);
 LLAMA_API int llama_set_expert_hip_prefill(struct llama_context * ctx, bool enabled);
 LLAMA_API int32_t llama_process_mtp_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
 LLAMA_API bool llama_mtp_vocab_subset_enabled(const struct llama_context * ctx);

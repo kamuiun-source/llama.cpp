@@ -170,6 +170,7 @@ struct llama_context {
     bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }
     void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
     int set_expert_hip_next_router_prefetch(bool enabled);
+    int set_expert_hip_next_router_byte_budget(bool enabled);
     int set_expert_hip_prefill(bool enabled);
 
     int encode(const llama_batch_ext & batch_inp);
