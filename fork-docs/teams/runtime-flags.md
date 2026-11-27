@@ -38,7 +38,7 @@ IQ2_S Strataは既存の符号復号とQ8_1入力共有を使い、同型のLDS�
 
 統合版のJSONLは設定切替・リクエスト境界・メモリ統計を記録する。応答JSONにある第1問16トークン目の `106806` / `159212` の分岐はcatch-upのON同士・OFF同士で再現した。原因の切り分けは同じ接頭辞でCPU Expertだけ変更し、競合する2語の本体logit、実際のExpert計算先、必要ならプリフィルのグループ幅を照合する。通常の `CATCHUP_FIRST_DRAFT=on` は維持。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行) · [catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
 
-`codex/rocm-live-output-flags` ではモデルの配置を共通にし、`LLAMA_GPU_OUTPUT_MODE_FILE` と `LLAMA_EXPERT_OUTPUT_MODE_FILE` でGPUカーネル、次層先読み、HIPプリフィルを待機中に切り替えられる。既存のCPU Expert、Strata、Router読み戻し、catch-upのモードファイルも併用できる。[切り替え手順と第4問の比較](../research/rocm-live-output-flags-20261127.md)
+`codex/rocm-integrated-test` に取り込んだ `codex/rocm-live-output-flags` の切り替え機構では、モデルの配置を共通にし、`LLAMA_GPU_OUTPUT_MODE_FILE` と `LLAMA_EXPERT_OUTPUT_MODE_FILE` でGPUカーネル、次層先読み、HIPプリフィルを待機中に切り替えられる。既存のCPU Expert、Strata、Router読み戻し、catch-upのモードファイルも併用できる。[切り替え手順と第4問の比較](../research/rocm-live-output-flags-20261127.md)
 
 ### MTP固定3幅の機能単体比較
 
@@ -53,6 +53,8 @@ IQ2_SのLDSは独立した試験設定。`GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH=1` 
 `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1` はIQ2_Sの固定3位置・LDSなし・2行のQ8_1入力共有。統合ブランチの通常起動で採用する。比較時は `0`。符号復号をON、IQ2_SのLDS先読みとLDSなし4行をOFFにする。[固定5問の比較](../rocm/10-decode-pipeline.md#q8_1共有を有効にした実モデルの固定5問)
 
 `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1` はgfx906・実3位置・2行のIQ4_NL downの復号セレクタ短縮。統合ブランチの通常起動で採用する。個別比較では `0` を指定する。[単体計測](../rocm/10-decode-pipeline.md#iq4_nl-downの復号セレクタを短縮する試作)、[固定5問の再比較](../rocm/10-decode-pipeline.md#復号短縮だけをonoffonoffで再比較)
+
+`GGML_HIP_GFX906_IQ_MMVQ_D4_ACTIVATION=1` はgfx906のIQ2_S・IQ3_XXSのgate/upのうち、狭幅プリフィル（1〜2トークン）で採用する。個別比較では起動時に `0`、または `LLAMA_GPU_OUTPUT_MODE_FILE` の該当キーに `off` を指定する。`GGML_HIP_GFX906_IQ_MMVQ_PRESERVE_FRACTION` は未設定（OFF）。[固定5問の比較](../research/rocm-live-output-flags-20261127.md#固定5問でのd4速度比較)
 
 RTXの固定3位置・Q8_0 HC down Split-Kは通常起動でOFF（未設定または `0`）。比較時は `GGML_CUDA_HC_DOWN_SPLIT_K=1` で有効化する。4分割した部分和のFP32加算順が変わり、丸め差で温度0でも出力文言・MTP採用数が変動し得る。[新しい5問の実測](../rocm/10-decode-pipeline.md#新しい独立5問でsplit-kを再比較)
 

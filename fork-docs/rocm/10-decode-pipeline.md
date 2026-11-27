@@ -229,6 +229,7 @@ docker run --rm --gpus all \
   -e GGML_CUDA_UNARY_MUL_BCAST=1 \
   -e GGML_CUDA_GDN_GATED_NORM=1 \
   -e GGML_HIP_GFX906_IQ_SIGN_DECODE=1 \
+  -e GGML_HIP_GFX906_IQ_MMVQ_D4_ACTIVATION=1 \
   -e GGML_HIP_GFX906_IQ2_S_PAIRED_DOT=1 \
   -e GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE=1 \
   -e GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1 \
@@ -254,6 +255,8 @@ SSMとGDNの融合を含む統合版では、`GGML_CUDA_UNARY_MUL_BCAST=1` と `
 RTXのQ8_0 HC down Split-Kは通常起動でOFF。環境変数は未設定または `0` とし、比較時だけ `GGML_CUDA_HC_DOWN_SPLIT_K=1` を指定してサーバーを再起動する。**FP32の加算順の違いによる丸め差で、温度0でも生成文言、出力トークン数、MTP採用数が変わる場合がある。** 厳密な出力照合では、比較元と同じSplit-K設定に揃える。[新しい5問の実測](#新しい独立5問でsplit-kを再比較)
 
 MI50の固定3幅では、符号復号、IQ2_SのQ8_1共有、IQ3_XXSのLDS先読み・出力4行、IQ4_NL downの復号短縮を有効にする。IQ2_SはLDSなし・2行を使う。Expert初期配置の比較では、これらの設定と直接DMAを共通にする。
+
+D4活性量子化は、gfx906でQwen3.8 Flash NextのIQ2_S・IQ3_XXSのgate/upが狭幅プリフィル（1〜2トークン）を通るときに適用する。非同期広幅プリフィルは引き続き有効で、固定3幅の生成・検証経路も従来どおり。整数内積の小数部保持 `GGML_HIP_GFX906_IQ_MMVQ_PRESERVE_FRACTION` は未設定（OFF）。D4だけ比較するときは、サーバー待機中に `LLAMA_GPU_OUTPUT_MODE_FILE` が指すファイルで `GGML_HIP_GFX906_IQ_MMVQ_D4_ACTIVATION=off` を指定できる。[計測と採用判断](../research/rocm-live-output-flags-20261127.md#固定5問でのd4速度比較)
 
 2026-11-26にpacked ExpertのCPU並列計算と量子化共有を取り込んだ。固定3幅の通常起動では、ホストでモードファイルを用意する。
 
@@ -1455,6 +1458,7 @@ Lunaが増分ビルドし、ログレベル4で全ONの5問を完走した。保
 | GDNのRMS正規化とsigmoidゲートの融合 | `GGML_CUDA_GDN_GATED_NORM` | `1` | `1` | `0` |
 | RTXのQ8_0 HC down Split-K | `GGML_CUDA_HC_DOWN_SPLIT_K` | 未設定（OFF） | `1` | `0` |
 | MI50のIQ2_S・IQ3_XXS符号復号 | `GGML_HIP_GFX906_IQ_SIGN_DECODE` | `1` | `1` | `0` |
+| MI50のIQ2_S・IQ3_XXS狭幅プリフィルのD4活性量子化 | `GGML_HIP_GFX906_IQ_MMVQ_D4_ACTIVATION` | `1` | `1` | `0` |
 | MI50のIQ2_S Q8_1入力共有 | `GGML_HIP_GFX906_IQ2_S_PAIRED_DOT` | `1` | `1`（LDS・4行がOFFのとき発動） | `0` |
 | MI50のIQ4_NL down復号短縮 | `GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE` | `1` | `1` | `0` |
 | MI50のIQ3_XXS LDS先読み | `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH` | `1` | `1` | `0` |
