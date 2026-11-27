@@ -1,8 +1,12 @@
 # ROCm固定3幅の最新計測サマリ
 
-更新日 2026-11-27。RTX 4070 Ti＋MI50、Qwen3.8 Flash Next UD-IQ3_XXS、固定3幅、単一バンク、直接DMA、CPU Expert自動配分ON。採用済みの次層先読み・非同期プリフィル・非同期昇格・Shared Expert先行発行を有効にした固定5問。HC down Split-KはOFF。
+更新日 2026-11-28。RTX 4070 Ti＋MI50、Qwen3.8 Flash Next UD-IQ3_XXS、固定3幅、単一バンク、直接DMA、CPU Expert自動配分ON。採用済みの次層先読み・非同期プリフィル・非同期昇格・Shared Expert先行発行を有効にした固定5問。HC down Split-KはOFF。
 
 ## 通常実行
+
+### LRU採用後の統合版でONを3回・OFFを1回
+
+統合ビルド `c6fb78eb4` の固定3幅・4K・上限512で、自然生成の5問を同一サーバーのON→OFF→ON→ONで実行。ONは61.95／61.44／63.56 tok/s、合算62.30、OFFは60.68 tok/s。本体検証はON合算31.292、OFF 31.220 ms/回。後半ONの2回に限ると31.137 ms/回で、通常H2DはOFFより約14%少ない7.13 MB/検証。MTP採用率と生成テキストに差がある。全20回答EOS、スワップアウト0。[実行順・通常H2D・出力](../research/rocm-mtp3-scratch-lru.md#採用後の統合版でonを3回offを1回)
 
 ### D4採用後の統合版で固定5問を1回
 
