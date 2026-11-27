@@ -166,3 +166,17 @@ tok/sは各条件の処理トークン数の合計を時間の合計で割った
 ONでは161・185トークン目の自然選択の1位が変わった。最初の誤った数字「5」は試作ONでも1位だった。190トークン目の検証幅は双方3で、OFFの行0とONの行2が異なるため、スコアの直接比較からは外した。参照式に近づけた試作で広幅との差が広がったため、既定OFFを維持する。Q8_1のスケール精度や別の演算経路も幅で変わる。実モデルの自由生成で誤答率が下がるかは今回の固定ID診断の対象外。[試作のON/OFFログ](/home/t-saka/rocm-mtp-q4-narrow-fraction-test-20261127/)
 
 追加の自由生成では同じサーバーでOFF→ONを切り替え、同じ履歴の第4問だけを各1回生成した。出力の固定とlogitトレースは外し、会話KV再利用0。OFFは217トークン、ONは192トークンで、両方EOS。Pythonコードは同一で、60.00 ms、27.00 ms、55.00%を計算する。どちらの説明にも個別の計算結果は書かれなかった。最後にOFFへ戻し、8トークン上限の応答が完了することも確認した。ON時は両型・両幅の適用ログが出てサーバーは終了コード0。各1回の自由生成から誤答率の改善は判定できない。[自由生成と切り替えログ](/home/t-saka/rocm-mtp-q4-narrow-fraction-live-smoke-20261127/)
+
+#### 試作をONにした反復の自由生成
+
+試作ON、狭幅プリフィル、固定3幅、CPU Expertなど比較対象の他の施策はOFF。同じサーバーで第4問単独を2回、第1〜4問の会話を新規に2回実行した。会話の前3問の返答はその場で生成し、会話KVは再利用した。第4問は全件EOS。単独は各146生成トークンでコードのみ、会話の続きは各217生成トークンで算出方法の説明付き。コードは全件同じで60.00 ms、27.00 ms、55.00%を計算し、実際の値を明記した説明は0/4だった。第4問の会話KV再利用は両回933トークン。IQ2_SとIQ3_XXSの1・2トークンで試作の起動を確認し、終了コードは0。[4回の全回答とログ](/home/t-saka/rocm-mtp-q4-fraction-on-four-cases-20261127/)
+
+算出結果も明記するよう求める追質問を1回追加した。新しいサーバーで2回目の会話履歴を読み直し、同じ試作ON設定で生成した。回答は224トークンでEOS、合計300と135、平均60.00 msと27.00 ms、差33.00 ms、改善率55.00%のすべてが正しかった。この1回は出力品質の確認で、試作OFFに対する誤答率の改善は比較していない。[追質問の回答全文](/home/t-saka/rocm-mtp-q4-fraction-on-four-cases-20261127/followup-response.txt)
+
+### 公開実装と論文から見た数値差の縮め方
+
+1. **同じExpert入力に同じ量子化・丸めを使う。** vLLMのDeepSeek-V4-Flashの検証では、異なるExpert入力配置に同じ量子化規則、行ごとに同じ累積、SwiGLU積の後に一度だけ丸める処理を適用した。このフォークでは狭幅Q8_1のスケール格納がFP16、広幅MMQのIQ2_S・IQ3_XXS向けD4がFP32で、量子値の計算式も狭幅は除算、広幅は逆数乗算。まず実モデルから同じ活性・Expert ID・重みを採り、量子化されたint8とスケールの差、gate/up出力の差を別々に測る。差が確認できれば、IQ型を限定して共通の量子化を試し、整数内積の小数部保持の有無も別々に評価する。[vLLMのExpert GEMM検証](https://github.com/vllm-project/vllm-project.github.io/blob/main/_posts/2026-10-14-train-inference-consistency.md#44-expert-gemm-two-layouts-same-row-result) · [狭幅の量子化](../../ggml/src/ggml-cuda/quantize.cuh#L14) · [広幅の量子化](../../ggml/src/ggml-cuda/quantize.cu#L488)
+2. **並列化の形状と加算順を切り離す。** Thinking Machines Labの公開カーネルやSGLangでは、バッチやプリフィル分割が変わっても演算の分割境界を固定する。Detentは数値を変える選択だけを固定する。今回なら同じK分割とFP32の加算順でExpert出力を作り、トークン方向の並列度を変えられるかを調べる。GGUF系のAxonは公開資料で、整数ブロック内積とFP32加算順を共通にするCUDA実装を記録している。CPU Expertにも展開する場合は入力Q8形式とExpert出力の合流順まで揃える必要がある。[Thinking Machines Labの実装](https://github.com/thinking-machines-lab/batch_invariant_ops) · [SGLangの実装解説](https://www.lmsys.org/blog/2025-09-22-sglang-deterministic/) · [Detent](https://arxiv.org/abs/2611.10611) · [Axonの設計メモ](https://github.com/HaseebKhalid1507/Axon/blob/main/docs/research/research-determinism.md)
+3. **高精度の参照計算を使って最初の差を探す。** LayerCastは低精度で保持した重みをFP32演算に使い、推論のばらつきを抑えた。このフォークでは全層の演算を差し替える前に、少数のExpert行のFP32参照と、RTX側のSSM畳み込み出力、Router順位を比較する。Expertに渡る時点ですでに入力が異なる場合は、同じ活性を与えたExpert単体の結果と、モデル全体のlogitを分けて判断する。[LayerCastの論文](https://proceedings.neurips.cc/paper_files/paper/2025/hash/f80094a824ba5912d4a2de169c404a40-Abstract-Conference.html) · [公開コード](https://github.com/nanomaoli/llm_reproducibility)
+
+推論経路間のlogit差を減らす実験と、説明に書かれる計算結果の正確さの評価は別々に行う。今回は同じ「5」が複数の経路で1位になっており、logitの再現性から計算結果の正しさは推定できない。
