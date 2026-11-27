@@ -13,6 +13,7 @@
 #include "server-single-miss-cpu-mode.h"
 #include "server-hip-return-wait-mode.h"
 #include "server-copy-api-batch-mode.h"
+#include "server-late-prefetch-cpu-mode.h"
 #include "server-gpu-output-mode.h"
 #include "server-expert-output-mode.h"
 #include "src/llama-next-router-readback.h"
@@ -4005,6 +4006,7 @@ private:
                         server_refresh_single_miss_cpu_mode(ctx_tgt, ctx_dft);
                         server_refresh_hip_return_wait_mode(ctx_tgt, ctx_dft);
                         server_refresh_copy_api_batch_mode(ctx_tgt, ctx_dft);
+                        server_refresh_late_prefetch_cpu_mode(ctx_tgt, ctx_dft);
                         server_refresh_iq_strata_mode<false>(ctx_tgt, ctx_dft);
                         server_refresh_iq_strata_mode<true>(ctx_tgt, ctx_dft);
                         llama_refresh_next_router_readback_mode();

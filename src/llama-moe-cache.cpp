@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-batch.h"
 #include "llama-impl.h"
+#include "llama-late-prefetch-cpu.h"
 #include "llama-memory.h"
 #include "llama-model.h"
 #include "llama-next-router-budget.h"
@@ -27,6 +28,10 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+
+void llama_set_late_prefetch_cpu(bool enabled) {
+    llama_late_prefetch_cpu_enabled.store(enabled, std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -664,6 +669,9 @@ struct llama_moe_cache::impl {
     size_t next_prefetch_unused = 0;
     size_t next_prefetch_h2d_bytes = 0;
     size_t next_prefetch_d2d_bytes = 0;
+    size_t late_prefetch_cpu_reroutes = 0;
+    size_t late_prefetch_cpu_events_omitted = 0;
+    size_t late_prefetch_cpu_d2d_bytes = 0;
     int64_t next_prefetch_wait_us = 0;
     bool next_profile_enabled = false;
     int64_t next_profile_start = 0;
@@ -3831,13 +3839,34 @@ struct llama_moe_cache::impl {
                     return slots[id] < 0 && next_prefetch_slot(il, id) < 0;
                 }) : llama_single_miss_selection{};
                 const int n_misses = selection.actual;
+                const int n_cpu_demand = std::min(n_misses, budget.jobs());
+                // A promotion writes back into the host slot of the selected scratch hit.
+                const int32_t promotion_host_slot = promote_index >= 0 ? map.host[scratch[promote_index]] : -1;
+                llama_late_prefetch_cpu_candidate late;
+                if (enabled && next_prefetch_layer == il && next_prefetch_source_layer == il &&
+                        next_prefetch_hit_wait && next_prefetch_event_ready && !overlap_expert_upload &&
+                        llama_late_prefetch_cpu_enabled.load(std::memory_order_relaxed) &&
+                        llama_late_prefetch_cpu_has_room(n_cpu_demand, budget)) {
+                    const size_t ready_prefix = std::max(next_prefetch_ready_prefix, next_prefetch_completed);
+                    if (ready_prefix < next_prefetch_count) {
+                        late = llama_late_prefetch_cpu_select(ids.data(), next_prefetch_ids.data(), next_prefetch_count,
+                            [&](int32_t expert) { return slots[expert] < 0; },
+                            [&](int32_t expert, size_t i) {
+                                const int32_t host_slot = map.host[expert];
+                                return host_slot >= 0 && host_slot != promotion_host_slot &&
+                                        host_slot == next_prefetch_source_slots[i];
+                            },
+                            [&](size_t i) {
+                                return i < ready_prefix ||
+                                        next_prefetch_event_ready(next_prefetch_backend.get(), next_prefetch_events[i].get());
+                            });
+                    }
+                }
                 const float * activation;
                 const float * router_weights;
-                if (n_misses > 0 && ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights)) {
-                    const auto & experts = selection.ids;
-                    const int n_cpu = std::min(n_misses, budget.jobs());
-                    auto & totals = single_miss_cpu->jobs[n_cpu];
-                    ++totals.eligible;
+                if ((n_cpu_demand > 0 || late.expert >= 0) &&
+                        ggml_backend_sched_get_hip_single_miss_inputs(sched, &activation, &router_weights)) {
+                    auto experts = selection.ids;
                     std::array<const ggml_tensor *, 3> planes{};
                     for (const auto * w : l.experts) {
                         if (std::strstr(w->name, ".ffn_gate_exps.weight")) {
@@ -3851,17 +3880,34 @@ struct llama_moe_cache::impl {
                     unsigned mask = 0;
                     std::array<int32_t, llama_single_miss_budget::max_jobs> host_slots;
                     bool safe = true;
-                    // A promotion writes back into the host slot of the selected scratch hit.
-                    const int32_t promotion_host_slot = promote_index >= 0 ? map.host[scratch[promote_index]] : -1;
-                    for (int i = 0; i < n_cpu; ++i) {
+                    for (int i = 0; i < n_cpu_demand; ++i) {
                         host_slots[i] = map.host[experts[i]];
                         safe &= host_slots[i] >= 0 && host_slots[i] != promotion_host_slot;
                     }
-                    if (safe && single_miss_cpu->enqueue(planes, host_slots.data(), experts.data(), n_cpu,
-                            ids.data(), activation, router_weights, mask)) {
+                    const auto enqueue = [&](int jobs) {
+                        ++single_miss_cpu->jobs[jobs].eligible;
+                        return safe && single_miss_cpu->enqueue(planes, host_slots.data(), experts.data(), jobs,
+                                ids.data(), activation, router_weights, mask);
+                    };
+                    int n_cpu = n_cpu_demand;
+                    if (late.expert >= 0) {
+                        experts[n_cpu] = late.expert;
+                        host_slots[n_cpu] = map.host[late.expert];
+                        if (enqueue(n_cpu + 1)) {
+                            ++n_cpu;
+                        }
+                    }
+                    if (n_cpu > n_cpu_demand || (n_cpu > 0 && enqueue(n_cpu))) {
+                        auto & totals = single_miss_cpu->jobs[n_cpu];
                         ggml_backend_sched_set_hip_single_miss_result(sched, [](void * worker, int64_t mi50_done_us) {
                             return static_cast<llama_single_miss_cpu *>(worker)->resolve(mi50_done_us);
                         }, single_miss_cpu.get(), mask);
+                        if (n_cpu > n_cpu_demand) {
+                            ++late_prefetch_cpu_reroutes;
+                            late_prefetch_cpu_events_omitted += late.sole_hit;
+                            late_prefetch_cpu_d2d_bytes += placement->tuples[il].stride;
+                            demand_trace(il, "late_prefetch_cpu", 1, placement->tuples[il].stride);
+                        }
                         // The last tuple is initialized to zero and is outside all scratch and promotion ranges.
                         for (int i = 0; i < n_cpu; ++i) {
                             slots[experts[i]] = llama_expert_profile::n_resident + placement->n_slots;
@@ -3871,9 +3917,9 @@ struct llama_moe_cache::impl {
                             totals.positions += (mask >> t) & 1;
                         }
                         totals.experts += n_cpu;
-                        totals.avoided_bytes += n_cpu * placement->tuples[il].stride;
-                        totals.planned_gpu_uploads += n_misses - n_cpu;
-                        totals.planned_gpu_bytes += (n_misses - n_cpu) * placement->tuples[il].stride;
+                        totals.avoided_bytes += n_cpu_demand * placement->tuples[il].stride;
+                        totals.planned_gpu_uploads += n_misses - n_cpu_demand;
+                        totals.planned_gpu_bytes += (n_misses - n_cpu_demand) * placement->tuples[il].stride;
                     }
                 }
             }
@@ -4496,6 +4542,11 @@ struct llama_moe_cache::impl {
             }
         }
         if (single_miss_cpu) {
+            if (late_prefetch_cpu_reroutes || llama_late_prefetch_cpu_enabled.load(std::memory_order_relaxed)) {
+                LLAMA_LOG_INFO("packed HIP MTP3 late prefetch CPU: reroutes=%zu consumer_events_omitted=%zu d2d_copies_omitted=%zu d2d_bytes_omitted=%zu\n",
+                        late_prefetch_cpu_reroutes, late_prefetch_cpu_events_omitted, late_prefetch_cpu_reroutes,
+                        late_prefetch_cpu_d2d_bytes);
+            }
             const auto & budget = single_miss_cpu->budget;
             for (int n = 1; n <= budget.jobs(); ++n) {
                 const auto & cpu = single_miss_cpu->jobs[n];
