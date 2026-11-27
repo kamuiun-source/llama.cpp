@@ -1294,6 +1294,13 @@ int llama_context::set_expert_hip_next_router_prefetch(bool enabled) {
     return 1;
 }
 
+int llama_context::set_expert_hip_next_router_byte_budget(bool enabled) {
+    if (!moe_cache) {
+        return enabled ? -1 : 0;
+    }
+    return moe_cache->set_next_router_byte_budget(enabled);
+}
+
 int llama_context::set_expert_hip_prefill(bool enabled) {
     if (!moe_cache || !moe_cache->hip_prefill_supported()) {
         return enabled ? -1 : 0;
@@ -5907,6 +5914,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, true, false);
+}
+
+int llama_set_expert_hip_next_router_byte_budget(llama_context * ctx, bool enabled) {
+    return ctx->set_expert_hip_next_router_byte_budget(enabled);
 }
 
 int llama_set_expert_hip_next_router_prefetch(llama_context * ctx, bool enabled) {
