@@ -20,6 +20,10 @@
 
 両回とも日本語は自然で、Wi-Fiの説明・切り分け・改善計画・4項目の家族向け要約は質問に沿っていた。1回目の第3問は冒頭の「2段階」に対して本文は3作業だった。第4問のPythonコードは両回とも正しく60.00 ms、27.00 ms、55.00%を計算した。2回目の説明文だけが52.00 ms、27.00 ms、48.08%と誤り、元ブランチの同条件にも同じ誤りがあった。[計測と全回答](/home/t-saka/rocm-integrated-adopted-three-on-repeat-20261127/session-batch-01) · [速度集計](/home/t-saka/rocm-integrated-adopted-three-on-repeat-20261127/integrated-repeat-summary.json)
 
+### 同梱llama.cppで第4問だけ回答
+
+Perplexity試験と同じ `mxxm/llama-cpp-gfx906:rocm-727` 同梱版（`b94959a64`）で、同じQwen3.8 Flash Next UD-IQ3_XXSをMI50＋CPUの自動配置、MTPなし、温度0、seed 1234で実行した。固定5問の第4問だけを会話テンプレート付きの新規会話として1回入力し、146トークンでEOS、サーバー終了コード0。返答はPythonコードのみ。実行結果は60.00 ms、27.00 ms、55.00%で、数値を述べる説明文は付かなかった。統合版の5問を通した試行とは会話履歴と実行構成が異なるため、この1回から説明文の数値誤りの原因は判断しない。[返答全文](/home/t-saka/rocm-stock-q4-single-turn-20261127/response.txt) · [実行設定](/home/t-saka/rocm-stock-q4-single-turn-20261127/settings.json)
+
 ### Strataと次層Router読み戻し取り込み前の測定
 
 `codex/rocm-integrated-test` の `7e9dbd296` を増分ビルドし、固定3幅、4K、生成上限512、会話KV再利用で5問を1回計測した。catch-up統合、CPU Expert、IQ3_XXS LDS先読み・4行を維持し、GPUプロファイラーなし。ビルド・サーバーとも終了コード0。全5問EOS、MTP採用759/1,164、応答中スワップアウト0。[今回の実測](/home/t-saka/rocm-integrated-sweep-20261126/session-batch-01) · [ビルドログ](/home/t-saka/rocm-integrated-sweep-20261126/build.log)
