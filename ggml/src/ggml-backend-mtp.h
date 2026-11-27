@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 
 extern "C" {
+GGML_API void ggml_backend_sched_set_hip_return_dst_wait_skip(bool enabled);
 GGML_API void ggml_backend_sched_set_hip_single_miss_cpu(int mode);
 GGML_API int ggml_backend_sched_get_hip_single_miss_cpu_mode(void);
 GGML_API int ggml_backend_sched_get_hip_single_miss_inputs(ggml_backend_sched_t sched,

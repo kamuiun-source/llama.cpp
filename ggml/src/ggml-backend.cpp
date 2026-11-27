@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-mtp.h"
+#include "ggml-backend-hip-return-wait.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1573,6 +1574,9 @@ struct ggml_backend_sched {
     size_t hip_return_h2d_applied;
     size_t hip_return_h2d_fallback;
     size_t hip_return_h2d_waits;
+    ggml_backend_cuda_return_stream_ordered_t hip_return_ordered_stream;
+    ggml_backend_hip_return_wait_stats hip_return_wait_stats[2];
+    bool hip_return_wait_pending_mode;
     ggml_backend_hip_verify_trace * hip_verify_trace;
     size_t mapped_hip_input_producers;
     size_t mapped_hip_input_after_shared_producers;
@@ -2984,7 +2988,13 @@ struct ggml_backend_sched_mapped_hip_input {
 
 static void ggml_backend_sched_wait_hip_return_h2d(ggml_backend_sched_t sched) {
     if (sched->hip_return_h2d_pending) {
+        auto & stats = sched->hip_return_wait_stats[sched->hip_return_wait_pending_mode];
+        const int64_t start = sched->trace_hip_handoff_wait ? ggml_time_us() : 0;
         ggml_backend_event_synchronize(sched->hip_return_h2d_event);
+        if (start) {
+            stats.slab_event_trace_us += ggml_time_us() - start;
+        }
+        ++stats.slab_event_waits;
         sched->hip_return_h2d_pending = nullptr;
         ++sched->hip_return_h2d_waits;
     }
@@ -3071,6 +3081,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    const bool mapped_return = use_hip_return && hip_return->mapped && sched->target_mtp_verify_three;
+    const bool return_wait_mode = mapped_return && hip_return_dst_wait_skip.load(std::memory_order_relaxed);
+    auto & return_wait_stats = sched->hip_return_wait_stats[return_wait_mode];
+    const bool ordered_return = return_wait_mode && sched->n_copies == 1 &&
+            !sched->events[split_backend_id][sched->cur_copy] && !split->has_custom &&
+            sched->hip_return_ordered_stream && sched->hip_return_ordered_stream(split_backend) &&
+            ggml_backend_hip_return_can_queue_h2d(split_backend, sched->hip_return_h2d_event);
+
     const bool weight_callback = sched->callback_copy && ggml_backend_sched_is_host_weight(input);
     const bool expert_wait_candidate = (sched->async_hip_input || sched->measure_expert_copy_wait) &&
             weight_callback && host_copies &&
@@ -3086,7 +3104,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         GGML_ASSERT(!sched->deferred_expert_copy_backend);
         sched->deferred_expert_copy_backend = split_backend;
         sched->deferred_expert_copy_start_us = sched->measure_expert_copy_wait ? ggml_time_us() : 0;
-    } else {
+    } else if (!ordered_return) {
         // Finish earlier uses of the destination before overwriting it.
         const int64_t wait_start = captured_router && sched->measure_expert_copy_wait ? ggml_time_us() : 0;
         handoff.destination_wait([&] {
@@ -3096,6 +3114,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                 ggml_backend_synchronize(split_backend);
             }
         });
+        if (mapped_return) {
+            ++return_wait_stats.destination_first_waits;
+            return_wait_stats.destination_first_us += handoff.destination_wait_us;
+        }
         if (wait_start) {
             ++sched->expert_copy_wait_before;
             sched->expert_copy_wait_before_us += ggml_time_us() - wait_start;
@@ -3149,7 +3171,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         const int64_t mi50_done_us = combine_single_miss ? ggml_time_us() : 0;
         const bool skip_hip_wait = sched->skip_hip_device_dst_wait && cuda_hip_pair && ggml_are_same_layout(input, input_cpy);
         const char * host_path = "host";
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        if (ordered_return) {
+            ++return_wait_stats.applied;
+        } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             handoff.destination_wait([&] { ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]); });
         } else if (sched->n_copies == 1 &&
                 (skip_hip_wait || (sched->batch_device_inputs && ggml_backend_sched_is_cuda_vulkan_pair(input_backend, split_backend))) &&
@@ -3163,13 +3187,23 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             }
         } else {
             handoff.destination_wait([&] { ggml_backend_synchronize(split_backend); });
+            if (mapped_return) {
+                ++return_wait_stats.destination_second_waits;
+                return_wait_stats.destination_second_us += handoff.destination_second_end_us - handoff.destination_second_us;
+            }
+        }
+        if (mapped_return) {
+            ++return_wait_stats.source_waits;
+            return_wait_stats.source_us += handoff.source_wait_us;
+            return_wait_stats.fallback += return_wait_mode && !ordered_return;
         }
         if (use_hip_return) {
+            GGML_ASSERT(!sched->hip_return_h2d_pending);
             if (combine_single_miss) {
                 const float * result = correction->resolve(correction->user_data, mi50_done_us);
                 GGML_ASSERT(result);
                 const int64_t combine_start = ggml_time_us();
-                // Both GPU readers and writers of this return slot have completed.
+                // The previous H2D and the mapped HIP write to this slot have completed.
                 auto * output = reinterpret_cast<float *>(hip_return->data);
                 for (int t = 0; t < 3; ++t) {
                     if (correction->mask & (1u << t)) {
@@ -3186,18 +3220,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             handoff.read_start_us = hip_return->enqueue_start_us;
             handoff.read_end_us = hip_return->enqueue_end_us;
             bool async_h2d = false;
-            if (hip_return->mapped && sched->target_mtp_verify_three) {
-                auto & event = sched->hip_return_h2d_event;
-                if (!event && split_backend->iface.set_tensor_async) {
-                    event = ggml_backend_event_new(split_backend->device);
-                }
-                async_h2d = event && event->device == split_backend->device && split_backend->iface.set_tensor_async;
+            if (mapped_return) {
+                async_h2d = ordered_return || ggml_backend_hip_return_can_queue_h2d(split_backend, sched->hip_return_h2d_event);
                 if (async_h2d) {
                     handoff.write([&] {
                         ggml_backend_tensor_set_async(split_backend, input_cpy, hip_return->data, 0, bytes);
-                        ggml_backend_event_record(event, split_backend);
+                        ggml_backend_event_record(sched->hip_return_h2d_event, split_backend);
                     });
                     sched->hip_return_h2d_pending = split_backend;
+                    sched->hip_return_wait_pending_mode = return_wait_mode;
                     ++sched->hip_return_h2d_applied;
                 } else {
                     ++sched->hip_return_h2d_fallback;
@@ -3209,7 +3240,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_sched_record_hip_handoff(sched, input_backend, 1, bytes, true, handoff,
                     false, !hip_return->mapped, false, hip_return->mapped);
             ggml_backend_sched_log_handoff(sched, split, input_backend, split_backend, &trace_input, 1,
-                    bytes, handoff, async_h2d ? "host_dual_pinned_mapped_return_async_h2d" :
+                    bytes, handoff, ordered_return ? "host_dual_pinned_mapped_return_ordered_h2d" :
+                    async_h2d ? "host_dual_pinned_mapped_return_async_h2d" :
                     hip_return->mapped ? "host_dual_pinned_mapped_return" : "host_dual_pinned_async_return");
             return;
         }
@@ -3714,6 +3746,7 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
         // Keep the ordinary synchronous bulk path for every other input layout and backend.
         handoff.source_wait([&] { ggml_backend_synchronize(src_backend); });
         if (sched->hip_return_h2d_pending == src_backend) {
+            ++sched->hip_return_wait_stats[sched->hip_return_wait_pending_mode].slab_stream_drains;
             sched->hip_return_h2d_pending = nullptr;
         }
         handoff.destination_wait([&] { ggml_backend_synchronize(dst_backend); });
@@ -4319,7 +4352,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 split_id > 0 && !profile.enabled && !sched->callback_eval) {
             const auto & routed = splits[split_id - 1];
             if (ggml_backend_sched_plan_shared(sched, *split, splits[split_id - 1], true)) {
-                // The routed split is already submitted. The CUDA destination wait below joins this prefix.
+                // The routed split is already submitted. The CUDA return joins this prefix by a wait or stream order.
                 const int64_t start = sched->trace_handoff_graph ? ggml_time_us() : 0;
                 const auto status = ggml_backend_graph_compute_async(split_backend, &split->shared_prefix);
                 if (status != GGML_STATUS_SUCCESS) {
@@ -4883,7 +4916,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
     if (cuda_hip && async_hip_return && strcmp(async_hip_return, "1") == 0) {
         sched->async_hip_return = sched->dual_pinned_hip_handoff;
-        if (!sched->async_hip_return) {
+        if (sched->async_hip_return) {
+            sched->hip_return_ordered_stream = ggml_backend_hip_return_ordered_stream(backends, n_backends);
+        } else {
             GGML_LOG_WARN("packed HIP MTP3 async return requires dual-pinned handoff\n");
         }
     }
@@ -5212,6 +5247,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched->async_hip_return) {
         GGML_LOG_INFO("packed HIP MTP3 async return H2D: applied=%zu fallback=%zu reuse_waits=%zu\n",
                 sched->hip_return_h2d_applied, sched->hip_return_h2d_fallback, sched->hip_return_h2d_waits);
+        sched->hip_return_wait_stats[0].log(false);
+        sched->hip_return_wait_stats[1].log(true);
     }
     if (sched->async_hip_mtp4_input && sched->hip_mtp4_input_stats.ops) {
         const auto & stats = sched->hip_mtp4_input_stats;
@@ -5393,7 +5430,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     // The shared input upload is complete, so cleanup no longer needs its backend.
     sched->shared_input_pending = false;
     sched->hip_async_input_pending = nullptr;
-    sched->hip_return_h2d_pending = nullptr;
+    if (sched->hip_return_h2d_pending) {
+        ++sched->hip_return_wait_stats[sched->hip_return_wait_pending_mode].slab_stream_drains;
+        sched->hip_return_h2d_pending = nullptr;
+    }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
