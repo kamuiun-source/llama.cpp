@@ -296,6 +296,7 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool profile = false);
     void get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const;
     llama_expert_round_stats get_expert_round_stats() const;
+    llama_cpu_expert_join_snapshot get_cpu_expert_join_snapshot() const;
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(

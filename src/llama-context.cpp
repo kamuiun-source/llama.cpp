@@ -3776,6 +3776,10 @@ void llama_context::get_sched_telemetry(uint64_t & graphs, uint64_t & splits) co
     splits = telemetry_splits;
 }
 
+llama_cpu_expert_join_snapshot llama_context::get_cpu_expert_join_snapshot() const {
+    return moe_cache ? moe_cache->cpu_expert_join_snapshot() : llama_cpu_expert_join_snapshot{};
+}
+
 llama_expert_round_stats llama_context::get_expert_round_stats() const {
     return moe_cache ? moe_cache->round_stats() : llama_expert_round_stats{};
 }
@@ -5919,6 +5923,10 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 
 void llama_get_sched_telemetry(const llama_context * ctx, uint64_t & graphs, uint64_t & splits) {
     ctx->get_sched_telemetry(graphs, splits);
+}
+
+llama_cpu_expert_join_snapshot llama_get_cpu_expert_join_snapshot(const llama_context * ctx) {
+    return ctx->get_cpu_expert_join_snapshot();
 }
 
 llama_expert_round_stats llama_get_expert_round_stats(const llama_context * ctx) {

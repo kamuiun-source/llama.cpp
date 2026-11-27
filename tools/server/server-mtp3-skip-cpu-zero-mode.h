@@ -2,9 +2,11 @@
 
 #include "../../ggml/src/ggml-hip-mtp3-skip-cpu-zero.h"
 #include "ggml-backend.h"
+#include "src/llama-ext.h"
 #include "llama.h"
 #include "log.h"
 
+#include <cinttypes>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -54,5 +56,17 @@ inline void server_refresh_mtp3_skip_cpu_zero_mode(llama_context * target, llama
         set_mode(requested != 0);
         active = requested;
         LOG_INF("HIP MTP3 CPU zero-slot skip mode applied: %s\n", active ? "on" : "off");
+    }
+}
+
+inline void server_log_cpu_expert_join_response(const llama_context * target, uint64_t response) {
+    const auto snapshot = llama_get_cpu_expert_join_snapshot(target);
+    for (const auto & stats : snapshot.groups) {
+        LOG_INF("cpu_expert_join_response: response=%" PRIu64 " skip_cpu_zero=%s jobs=%d cumulative=1"
+                " queued=%" PRIu64 " joined=%" PRIu64 " join_waited=%" PRIu64 " join_wait_us=%" PRIu64
+                " pending_at_mi50=%" PRIu64 " remaining_after_mi50_us=%" PRIu64 "\n",
+                response, snapshot.skip_cpu_zero ? "on" : "off", stats.jobs,
+                stats.queued, stats.joined, stats.join_waited, stats.join_wait_us, stats.pending_at_mi50,
+                stats.remaining_after_mi50_us);
     }
 }

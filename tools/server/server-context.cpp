@@ -289,6 +289,7 @@ struct server_decode_telemetry {
             if (kind == server_step && !owner.pending_response.empty()) {
                 SRV_INF("decode_response_begin: %s\n", owner.pending_response.c_str());
                 owner.log_and_reset();
+                server_log_cpu_expert_join_response(ctx, owner.response_index);
                 SRV_INF("decode_response_end: response=%" PRIu64 "\n", owner.response_index);
                 owner.pending_response.clear();
             }

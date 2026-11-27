@@ -235,6 +235,23 @@ struct llama_expert_staging_telemetry {
     uint64_t map_us = 0;
 };
 LLAMA_API llama_expert_staging_telemetry llama_get_expert_staging_telemetry();
+struct llama_cpu_expert_join_stats {
+    int jobs = 0; // Zero is the total across job counts.
+    uint64_t queued = 0;
+    uint64_t joined = 0;
+    uint64_t join_waited = 0;
+    uint64_t join_wait_us = 0;
+    uint64_t pending_at_mi50 = 0;
+    uint64_t remaining_after_mi50_us = 0;
+};
+
+struct llama_cpu_expert_join_snapshot {
+    bool skip_cpu_zero = false;
+    std::vector<llama_cpu_expert_join_stats> groups;
+};
+
+// Cumulative counters, read on the target's decode thread at a response boundary.
+LLAMA_API llama_cpu_expert_join_snapshot llama_get_cpu_expert_join_snapshot(const llama_context * ctx);
 LLAMA_API int64_t llama_set_expert_prompt_trace_request(int64_t request);
 
 struct llama_expert_round_stats {

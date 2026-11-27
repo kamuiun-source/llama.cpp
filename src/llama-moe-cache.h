@@ -9,6 +9,7 @@
 struct llama_model;
 struct llama_ubatch;
 struct llama_expert_round_stats;
+struct llama_cpu_expert_join_snapshot;
 class llama_rtx_expert;
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
@@ -44,6 +45,7 @@ public:
     void record_decode_width(uint32_t tokens);
     void finish_pending_promotion();
     llama_expert_round_stats round_stats() const;
+    llama_cpu_expert_join_snapshot cpu_expert_join_snapshot() const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)

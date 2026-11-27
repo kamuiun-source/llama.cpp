@@ -4796,6 +4796,34 @@ void llama_moe_cache::finish_pending_promotion() {
     pimpl->finish_hip_mtp_promotion();
 }
 
+llama_cpu_expert_join_snapshot llama_moe_cache::cpu_expert_join_snapshot() const {
+    llama_cpu_expert_join_snapshot snapshot;
+    const auto & cpu = pimpl->single_miss_cpu;
+    if (!cpu || !pimpl->skip_cpu_zero_mode) {
+        return snapshot;
+    }
+
+    snapshot.skip_cpu_zero = pimpl->skip_cpu_zero_mode(pimpl->placement->target) > 0;
+    const int max_jobs = cpu->budget.jobs();
+    snapshot.groups.reserve(max_jobs + 1);
+    auto & total = snapshot.groups.emplace_back();
+    for (int n = 1; n <= max_jobs; ++n) {
+        const auto & stats = cpu->jobs[n];
+        if (stats.applied == 0) {
+            continue;
+        }
+        total.queued += stats.applied;
+        total.joined += stats.joined;
+        total.join_waited += stats.waited;
+        total.join_wait_us += stats.join_us;
+        total.pending_at_mi50 += stats.outstanding_at_mi50;
+        total.remaining_after_mi50_us += stats.remaining_after_mi50_us;
+        snapshot.groups.push_back({ n, stats.applied, stats.joined, stats.waited, uint64_t(stats.join_us),
+                stats.outstanding_at_mi50, uint64_t(stats.remaining_after_mi50_us) });
+    }
+    return snapshot;
+}
+
 llama_expert_round_stats llama_moe_cache::round_stats() const {
     const auto & self = *pimpl;
     return {
