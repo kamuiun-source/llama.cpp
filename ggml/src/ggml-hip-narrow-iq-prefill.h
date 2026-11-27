@@ -4,6 +4,7 @@
 
 namespace ggml_hip_narrow_iq_prefill {
 
+inline constexpr char d4_env[] = "GGML_HIP_GFX906_IQ_MMVQ_D4_ACTIVATION";
 inline constexpr char env[] = "GGML_HIP_GFX906_IQ_MMVQ_PRESERVE_FRACTION";
 inline constexpr int32_t lookup_tag = 0x4e495150;
 

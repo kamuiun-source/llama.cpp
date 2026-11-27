@@ -2188,7 +2188,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static const bool iq_prefill_mode_configured = [] {
         const char * mode_file = std::getenv(ggml_gpu_output_modes::mode_file_env);
         const char * mode = std::getenv(ggml_hip_narrow_iq_prefill::env);
-        return (mode_file && *mode_file) || (mode && std::strcmp(mode, "1") == 0);
+        const char * d4_mode = std::getenv(ggml_hip_narrow_iq_prefill::d4_env);
+        return (mode_file && *mode_file) || (mode && std::strcmp(mode, "1") == 0) ||
+               (d4_mode && std::strcmp(d4_mode, "1") == 0);
     }();
     gparams.narrow_iq_prefill = iq_prefill_mode_configured && narrow_prefill && ubatch.n_tokens <= 2 &&
         model.arch == LLM_ARCH_QWEN4EXP && moe_cache;

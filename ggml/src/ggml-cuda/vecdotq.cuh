@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "iq-prefill-scale.cuh"
+#include "iq-prefill-activation.cuh"
 
 #include <cstdint>
 
@@ -1205,9 +1206,9 @@ static __device__ __forceinline__ iq2_s_mmvq_weights load_iq_mmvq_weights(const 
     return {get_int_b2(bq2.qs, group), get_int_b2(bq2.qs, QK_K/32 + group), bq2.qh[group], bq2.scales[group], bq2.d};
 }
 
-template <bool packed_signs, bool preserve_fraction = false>
+template <bool packed_signs, bool preserve_fraction = false, typename Activation = block_q8_1>
 static __device__ __forceinline__ float vec_dot_iq_q8_1_loaded(
-        const iq2_s_mmvq_weights & weight, const block_q8_1 & activation, const uint64_t * grid) {
+        const iq2_s_mmvq_weights & weight, const Activation & activation, const uint64_t * grid) {
     const uint8_t * qs = (const uint8_t *) &weight.qs;
     const uint8_t * signs_packed_8 = (const uint8_t *) &weight.signs;
     const int qh = weight.qh;
@@ -1243,7 +1244,7 @@ static __device__ __forceinline__ float vec_dot_iq_q8_1_loaded(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const float d = __half2float(weight.d) * __low2float(activation.ds);
+    const float d = __half2float(weight.d) * ggml_hip_narrow_iq_prefill::activation_scale(activation);
     if constexpr (preserve_fraction) {
         return ggml_hip_narrow_iq_prefill::iq2_scaled_dot(sumi0, sumi1, ls0, ls1, d);
     }
@@ -1283,9 +1284,9 @@ static __device__ __forceinline__ void vec_dot_iq2_s_q8_1_pair(
     gate_sum += (__half2float(gate.d) * activation_d) * gate_scaled;
 }
 
-template <bool packed_signs, bool preserve_fraction = false>
+template <bool packed_signs, bool preserve_fraction = false, typename Activation = block_q8_1>
 static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+        const void * __restrict__ vbq, const Activation * __restrict__ bq8_1, const int & kbx, const int & iqs) {
     const auto * bq2 = static_cast<const block_iq2_s *>(vbq) + kbx;
     return vec_dot_iq_q8_1_loaded<packed_signs, preserve_fraction>(load_iq_mmvq_weights(*bq2, iqs), bq8_1[iqs/2], iq2s_grid);
 }
@@ -1304,9 +1305,9 @@ static __device__ __forceinline__ iq3_xxs_mmvq_weights load_iq_mmvq_weights(cons
         uint32_t(get_int_b2(bq3.qs, QK_K/16 + iqs/2)), bq3.d};
 }
 
-template <bool packed_signs, bool preserve_fraction = false>
+template <bool packed_signs, bool preserve_fraction = false, typename Activation = block_q8_1>
 static __device__ __forceinline__ float vec_dot_iq_q8_1_loaded(
-        const iq3_xxs_mmvq_weights & weight, const block_q8_1 & activation, const uint32_t * grid) {
+        const iq3_xxs_mmvq_weights & weight, const Activation & activation, const uint32_t * grid) {
     const uint8_t * q3 = (const uint8_t *) &weight.qs;
     const uint32_t aux32 = weight.aux;
 
@@ -1336,16 +1337,16 @@ static __device__ __forceinline__ float vec_dot_iq_q8_1_loaded(
     }
 
     const int ls = aux32 >> 28;
-    const float d = __half2float(weight.d) * __low2float(activation.ds);
+    const float d = __half2float(weight.d) * ggml_hip_narrow_iq_prefill::activation_scale(activation);
     if constexpr (preserve_fraction) {
         return ggml_hip_narrow_iq_prefill::iq3_scaled_dot(sumi, ls, d);
     }
     return d * ((ls*sumi + sumi/2)/2);
 }
 
-template <bool packed_signs, bool preserve_fraction = false>
+template <bool packed_signs, bool preserve_fraction = false, typename Activation = block_q8_1>
 static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+        const void * __restrict__ vbq, const Activation * __restrict__ bq8_1, const int & kbx, const int & iqs) {
     const auto * bq3 = static_cast<const block_iq3_xxs *>(vbq) + kbx;
     return vec_dot_iq_q8_1_loaded<packed_signs, preserve_fraction>(load_iq_mmvq_weights(*bq3, iqs), bq8_1[iqs/2], iq3xxs_grid);
 }
