@@ -6118,6 +6118,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__linux__)
+#include "hip-return-wait.cuh"
+
 static bool ggml_backend_cuda_graph_mapped_hc_input(ggml_backend_t backend, ggml_cgraph * graph, uint64_t uid,
         const ggml_tensor * producer, void * mapped, enum ggml_status * status) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
@@ -7776,6 +7778,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_get_host_mapping") == 0) {
         return (void *)ggml_backend_cuda_get_host_mapping;
+    }
+    if (strcmp(name, "ggml_backend_cuda_return_stream_ordered") == 0) {
+        return (void *)ggml_backend_cuda_return_stream_ordered;
     }
     if (strcmp(name, "ggml_backend_cuda_graph_mapped_hc_input") == 0) {
         return (void *)ggml_backend_cuda_graph_mapped_hc_input;
