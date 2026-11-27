@@ -1,4 +1,7 @@
 #include "llama-context.h"
+
+#include "../ggml/src/ggml-gpu-output-modes.h"
+#include "../ggml/src/ggml-hip-narrow-iq-prefill.h"
 #include "llama-mtp-catchup.h"
 
 #include "ggml.h"
@@ -2165,7 +2168,7 @@ bool llama_context::set_adapter_cvec(
 static constexpr uint32_t mtp_draft_graph_cache_max_tokens = 8;
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret,
-        bool profile, bool draft_cache_eligible) {
+        bool profile, bool draft_cache_eligible, bool narrow_prefill) {
     auto * stage_sched = target_mtp_verify_width == 3 && ubatch.n_tokens == 3 ? sched.get() : nullptr;
     const int64_t stage_prepare = ggml_backend_sched_hip_verify_stage_time(stage_sched);
     if (mctx && !mctx->apply()) {
@@ -2182,6 +2185,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = get_gf_res_prev();
     auto gparams = graph_params(res, ubatch, mctx, gtype);
+    static const bool iq_prefill_mode_configured = [] {
+        const char * mode_file = std::getenv(ggml_gpu_output_modes::mode_file_env);
+        const char * mode = std::getenv(ggml_hip_narrow_iq_prefill::env);
+        return (mode_file && *mode_file) || (mode && std::strcmp(mode, "1") == 0);
+    }();
+    gparams.narrow_iq_prefill = iq_prefill_mode_configured && narrow_prefill && ubatch.n_tokens <= 2 &&
+        model.arch == LLM_ARCH_QWEN4EXP && moe_cache;
     const bool next_router_prefetch = moe_cache && moe_cache->next_router_prefetch_enabled();
     gparams.trace_next_router = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_expert_used() == 10 &&
             model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed && target_mtp_verify_width == 3 &&
@@ -2917,7 +2927,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
         }
         ggml_backend_sched_hip_verify_stage_record(stage_sched, "decode_prepare", stage_decode_prepare, true);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
-                decode_profile && n_tokens_all == 1, !prefill && n_tokens_all <= mtp_draft_graph_cache_max_tokens);
+                decode_profile && n_tokens_all == 1, !prefill && n_tokens_all <= mtp_draft_graph_cache_max_tokens,
+                prefill && !use_wide_prefill);
         stage_decode_outputs = ggml_backend_sched_hip_verify_stage_time(stage_sched);
         expert_trace.success = res != nullptr;
 

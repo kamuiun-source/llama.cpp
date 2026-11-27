@@ -842,6 +842,7 @@ struct llm_graph_params {
     bool target_mtp_verify_packed = false;
     bool trace_next_router = false;
     int next_router_score_mode = 0;
+    bool narrow_iq_prefill = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -922,6 +923,7 @@ struct llm_graph_params {
             target_mtp_verify_packed == other.target_mtp_verify_packed &&
             trace_next_router == other.trace_next_router &&
             next_router_score_mode == other.next_router_score_mode &&
+            narrow_iq_prefill == other.narrow_iq_prefill &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1098,6 +1100,7 @@ struct llm_graph_context {
     const llama_moe_cache        * moe_cache;
     const bool target_mtp_verify_three;
     const bool target_mtp_verify_packed;
+    const bool narrow_iq_prefill;
 
     const llama_prec_policy * prec_policy;
 

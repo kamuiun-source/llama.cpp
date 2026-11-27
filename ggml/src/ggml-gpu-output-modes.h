@@ -22,6 +22,7 @@ enum flag : unsigned {
     gdn_gated_norm,
     concat_small,
     unary_mul_bcast,
+    iq_mmvq_preserve_fraction,
     count,
 };
 
@@ -38,6 +39,7 @@ inline constexpr std::array<std::string_view, count> names{{
     "GGML_CUDA_GDN_GATED_NORM",
     "GGML_CUDA_CONCAT_SMALL",
     "GGML_CUDA_UNARY_MUL_BCAST",
+    "GGML_HIP_GFX906_IQ_MMVQ_PRESERVE_FRACTION",
 }};
 
 constexpr uint32_t bit(unsigned index) {
@@ -49,7 +51,7 @@ constexpr uint32_t pack(uint32_t present, uint32_t enabled) {
 }
 
 constexpr uint32_t common_bits = bit(concat_small) | bit(unary_mul_bcast);
-constexpr uint32_t gfx906_bits = bit(hc_down_split_k) - 1;
+constexpr uint32_t gfx906_bits = (bit(hc_down_split_k) - 1) | bit(iq_mmvq_preserve_fraction);
 constexpr uint32_t ada_bits = bit(hc_down_split_k) | bit(gdn_gated_norm);
 constexpr uint32_t hip_bits = common_bits | gfx906_bits;
 constexpr uint32_t cuda_bits = common_bits | ada_bits;

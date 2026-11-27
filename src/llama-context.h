@@ -163,7 +163,8 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret,
                               bool   profile = false,
-                              bool   draft_cache_eligible = false);
+                              bool   draft_cache_eligible = false,
+                              bool   narrow_prefill = false);
 
     bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
     bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }

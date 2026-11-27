@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 #include "../ggml/src/ggml-hip-iq3-strata-plan.h"
+#include "../ggml/src/ggml-hip-narrow-iq-prefill.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1597,6 +1598,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     target_mtp_verify_three(params.target_mtp_verify_three),
     target_mtp_verify_packed(params.target_mtp_verify_packed),
+    narrow_iq_prefill(params.narrow_iq_prefill),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2831,6 +2833,9 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, cold ? "ffn_moe_cold_slots" : "ffn_moe_slots", il);
+    if (narrow_iq_prefill && !cold && prefill_wave < 0 && selected_experts->ne[0] == 10) {
+        slots->op_params[0] = ggml_hip_narrow_iq_prefill::lookup_tag;
+    }
     static const bool shared_iq3_weights = [] {
         const char * value = std::getenv("GGML_HIP_GFX906_MTP3_IQ3_XXS_SHARE_WEIGHTS");
         return value && std::strcmp(value, "1") == 0;
