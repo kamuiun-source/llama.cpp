@@ -20,6 +20,7 @@
 #include "src/llama-next-router-readback.h"
 #include "server-iq3-strata-mode.h"
 #include "server-mtp-catchup-mode.h"
+#include "server-mtp-fixed-replay.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1829,6 +1830,7 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    server_mtp_fixed_replay mtp_fixed_replay;
     bool mtp_logit_trace = false;
     bool mtp_logit_match_drafts = false;
     llama_tokens mtp_logit_reference;
@@ -3248,6 +3250,10 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (mtp_fixed_replay.active(slot.task->id)) {
+            mtp_fixed_replay.finish(slot.stats.n_gen, slot.stats.n_draft_tokens, slot.stats.n_draft_accepted,
+                    slot.stop, slot.generated_tokens);
+        }
         if (server_mtp_vocab_stats_enabled()) {
             if (slots.size() != 1) {
                 SLT_WRN(slot, "%s", "mtp_vocab_request: unsupported_parallel=1\n");
@@ -4013,6 +4019,25 @@ private:
                         server_refresh_iq_strata_mode<true>(ctx_tgt, ctx_dft);
                         llama_refresh_next_router_readback_mode();
                         server_mtp_catchup_first_draft(true, ctx_tgt, ctx_dft);
+                    }
+                    if (task.type == SERVER_TASK_TYPE_COMPLETION && server_mtp_fixed_replay::mode_path()) {
+                        try {
+                            const auto & sampling = task.params.sampling;
+                            const bool supported = slots.size() == 1 && spec && !slot->mtp_adaptive && !mtp_logit_trace &&
+                                    !task.is_parent() && !task.tokens.has_mtmd && !task.params.stream && task.params.return_tokens &&
+                                    sampling.temp == 0 && sampling.grammar.empty() && !sampling.n_probs &&
+                                    !params_base.speculative.has_synth() && !params_base.speculative.draft.probabilistic &&
+                                    llama_supports_mtp_verify_three(ctx_tgt) && common_speculative_n_max(spec.get()) == 2 &&
+                                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) >= 2 &&
+                                    ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+                            const llama_tokens empty_prompt;
+                            const auto & prompt = task.tokens.has_mtmd ? empty_prompt : task.tokens.get_tokens();
+                            mtp_fixed_replay.begin(task.id, supported, prompt, task.params.n_predict,
+                                    llama_vocab_n_tokens(llama_model_get_vocab(model_tgt)));
+                        } catch (const std::exception & e) {
+                            send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
                     }
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
@@ -4928,6 +4953,13 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            if (mtp_fixed_replay.active(slot.task->id)) {
+                if (!draft.empty() && common_speculative_last_draft_type(spec.get(), slot.id) != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    throw std::runtime_error("MTP fixed replay: unexpected speculative draft type");
+                }
+                mtp_fixed_replay.drafts(slot.stats.n_gen, slot.prompt.tokens.pos_next(), slot.sampled, draft);
+            }
+
             if (mtp_logit_trace && (slot.n_remaining() <= 0 || draft.size() >= size_t(slot.n_remaining()))) {
                 throw std::runtime_error("MTP logit trace draft leaves no room for the final target sample");
             }
@@ -5772,6 +5804,23 @@ private:
             phase = server_decode_telemetry::verify;
         }
 
+        if (mtp_fixed_replay.active() && !prefill && view_width > 1 && slots[batch.tokens[off].id_slot].task &&
+                mtp_fixed_replay.active(slots[batch.tokens[off].id_slot].task->id)) {
+            const auto & slot = slots[batch.tokens[off].id_slot];
+            if (view_width > 3 || slot.spec_is_replay || slot.spec_i_batch.size() != size_t(view_width)) {
+                throw std::runtime_error("MTP fixed replay: unsupported verification batch");
+            }
+            llama_tokens ids;
+            const auto pos = batch.tokens[off].pos[0];
+            for (int i = 0; i < view_width; ++i) {
+                if (slot.spec_i_batch[i] != off + i || batch.tokens[off + i].pos[0] != pos + i) {
+                    throw std::runtime_error("MTP fixed replay: noncontiguous verification positions");
+                }
+                ids.push_back(batch.view.tokens.at(i).id);
+            }
+            mtp_fixed_replay.verify_batch(slot.stats.n_gen, pos, mtp_verify, ids);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -6067,6 +6116,9 @@ private:
                 }
             }
 
+            if (mtp_fixed_replay.active(slot.task->id)) {
+                id = mtp_fixed_replay.single(slot.stats.n_gen, batch.view.tokens.at(tok_idx).pos[0], id);
+            }
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
@@ -6149,7 +6201,19 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
-                if (mtp_logit_trace) {
+                const bool fixed_replay = mtp_fixed_replay.active(slot.task->id);
+                const auto position = fixed_replay ? batch.tokens.at(spec_i_batch.front()).pos[0] : -1;
+                if (fixed_replay && mtp_fixed_replay.replaying()) {
+                    const auto & chosen = mtp_fixed_replay.verify(trace_round, position, n_draft + 1, {});
+                    accepted = common_sampler_sample_and_accept_n_with(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
+                            [&](int32_t row, size_t index) {
+                                const auto natural = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, row);
+                                return mtp_fixed_replay.select(natural, chosen, index);
+                            });
+                    if (accepted != chosen) {
+                        throw std::runtime_error("MTP fixed replay: verify acceptance changed");
+                    }
+                } else if (mtp_logit_trace) {
                     if (use_rejection || (trace_replay && slot.use_spec_rejection())) {
                         throw std::runtime_error("MTP logit trace requires sample-and-match verification");
                     }
@@ -6179,6 +6243,9 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                if (fixed_replay && !mtp_fixed_replay.replaying()) {
+                    mtp_fixed_replay.verify(trace_round, position, n_draft + 1, accepted);
+                }
 
                 if (n_draft == 2 && !slot.spec_is_replay && llama_supports_mtp_verify_three(ctx_tgt) &&
                         common_speculative_last_draft_type(spec.get(), slot.id) == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
