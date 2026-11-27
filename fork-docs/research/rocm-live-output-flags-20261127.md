@@ -25,7 +25,7 @@
 ## 起動中に切り替える設定
 
 - `LLAMA_GPU_OUTPUT_MODE_FILE` はGPUカーネルの既存の環境変数名をキーとし、1行に1つ `名前=on` または `名前=off` を書く。未記載の項目は起動時の設定に従う。
-- `LLAMA_EXPERT_OUTPUT_MODE_FILE` には `NEXT_ROUTER_PREFETCH=on/off` と `HIP_PREFILL=on/off` を書く。必要な作業領域を起動時に確保するため、Docker起動時にファイルのパスを指定する。
+- `LLAMA_EXPERT_OUTPUT_MODE_FILE` には `NEXT_ROUTER_PREFETCH`、`HIP_PREFILL`、`SCRATCH_LRU` を `on/off` で指定できる。Docker起動時にファイルのパスを渡す。 `SCRATCH_LRU` の省略時はON。LRUだけの変更ではプロンプトキャッシュを消去しない。
 - CPU Expert、catch-up＋第1候補、IQ2_S・IQ3_XXS Strata、次層Router ID読み戻しは[既存のモードファイル](../teams/runtime-flags.md#linux-rocm固定3幅の採用設定)で切り替える。
 
 Dockerには個別ファイルの代わりにモードファイルを置くディレクトリをマウントする。待機中にファイルを同じディレクトリ内の一時ファイルから置き換え、次のリクエストで反映する。今回追加したモードを切り替えると、以前の設定で計算したプロンプトを再利用しないよう、対象・ドラフトのKVとサーバーのプロンプトキャッシュを消去する。モデルの配置と重みはそのまま使う。

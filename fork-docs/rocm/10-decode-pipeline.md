@@ -242,6 +242,8 @@ docker run --rm --gpus all \
 
 次層先読みを有効にすると、共有8枠、ヒット分のイベント待ち、現在層の投入後の先読み発行、実ミス優先が適用される。通常起動では `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT`、`LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH_AFTER_SUBMIT`、`LLAMA_EXPERT_HIP_NEXT_ROUTER_SCORE_FILTER` を未設定にする。必要転送後のホスト同期省略 `LLAMA_EXPERT_HIP_MTP3_ASYNC_DEMAND` と詳細ログ `LLAMA_EXPERT_HIP_MTP3_DEMAND_TRACE` も未設定にする。[採用設定と比較フラグ](../teams/runtime-flags.md#rocm統合ブランチの固定3幅)
 
+仮置き枠が満杯のときのLRUを、単一バンク・固定3幅・動的常駐・直接tuple DMAの通常起動で有効にする。従来のDocker起動設定で自動適用される。比較時は起動時に `LLAMA_EXPERT_OUTPUT_MODE_FILE` を指定し、待機中にファイルの `SCRATCH_LRU=off` を設定する。 `SCRATCH_LRU=on` または行の省略で既定動作に戻る。[採用の根拠となった固定リプレイ](../research/rocm-mtp3-scratch-lru.md#5問の履歴とmtp候補を固定した比較)
+
 直接DMAは、ROCmの単一バンク・固定3幅と `--load-mode none` で検証した。既存の `LLAMA_EXPERT_HIP_MTP3_DIRECT_RAM` は未設定または `0` にする。連続配置はモデル読み込み時に決まるため、切り替えるときはサーバーを起動し直す。計測用のExpertミス集計と詳細トレースは通常起動に含めない。
 
 RTXのQKV/gate結合 `GGML_CUDA_QKV_GATE_MERGE` とMMVQ詳細計測 `GGML_CUDA_MMVQ_TRACE` は通常起動で未設定にする。

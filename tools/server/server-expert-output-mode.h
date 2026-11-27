@@ -25,6 +25,15 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     static bool prefetch_unsupported = false;
     static bool prefill_unsupported = false;
 
+    const auto apply_scratch_lru = [&](int mode) {
+        const bool enabled = mode != 0;
+        const bool changed = llama_set_expert_scratch_lru(enabled);
+        if (changed || (mode >= 0 && scratch_lru_mode != mode)) {
+            LOG_INF("HIP Expert scratch LRU mode applied: SCRATCH_LRU=%s\n", enabled ? "on" : "off");
+        }
+        scratch_lru_mode = mode;
+    };
+
     std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
     char buffer[128];
     input.read(buffer, sizeof(buffer));
@@ -76,11 +85,6 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     const bool prefetch_changed = apply(llama_set_expert_hip_next_router_prefetch(target, want_prefetch),
             prefetch_unsupported, "NEXT_ROUTER_PREFETCH");
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
-    if (llama_set_expert_scratch_lru(want_scratch_lru == 1) || scratch_lru_mode != want_scratch_lru) {
-        if (want_scratch_lru >= 0 || scratch_lru_mode == 1) {
-            LOG_INF("HIP Expert scratch LRU mode applied: SCRATCH_LRU=%s\n", want_scratch_lru == 1 ? "on" : "off");
-        }
-    }
-    scratch_lru_mode = want_scratch_lru;
+    apply_scratch_lru(want_scratch_lru);
     return prefetch_changed || prefill_changed;
 }

@@ -8,9 +8,9 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
-- 仮置き枠LRUを固定3幅の同一履歴・MTP候補で再比較。OFF→ON→ON→OFF、各回527検証・提案1,054・採用686。通常H2Dバイトは合算54.3%減、本体1.331 ms/検証短縮。Expert状態が温まった後半組でも19.7%減、0.486 ms/検証短縮。既定OFF。[固定候補比較](../research/rocm-mtp3-scratch-lru.md#5問の履歴とmtp候補を固定した比較)
+- 仮置き枠LRUを固定3幅の同一履歴・MTP候補で再比較。OFF→ON→ON→OFF、各回527検証・提案1,054・採用686。通常H2Dバイトは合算54.3%減、本体1.331 ms/検証短縮。Expert状態が温まった後半組でも19.7%減、0.486 ms/検証短縮。2026-11-28に統合版で採用し、対象構成の通常起動を既定ONにした。比較時は既存のExpertモードファイルに `SCRATCH_LRU=off`。[固定候補比較](../research/rocm-mtp3-scratch-lru.md#5問の履歴とmtp候補を固定した比較)
 
-- 統合版 `8bb448c2e` から `codex/rocm-scratch-lru` を作成。固定3幅の仮置き枠が満杯のときだけ追い出し順をLRUにし、`LLAMA_EXPERT_OUTPUT_MODE_FILE` の `SCRATCH_LRU=off|on` をリクエスト間で切り替え。上限512の固定5問を同一サーバーのOFF→ON→ON→OFFで各2回測定。通常H2D 8,469→3,985件、本体31.76→31.49 ms/検証、生成59.45→62.84 tok/s。MTP採用率と生成IDは条件間で異なった。既定OFF。[実機比較](../research/rocm-mtp3-scratch-lru.md#固定3幅上限512の実モデル比較)
+- 統合版 `8bb448c2e` から `codex/rocm-scratch-lru` を作成。固定3幅の仮置き枠が満杯のときだけ追い出し順をLRUにし、`LLAMA_EXPERT_OUTPUT_MODE_FILE` の `SCRATCH_LRU=off|on` をリクエスト間で切り替え。上限512の固定5問を同一サーバーのOFF→ON→ON→OFFで各2回測定。通常H2D 8,469→3,985件、本体31.76→31.49 ms/検証、生成59.45→62.84 tok/s。MTP採用率と生成IDは条件間で異なった。試作時の既定はOFF。[実機比較](../research/rocm-mtp3-scratch-lru.md#固定3幅上限512の実モデル比較)
 
 - GPU間受け渡しとExpert転送の公開実装を調査。vLLMの非連続コピー一括発行、UCXとMoE-Infinityの完了管理、MoE-Infinityの計算窓ベース先読み予算を照合した。実ミス優先は採用済み。次に詰める候補は先読み発行のバイト予算と、MI50→RTXの宛先側同期の理由別計測。[調査メモ](../research/rocm-handoff-expert-transfer-20261127.md)
 

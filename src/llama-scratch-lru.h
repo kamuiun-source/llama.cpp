@@ -2,7 +2,7 @@
 
 #include <atomic>
 
-inline std::atomic<bool> llama_expert_scratch_lru_enabled{false};
+inline std::atomic<bool> llama_expert_scratch_lru_enabled{true};
 
 template <typename Iterator, typename Eligible, typename LastUsed>
 Iterator llama_expert_scratch_lru_victim(Iterator begin, Iterator end, Eligible eligible, LastUsed last_used, bool & changed) {

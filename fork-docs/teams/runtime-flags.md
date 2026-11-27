@@ -24,7 +24,7 @@ IQ2_S Strataは既存の符号復号とQ8_1入力共有を使い、同型のLDS�
 | --- | --- |
 | MTP | 本体の固定3位置一括検証 `LLAMA_MTP_VERIFY_THREE`、確定位置の隠れ状態をRTX内で渡す `LLAMA_MTP_FIXED3_DEVICE_PENDING`、catch-upと第1候補の統合 `CATCHUP_FIRST_DRAFT=on` |
 | CPU Expert | `SINGLE_MISS_CPU=on`。実ミスの一部をCPUで並列計算し、gate/upとdownの量子化済み入力を共有。残りはMI50で計算 |
-| Expert配置・転送 | `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY`、`LLAMA_EXPERT_HIP_TUPLE_DMA`、`LLAMA_EXPERT_HIP_PINNED_UPLOAD`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP`。原本のページ固定はLinuxで自動適用 |
+| Expert配置・転送 | `LLAMA_EXPERT_HIP_DYNAMIC_RESIDENCY`、`LLAMA_EXPERT_HIP_TUPLE_DMA`、`LLAMA_EXPERT_HIP_PINNED_UPLOAD`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION`、`LLAMA_EXPERT_HIP_MTP3_ASYNC_SLOT_MAP`。原本のページ固定はLinuxで自動適用。固定3幅の仮置き枠が満杯のときはLRUを自動適用 |
 | Expert先読み・プリフィル | `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH`、`LLAMA_EXPERT_HIP_PREFILL`。先読み8枠、実ミス優先、必要なヒットだけイベント待ち。対象層では現層のMI50投入後に次層Routerを発行 |
 | RTXとMI50の受け渡し | `GGML_SCHED_HIP_BATCH_DEVICE_INPUTS`、`GGML_SCHED_HIP_DUAL_PINNED_HANDOFF`、`GGML_SCHED_HIP_ASYNC_INPUT`、`GGML_SCHED_HIP_ASYNC_RETURN`、`GGML_SCHED_HIP_HOST_ROUTER_IDS`。対象形状で共有RAM直接書き込みと非同期の戻りを選択 |
 | RTX | Shared Expertの先行発行 `GGML_SCHED_HIP_SHARED_OVERLAP`。短いconcat `GGML_CUDA_CONCAT_SMALL`、SSMのsoftplusと係数乗算の融合 `GGML_CUDA_UNARY_MUL_BCAST`、GDNの正規化とゲートの融合 `GGML_CUDA_GDN_GATED_NORM` |
@@ -38,7 +38,7 @@ IQ2_S Strataは既存の符号復号とQ8_1入力共有を使い、同型のLDS�
 
 統合版のJSONLは設定切替・リクエスト境界・メモリ統計を記録する。応答JSONにある第1問16トークン目の `106806` / `159212` の分岐はcatch-upのON同士・OFF同士で再現した。原因の切り分けは同じ接頭辞でCPU Expertだけ変更し、競合する2語の本体logit、実際のExpert計算先、必要ならプリフィルのグループ幅を照合する。通常の `CATCHUP_FIRST_DRAFT=on` は維持。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行) · [catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
 
-`codex/rocm-integrated-test` に取り込んだ `codex/rocm-live-output-flags` の切り替え機構では、モデルの配置を共通にし、`LLAMA_GPU_OUTPUT_MODE_FILE` と `LLAMA_EXPERT_OUTPUT_MODE_FILE` でGPUカーネル、次層先読み、HIPプリフィルを待機中に切り替えられる。既存のCPU Expert、Strata、Router読み戻し、catch-upのモードファイルも併用できる。[切り替え手順と第4問の比較](../research/rocm-live-output-flags-20261127.md)
+`codex/rocm-integrated-test` に取り込んだ `codex/rocm-live-output-flags` の切り替え機構では、モデルの配置を共通にし、`LLAMA_GPU_OUTPUT_MODE_FILE` と `LLAMA_EXPERT_OUTPUT_MODE_FILE` でGPUカーネル、次層先読み、HIPプリフィル、仮置き枠LRUを待機中に切り替えられる。既存のCPU Expert、Strata、Router読み戻し、catch-upのモードファイルも併用できる。[切り替え手順と第4問の比較](../research/rocm-live-output-flags-20261127.md)
 
 ### MTP固定3幅の機能単体比較
 
@@ -96,6 +96,8 @@ Auto専用の採用済み改善は `GGML_SCHED_MTP_AUTO_RESET_SHARED_PLAN=1`、`
 `codex/rocm-expert-single-kernel-overlap` から採用した次層先読みは `LLAMA_EXPERT_HIP_NEXT_ROUTER_PREFETCH=1` で有効にする。共有8枠、必要なヒットだけのイベント待ち、現在層の投入後に先読みを発行する順序、実ミス優先が含まれる。単一バンク・固定3幅・直接tuple DMAの下で、非同期プリフィル `LLAMA_EXPERT_HIP_PREFILL=1` と非同期昇格 `LLAMA_EXPERT_HIP_MTP3_ASYNC_PROMOTION=1` を併用する。[Dockerの正式採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)
 
 通常はヒット待ち、後発行、スコアフィルター、必要転送後のホスト同期省略、詳細計測の各フラグを未設定にする。GPU間のストリーム通知は単体試験として記録している。[先読み併用時の計測](../rocm/09-single-bank-mtp3.md#非同期プリフィルと非同期昇格の併用) · [GPU間通知の単体試験](../rocm/10-decode-pipeline.md#mi50からrtxへのストリーム通知の単体試験)
+
+仮置き枠LRUは、単一バンク・固定3幅・動的常駐・直接tuple DMAの対象経路で既定ON。比較時は `LLAMA_EXPERT_OUTPUT_MODE_FILE` に `SCRATCH_LRU=off` を指定する。 `SCRATCH_LRU=on` または記載省略でON。[固定リプレイの計測](../research/rocm-mtp3-scratch-lru.md#5問の履歴とmtp候補を固定した比較)
 
 ### 次層Expert先読みの比較フラグ
 
