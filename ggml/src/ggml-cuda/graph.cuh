@@ -56,6 +56,7 @@ struct ggml_cuda_graph {
     const ggml_tensor * mapped_hc_output = nullptr;
     const void * mapped_hc_data = nullptr;
     int64_t last_used_time = 0;
+    uint32_t gpu_output_modes = 0;
 #ifdef GGML_USE_HIP
     int gfx906_lds_modes = -1;
     bool gfx906_iq2_strata = false;

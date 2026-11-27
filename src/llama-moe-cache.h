@@ -23,6 +23,10 @@ public:
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
     bool requires_slots(int32_t il) const;
+    bool wide_prefill_enabled() const;
+    bool hip_prefill_supported() const;
+    bool hip_prefill_enabled() const;
+    void set_hip_prefill(bool enabled);
     bool compact_prefill(int64_t n_tokens) const;
     ggml_tensor * build_compact_prefill(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * ids, int32_t il,
             ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, ggml_tensor * gate_up,
@@ -34,6 +38,8 @@ public:
     bool next_router_trace_active() const;
     void trace_next_router(int32_t il, const ggml_tensor * ids);
     bool next_router_prefetch_enabled() const;
+    bool next_router_prefetch_supported() const;
+    void set_next_router_prefetch(bool enabled);
     int next_router_score_mode() const;
     void begin_next_router_prefetch(ggml_backend_sched_t sched, const std::vector<ggml_tensor *> & predictions,
             const std::vector<ggml_tensor *> & scores);

@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "gpu-output-modes.cuh"
 
 #include <cstdlib>
 #include <stdint.h>
@@ -184,11 +185,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        static const bool use_small = [] {
-            const char * value = std::getenv("GGML_CUDA_CONCAT_SMALL");
-            return value && value[0] == '1' && value[1] == '\0';
-        }();
-        if (use_small && dim == 0 && dst->ne[0] > 0 && dst->ne[0] <= 32 &&
+        if (ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::concat_small>() && dim == 0 && dst->ne[0] > 0 && dst->ne[0] <= 32 &&
                 src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
                 dst->ne[1] > 0 && dst->ne[2] > 0) {
             const int64_t n = ggml_nelements(dst);

@@ -1279,6 +1279,30 @@ uint32_t llama_context::n_ubatch_reserve() const {
     return std::max(n_ubatch_prefill(), mtp_catchup_supported ? 4u : n_verify);
 }
 
+int llama_context::set_expert_hip_next_router_prefetch(bool enabled) {
+    if (!moe_cache || !moe_cache->next_router_prefetch_supported()) {
+        return enabled ? -1 : 0;
+    }
+    if (moe_cache->next_router_prefetch_enabled() == enabled) {
+        return 0;
+    }
+    synchronize();
+    moe_cache->set_next_router_prefetch(enabled);
+    return 1;
+}
+
+int llama_context::set_expert_hip_prefill(bool enabled) {
+    if (!moe_cache || !moe_cache->hip_prefill_supported()) {
+        return enabled ? -1 : 0;
+    }
+    if (moe_cache->hip_prefill_enabled() == enabled) {
+        return 0;
+    }
+    synchronize();
+    moe_cache->set_hip_prefill(enabled);
+    return 1;
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -2158,9 +2182,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = get_gf_res_prev();
     auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const bool next_router_prefetch = moe_cache && moe_cache->next_router_prefetch_enabled();
     gparams.trace_next_router = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_expert_used() == 10 &&
             model.hparams.n_expert_groups <= 1 && gparams.target_mtp_verify_packed && target_mtp_verify_width == 3 &&
-            !cparams.warmup && moe_cache && (moe_cache->next_router_trace_active() || moe_cache->next_router_prefetch_enabled());
+            !cparams.warmup && moe_cache && (moe_cache->next_router_trace_active() || next_router_prefetch);
     gparams.next_router_score_mode = gparams.trace_next_router ? moe_cache->next_router_score_mode() : 0;
     const auto rebind_graph = [&] {
         res = get_gf_res_prev();
@@ -2297,7 +2322,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
             }
         } prefetch{
-            !res->t_next_router.empty() && moe_cache->next_router_prefetch_enabled() ? moe_cache.get() : nullptr,
+            next_router_prefetch && !res->t_next_router.empty() ? moe_cache.get() : nullptr,
             !cparams.warmup && target_mtp_verify_width == 3 && gparams.target_mtp_verify_packed &&
                     moe_cache && moe_cache->next_router_profile_enabled() ? moe_cache.get() : nullptr,
             sched.get(), res, status,
@@ -2732,7 +2757,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool prefill, bool 
     memory_update(false);
 
     llama_memory_context_ptr mctx;
-    const uint32_t n_ubatch = prefill && prefill_wide ? n_ubatch_prefill() :
+    // Keep the reserved workspace. Narrow prompt graphs use the normal microbatch key.
+    const bool use_wide_prefill = prefill && prefill_wide && (!moe_cache || moe_cache->wide_prefill_enabled());
+    const uint32_t n_ubatch = use_wide_prefill ? n_ubatch_prefill() :
             mtp_catchup ? uint32_t(batch_inp.tokens.size()) : std::max(cparams.n_ubatch, target_mtp_verify_width);
 
     while (true) {
@@ -5867,6 +5894,14 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 int32_t llama_process_prefill_narrow(llama_context * ctx, llama_batch_ext * batch) {
     return ctx->decode(*batch, true, false);
+}
+
+int llama_set_expert_hip_next_router_prefetch(llama_context * ctx, bool enabled) {
+    return ctx->set_expert_hip_next_router_prefetch(enabled);
+}
+
+int llama_set_expert_hip_prefill(llama_context * ctx, bool enabled) {
+    return ctx->set_expert_hip_prefill(enabled);
 }
 
 bool llama_mtp_vocab_subset_enabled(const llama_context * ctx) {

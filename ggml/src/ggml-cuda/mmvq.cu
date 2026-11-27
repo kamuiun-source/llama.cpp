@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "hc-fused.cuh"
+#include "gpu-output-modes.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1509,48 +1510,21 @@ int ggml_hip_gfx906_lds_modes() {
     return gfx906_lds_modes.load(std::memory_order_relaxed);
 }
 
-static bool ggml_hip_gfx906_iq_sign_decode_configured() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_HIP_GFX906_IQ_SIGN_DECODE");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
+namespace output_modes = ggml_gpu_output_modes;
 
 static bool ggml_hip_gfx906_iq_sign_decode() {
-    return ggml_hip_gfx906_iq_sign_decode_configured() && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
-}
-
-static bool ggml_hip_gfx906_iq2_paired_dot() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_PAIRED_DOT");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-static bool ggml_hip_gfx906_iq2_lds_prefetch() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_LDS_PREFETCH");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-static bool ggml_hip_gfx906_iq2_no_lds_row_groups() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_HIP_GFX906_IQ2_S_NO_LDS_ROW_GROUPS");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
+    return output_modes::enabled<output_modes::iq_sign_decode>() &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20;
 }
 
 bool ggml_hip_gfx906_iq2_strata_enabled() {
     const int modes = ggml_hip_gfx906_lds_modes();
-    return iq2_strata_mode.load(std::memory_order_relaxed) && ggml_hip_gfx906_iq_sign_decode_configured() &&
-        ggml_hip_gfx906_iq2_paired_dot() &&
-        (modes >= 0 ? modes / gfx906_lds_mode_base == 0 :
-            !ggml_hip_gfx906_iq2_lds_prefetch() && !ggml_hip_gfx906_iq2_no_lds_row_groups());
+    const int legacy = modes < 0 ? -1 : modes / gfx906_lds_mode_base;
+    return iq2_strata_mode.load(std::memory_order_relaxed) &&
+        output_modes::enabled<output_modes::iq_sign_decode>() &&
+        output_modes::enabled<output_modes::iq2_paired_dot>() &&
+        !output_modes::enabled<output_modes::iq2_lds_prefetch>(legacy < 0 ? -1 : legacy != 0) &&
+        !output_modes::enabled<output_modes::iq2_no_lds_row_groups>(legacy < 0 ? -1 : 0);
 }
 #endif
 
@@ -1629,11 +1603,7 @@ static void mul_mat_vec_q_moe_launch(
 
 #ifdef GGML_USE_HIP
     if constexpr (type == GGML_TYPE_IQ4_NL) {
-        static const bool compact_decode = [] {
-            const char * value = std::getenv("GGML_HIP_GFX906_IQ4_NL_DOWN_COMPACT_DECODE");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        if (compact_decode && !has_fusion && !fusion.shared_up && ncols_x == 640 && nrows_x == 2560 &&
+        if (output_modes::enabled<output_modes::iq4_compact_decode>() && !has_fusion && !fusion.shared_up && ncols_x == 640 && nrows_x == 2560 &&
                 ncols_dst == 3 && nchannels_dst == 10 && nchannels_y.z == 10 &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_VEGA20) {
             ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, 0, 1, false, true>, launch_params,
@@ -1685,17 +1655,12 @@ static void mul_mat_vec_q_moe_launch(
             };
             bool use_no_lds_row_groups = false;
             if constexpr (type == GGML_TYPE_IQ2_S) {
-                use_no_lds_row_groups = live_lds_mode < 0 && ggml_hip_gfx906_iq2_no_lds_row_groups() && ncols_dst == 3 &&
+                use_no_lds_row_groups = output_modes::enabled<output_modes::iq2_no_lds_row_groups>(live_lds_mode < 0 ? -1 : 0) &&
+                    ncols_dst == 3 &&
                     nrows_x % (2*rows_per_block) == 0;
             }
-            static const bool lds_prefetch = [] {
-                if constexpr (type == GGML_TYPE_IQ2_S) {
-                    return ggml_hip_gfx906_iq2_lds_prefetch();
-                }
-                const char * value = std::getenv("GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            const bool use_lds = (live_lds_mode < 0 ? lds_prefetch : live_lds_mode != 0) &&
+            constexpr auto prefetch_flag = type == GGML_TYPE_IQ2_S ? output_modes::iq2_lds_prefetch : output_modes::iq3_lds_prefetch;
+            const bool use_lds = output_modes::enabled<prefetch_flag>(live_lds_mode < 0 ? -1 : live_lds_mode != 0) &&
                 stride_col_y == iq_lds_activation_blocks &&
                 (type == GGML_TYPE_IQ3_XXS || ncols_dst == 3);
             static std::once_flag logged[2];
@@ -1704,7 +1669,7 @@ static void mul_mat_vec_q_moe_launch(
                         ggml_type_name(type), ncols_dst);
             });
             if constexpr (type == GGML_TYPE_IQ2_S) {
-                if (ggml_hip_gfx906_iq2_paired_dot() && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
+                if (output_modes::enabled<output_modes::iq2_paired_dot>() && ncols_dst == 3 && !use_lds && !use_no_lds_row_groups) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true, 0, 1, true>, launch_params,
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                         stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1724,12 +1689,9 @@ static void mul_mat_vec_q_moe_launch(
             } else if (!use_lds) {
                 launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
             } else if (ncols_dst == 3) {
-                static const bool lds_row_groups = [] {
-                    const char * value = std::getenv(type == GGML_TYPE_IQ2_S ?
-                        "GGML_HIP_GFX906_IQ2_S_LDS_ROW_GROUPS" : "GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
-                if ((live_lds_mode < 0 ? lds_row_groups : live_lds_mode == 4) && nrows_x % (2*rows_per_block) == 0) {
+                constexpr auto rows_flag = type == GGML_TYPE_IQ2_S ? output_modes::iq2_lds_row_groups : output_modes::iq3_lds_row_groups;
+                if (output_modes::enabled<rows_flag>(live_lds_mode < 0 ? -1 : live_lds_mode == 4) &&
+                        nrows_x % (2*rows_per_block) == 0) {
                     launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
                 } else {
                     launch(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});
@@ -2200,10 +2162,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    static const bool hc_down_split_k = [] {
-        const char * value = std::getenv("GGML_CUDA_HC_DOWN_SPLIT_K");
-        return value && std::strcmp(value, "1") == 0;
-    }();
+    const bool hc_down_split_k = ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::hc_down_split_k>();
     static const bool fixed_mtp_three = [] {
         const char * value = std::getenv("LLAMA_MTP_VERIFY_THREE");
         return value && std::strcmp(value, "1") == 0;

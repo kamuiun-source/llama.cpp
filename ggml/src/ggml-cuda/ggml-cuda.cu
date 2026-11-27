@@ -9,6 +9,7 @@
 #include "ggml-cuda/common.cuh"
 #include "sync-telemetry.cuh"
 #include "ggml-cuda/graph.cuh"
+#include "ggml-cuda/gpu-output-modes.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -4410,7 +4411,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
 
         // GDN uses one row of weights for every token of the softplus output.
-        static const bool fuse_bcast = ggml_cuda_env_flag("GGML_CUDA_UNARY_MUL_BCAST");
+        const bool fuse_bcast = ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::unary_mul_bcast>();
         return fuse_bcast && unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS && unary->type == GGML_TYPE_F32 &&
                mul->src[0] == unary && ggml_are_same_shape(mul, unary) &&
                !ggml_is_empty(mul) && ggml_is_contiguous(mul) && ggml_is_contiguous(input) &&
@@ -4477,11 +4478,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static bool ggml_cuda_try_gdn_gated_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = [] {
-        const char * value = std::getenv("GGML_CUDA_GDN_GATED_NORM");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    if (!enabled || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_ADA_LOVELACE ||
+    if (!ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::gdn_gated_norm>() ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_ADA_LOVELACE ||
             !ctx.stream_context().concurrent_events.empty() ||
             !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
         return false;
@@ -6015,25 +6013,39 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
+    namespace output_modes = ggml_gpu_output_modes;
+    uint32_t output_mode_bits = output_modes::common_bits;
 #ifdef GGML_USE_HIP
-    const int lds_modes = ggml_hip_gfx906_lds_modes();
     const bool gfx906 = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_VEGA20;
+    const int lds_modes = ggml_hip_gfx906_lds_modes();
     const bool iq2_strata = gfx906 && ggml_hip_gfx906_iq2_strata_enabled();
     const bool iq3_strata = gfx906 && ggml_hip_gfx906_iq3_strata_enabled();
     if (gfx906) {
-        const auto it = cuda_ctx->cuda_graphs.find(graph_key);
-        if (it != cuda_ctx->cuda_graphs.end() &&
-                (it->second->gfx906_lds_modes != lds_modes || it->second->gfx906_iq2_strata != iq2_strata ||
-                 it->second->gfx906_iq3_strata != iq3_strata)) {
-            // Captured launches contain the kernel selected under the previous mode.
-            cuda_ctx->cuda_graphs.erase(it);
-        }
+        output_mode_bits |= output_modes::gfx906_bits;
+    }
+#elif !defined(GGML_USE_MUSA)
+    if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE) {
+        output_mode_bits |= output_modes::ada_bits;
     }
 #endif
+
+    const uint32_t gpu_output_modes = output_modes::capture_key(output_mode_bits);
+    const auto cached = cuda_ctx->cuda_graphs.find(graph_key);
+    if (cached != cuda_ctx->cuda_graphs.end() &&
+            (cached->second->gpu_output_modes != gpu_output_modes
+#ifdef GGML_USE_HIP
+             || (gfx906 && (cached->second->gfx906_lds_modes != lds_modes || cached->second->gfx906_iq2_strata != iq2_strata ||
+                 cached->second->gfx906_iq3_strata != iq3_strata))
+#endif
+            )) {
+        // Captured launches contain the kernel selected under the previous mode.
+        cuda_ctx->cuda_graphs.erase(cached);
+    }
 
     const bool graphs_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
     if (graphs_enabled) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        graph->gpu_output_modes = gpu_output_modes;
 #ifdef GGML_USE_HIP
         graph->gfx906_lds_modes = lds_modes;
         graph->gfx906_iq2_strata = iq2_strata;
@@ -7679,6 +7691,11 @@ static ggml_tensor * ggml_backend_cuda_make_ssm_conv_history(ggml_backend_dev_t 
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#ifndef GGML_USE_MUSA
+    if (strcmp(name, ggml_gpu_output_modes::setter_proc) == 0) {
+        return (void *) ggml_gpu_output_modes::set_overrides;
+    }
+#endif
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_is_ada") == 0) {
         return (void *)+[](ggml_backend_dev_t dev) {

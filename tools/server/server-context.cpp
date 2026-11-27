@@ -11,6 +11,8 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-single-miss-cpu-mode.h"
+#include "server-gpu-output-mode.h"
+#include "server-expert-output-mode.h"
 #include "src/llama-next-router-readback.h"
 #include "server-iq3-strata-mode.h"
 #include "server-mtp-catchup-mode.h"
@@ -3961,6 +3963,20 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
+                        const bool gpu_changed = server_refresh_gpu_output_modes(ctx_tgt, ctx_dft);
+                        const bool expert_changed = server_refresh_expert_output_modes(ctx_tgt);
+                        if (gpu_changed || expert_changed) {
+                            for (auto & slot : slots) {
+                                slot.prompt_clear();
+                            }
+                            if (prompt_cache) {
+                                prompt_cache->states.clear();
+                            }
+                            SRV_INF("%s", "cleared cached prompts after output mode change\n");
+                        }
+                    }
 
                     server_slot * slot = get_available_slot(task);
 

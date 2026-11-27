@@ -40,11 +40,12 @@ struct llama_expert_placement {
     llama_expert_placement(const char * path, ggml_backend_dev_t target, int32_t n_expert_used);
     ggml_tensor * add_weight(int layer, const ggml_tensor * source, uint16_t shard, size_t offset);
     bool load(llama_model_loader & loader, const llama_model_params & params);
+    static bool hip_output_mode_configured();
 
     const ggml_backend_dev_t target;
     const int32_t max_ubatch;
     const hip_overlap_mode hip_overlap;
-    const hip_overlap_mode hip_prefill;
+    const hip_overlap_mode hip_prefill_initial;
     const bool hip_overlap_promotion;
     const bool overlap;
     const bool dynamic_resident;
@@ -54,6 +55,7 @@ struct llama_expert_placement {
     const bool hip_tuple_dma;
     const bool hip_single_miss_cpu;
     const int32_t n_slots;
+    const hip_overlap_mode hip_prefill_reserved;
     const int32_t prefill_tokens;
     int32_t prefill_waves(int64_t n_tokens, int64_t n_used) const;
     mutable std::atomic<bool> context_in_use{false};
