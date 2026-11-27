@@ -8,6 +8,8 @@
 - 8枠のExpert先読みで必要な枠だけHIPイベント待ちする `LLAMA_EXPERT_HIP_NEXT_ROUTER_HIT_WAIT=1` を試作。固定3幅の実測はON 39.07 tok/s（2回合算）、同一ビルドの旧方式OFF 36.68（1回）、過去の8枠の旧方式38.81。転送関連のCPU待ち合計は6.09→6.27 ms/検証で低下せず、既定OFF。全3回の応答中スワップアウト0。原本のアドレスに絞ったトレースで、スワップアウトがない回にも原本の無効化とAMDGPU側からの回収要求を観測した。[試作と測定](../rocm/09-single-bank-mtp3.md#使用する先読みだけ完了を待つ試作)
 ## 現在の状態
 
+- MI50→RTXの戻り先行投入を固定3幅・同じ5問と候補で逆順再生。OFF→ONの2組は本体検証の差が −0.79 / +1.02 ms（ON−OFF）。前回と合わせて4組中3組でONが遅く、逆順の合算差は +0.11 ms/検証。初回OFFはホストのスワップインが多かった。既定OFFを維持。[逆順比較](../research/rocm-mtp3-return-ticket-20261127.md#offonの順で2組再生)
+
 - GPU間受け渡し・Expert先読み・コピー一括発行を3ワークツリーで実装し、`codex/rocm-transfer-optimization` に別コミットで統合した。固定3幅の比較と分岐先は[並列開発と統合確認](../research/rocm-transfer-optimization-integration-20261127.md)。 単独ONを各2回測定。合算は予算59.60、宛先同期省略61.19、CUDA一括61.17 tok/s。前回の全OFF60.58 tok/s。宛先同期省略と一括の差は小さく、採用判断は保留。
 
 - GPU間受け渡しとExpert転送の公開実装を調査。vLLMの非連続コピー一括発行、UCXとMoE-Infinityの完了管理、MoE-Infinityの計算窓ベース先読み予算を照合した。実ミス優先は採用済み。次に詰める候補は先読み発行のバイト予算と、MI50→RTXの宛先側同期の理由別計測。[調査メモ](../research/rocm-handoff-expert-transfer-20261127.md)
