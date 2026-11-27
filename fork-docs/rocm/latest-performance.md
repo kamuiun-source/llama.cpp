@@ -1,6 +1,6 @@
 # ROCm固定3幅の最新計測サマリ
 
-更新日 2026-11-26。RTX 4070 Ti＋MI50、Qwen3.8 Flash Next UD-IQ3_XXS、固定3幅、単一バンク、直接DMA、CPU Expert自動配分ON。採用済みの次層先読み・非同期プリフィル・非同期昇格・Shared Expert先行発行を有効にした固定5問。HC down Split-KはOFF。
+更新日 2026-11-27。RTX 4070 Ti＋MI50、Qwen3.8 Flash Next UD-IQ3_XXS、固定3幅、単一バンク、直接DMA、CPU Expert自動配分ON。採用済みの次層先読み・非同期プリフィル・非同期昇格・Shared Expert先行発行を有効にした固定5問。HC down Split-KはOFF。
 
 ## 通常実行
 
@@ -105,6 +105,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 コンテキスト512の初回は、末尾が1トークン切れたため除外。再実行ではサーバーのコンテキスト上限だけ1024とした。従来の `llama-perplexity` と比べ、今回の実行はFlash Attention自動選択で有効、マイクロバッチ2、確率取得用にホストサンプリングを使用した。同じトークンを採点した短い比較であり、2.7650との差から固定3幅だけの影響や品質差は判断しない。[固定3幅の実行結果](/home/t-saka/rocm-perplexity-mtp3-ctx1024-20261126/api/summary.json) · [サーバーログ](/home/t-saka/rocm-perplexity-mtp3-ctx1024-20261126/api/server.log)
 
 ## 最新の比較試作
+
+`codex/rocm-iq3-strata-reuse` から、IQ3_XXS・IQ2_S Strataと次層Router読み戻しの3施策を採用した。ここでの比較値は試作ブランチで計測した。順位付きTop-10、スロット表圧縮、先読みD2D省略、CPU担当Expertのゼロ枠内積省略のフラグ・条件・数値は、[採用と見送りの一覧](10-decode-pipeline.md#strata再利用ブランチの採用と計測結果)を参照。
 
 - **固定3幅のcatch-up＋第1候補の統合（通常起動ON）。** `codex/rocm-mtp3-catchup-first-draft` の `4336cdca7`。会話KV再利用、生成上限512、4K、device-pending有効の5問を同一サーバーでON/OFF各2回。生成57.55→60.20 tok/s（+4.6%）、ドラフト＋catch-up 6.03→5.20 ms/検証、MTP採用1,459/2,324→1,395/2,194。第5問は4回とも自然なEOSで、2K・上限128の試行で起きた43トークンの途中EOSは再現しなかった。以前の診断では両候補棄却後と第1候補だけ採用した場合のドラフトKV末尾を照合した。[手法・計測・出力](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
   統合後の採用設定で5問を1回再計測し、全5問合算58.61 tok/s、第2〜5問合算61.36 tok/s。ドラフト＋catch-upは5.43 ms/検証。全5問が自然に完結し、スワップアウト0。[統合後の確認](../research/mtp3-efficiency-20261125.md#統合後の通常起動確認)

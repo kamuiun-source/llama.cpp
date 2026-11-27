@@ -4,6 +4,16 @@
 
 ## Linux ROCm・固定3幅の採用設定
 
+2026-11-27に `codex/rocm-iq3-strata-reuse` から取り込んだ3項目を、固定3幅の通常起動に追加する。各モードファイルをホストで用意してDockerにマウントする。比較時はサーバーの待機中に対象のファイルを `off` に更新できる。ファイル未指定時のコード既定は各項目OFF。
+
+| 施策 | Dockerで渡す環境変数 | モードファイルの内容 |
+| --- | --- | --- |
+| IQ3_XXS Strata | `LLAMA_HIP_GFX906_IQ3_STRATA_MODE_FILE` | `IQ3_STRATA=on` |
+| IQ2_S Strata | `LLAMA_HIP_GFX906_IQ2_STRATA_MODE_FILE` | `IQ2_STRATA=on` |
+| 次層Router予測IDのピン留め読み戻しと完了待ちの後回し | `LLAMA_EXPERT_HIP_MTP3_NEXT_ROUTER_READBACK_MODE_FILE` | `NEXT_ROUTER_READBACK=on` |
+
+IQ2_S Strataは既存の符号復号とQ8_1入力共有を使い、同型のLDS先読みと4行をOFFにする。IQ3_XXSの既存LDS設定は維持する。見送った試作のフラグ名と結果は[試作ブランチの比較](../rocm/10-decode-pipeline.md#strata再利用ブランチの採用と計測結果)を参照。
+
 単一バンク・Expert直接DMAのDocker設定は [固定3幅の採用設定](../rocm/10-decode-pipeline.md#単一バンク固定3幅の採用設定)、機能別のON/OFFは [固定3幅の起動フラグ一覧](../rocm/10-decode-pipeline.md#固定3幅の起動フラグ一覧) を参照。移植を取り込んだ `codex/rocm-integrated-test` のMI50では、符号復号 `GGML_HIP_GFX906_IQ_SIGN_DECODE=1`、LDS先読み `GGML_HIP_GFX906_IQ3_XXS_LDS_PREFETCH=1`、3位置での出力4行 `GGML_HIP_GFX906_IQ3_XXS_LDS_ROW_GROUPS=1` を採用する。
 
 ### 現行の高速化一覧
