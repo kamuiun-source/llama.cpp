@@ -13,6 +13,7 @@
 #include "server-single-miss-cpu-mode.h"
 #include "server-gpu-output-mode.h"
 #include "server-expert-output-mode.h"
+#include "server-scratch-lru-telemetry.h"
 #include "src/llama-next-router-readback.h"
 #include "server-iq3-strata-mode.h"
 #include "server-mtp-catchup-mode.h"
@@ -895,6 +896,7 @@ struct server_slot {
     bool expert_trace = server_expert_decode_trace_enabled();
     bool expert_supported = true;
     uint64_t expert_rounds = 0;
+    server_scratch_lru_telemetry scratch_lru_telemetry;
     uint64_t expert_initial = 0;
     std::optional<expert_round> expert_pending;
     llama_expert_round_stats expert_total;
@@ -1146,6 +1148,7 @@ struct server_slot {
         stats = {};
         expert_supported = true;
         expert_rounds = 0;
+        scratch_lru_telemetry = {};
         expert_initial = 0;
         expert_pending.reset();
         expert_total = {};
@@ -1826,6 +1829,7 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     bool mtp_logit_trace = false;
+    int scratch_lru_mode = -1;
     bool mtp_logit_match_drafts = false;
     llama_tokens mtp_logit_reference;
     std::vector<int> mtp_logit_auto_chain;
@@ -3244,6 +3248,9 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (scratch_lru_mode >= 0 && slots.size() == 1 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+            slot.scratch_lru_telemetry.log(slot.task->id, scratch_lru_mode == 1);
+        }
         if (server_mtp_vocab_stats_enabled()) {
             if (slots.size() != 1) {
                 SLT_WRN(slot, "%s", "mtp_vocab_request: unsupported_parallel=1\n");
@@ -3966,7 +3973,7 @@ private:
 
                     if (std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
                         const bool gpu_changed = server_refresh_gpu_output_modes(ctx_tgt, ctx_dft);
-                        const bool expert_changed = server_refresh_expert_output_modes(ctx_tgt);
+                        const bool expert_changed = server_refresh_expert_output_modes(ctx_tgt, scratch_lru_mode);
                         if (gpu_changed || expert_changed) {
                             for (auto & slot : slots) {
                                 slot.prompt_clear();
@@ -5767,6 +5774,8 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool count_lru = scratch_lru_mode >= 0 && slots.size() == 1 && phase == server_decode_telemetry::verify;
+        const auto lru_before = count_lru ? llama_get_expert_round_stats(ctx_tgt) : llama_expert_round_stats{};
         queue_tasks.yield_to_queue([&]() {
             server_decode_telemetry::scope measure(decode_telemetry, ctx_tgt, phase, batch.view.size());
             server_slot * expert_slot = nullptr;
@@ -5828,6 +5837,9 @@ private:
                 }
             }
         });
+        if (count_lru) {
+            slots[batch.tokens[off].id_slot].scratch_lru_telemetry.add(lru_before, llama_get_expert_round_stats(ctx_tgt));
+        }
 
         if (ret != 0) {
             {

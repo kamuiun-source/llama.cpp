@@ -8,7 +8,7 @@
 #include <fstream>
 #include <string_view>
 
-inline bool server_refresh_expert_output_modes(llama_context * target) {
+inline bool server_refresh_expert_output_modes(llama_context * target, int & scratch_lru_mode) {
     static const char * path = std::getenv("LLAMA_EXPERT_OUTPUT_MODE_FILE");
     if (!path || !*path) {
         return false;
@@ -34,6 +34,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target) {
     bool want_prefill = startup_prefill;
     bool seen_prefetch = false;
     bool seen_prefill = false;
+    int want_scratch_lru = -1;
     while (valid && !text.empty()) {
         const auto end = text.find('\n');
         auto line = text.substr(0, end);
@@ -50,6 +51,8 @@ inline bool server_refresh_expert_output_modes(llama_context * target) {
         } else if (!seen_prefill && (line == "HIP_PREFILL=on" || line == "HIP_PREFILL=off")) {
             want_prefill = line == "HIP_PREFILL=on";
             seen_prefill = true;
+        } else if (want_scratch_lru < 0 && (line == "SCRATCH_LRU=on" || line == "SCRATCH_LRU=off")) {
+            want_scratch_lru = line == "SCRATCH_LRU=on";
         } else {
             valid = false;
         }
@@ -73,5 +76,11 @@ inline bool server_refresh_expert_output_modes(llama_context * target) {
     const bool prefetch_changed = apply(llama_set_expert_hip_next_router_prefetch(target, want_prefetch),
             prefetch_unsupported, "NEXT_ROUTER_PREFETCH");
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
+    if (llama_set_expert_scratch_lru(want_scratch_lru == 1) || scratch_lru_mode != want_scratch_lru) {
+        if (want_scratch_lru >= 0 || scratch_lru_mode == 1) {
+            LOG_INF("HIP Expert scratch LRU mode applied: SCRATCH_LRU=%s\n", want_scratch_lru == 1 ? "on" : "off");
+        }
+    }
+    scratch_lru_mode = want_scratch_lru;
     return prefetch_changed || prefill_changed;
 }

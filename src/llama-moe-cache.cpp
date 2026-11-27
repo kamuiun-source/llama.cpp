@@ -8,6 +8,7 @@
 #include "llama-model.h"
 #include "llama-next-router-readback.h"
 #include "llama-rtx-expert.h"
+#include "llama-scratch-lru.h"
 #include "llama-single-miss-cpu.h"
 #include "llama-single-miss-topology.h"
 #include "../ggml/src/ggml-backend-mtp.h"
@@ -26,6 +27,10 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+
+bool llama_set_expert_scratch_lru(bool enabled) {
+    return llama_expert_scratch_lru_enabled.exchange(enabled, std::memory_order_relaxed) != enabled;
+}
 
 namespace {
 
@@ -710,6 +715,8 @@ struct llama_moe_cache::impl {
     size_t tuple_h2d_count = 0;
     size_t tuple_h2d_payload_bytes = 0;
     size_t tuple_h2d_bytes = 0;
+    uint64_t scratch_lru_applied = 0;
+    uint64_t scratch_lru_changed = 0;
     size_t tuple_prefill_h2d_count = 0;
     size_t tuple_d2h_count = 0;
     size_t tuple_d2h_payload_bytes = 0;
@@ -3771,6 +3778,10 @@ struct llama_moe_cache::impl {
                     rtx_expert->clear(il, graph, dst);
                 }
             }
+            const bool scratch_lru = fixed_three && placement->hip_tuple_dma &&
+                    placement->dynamic_resident && !placement->overlap && !use_waves && !early &&
+                    !rtx_expert && sched && ggml_backend_sched_get_n_copies(sched) == 1 &&
+                    llama_expert_scratch_lru_enabled.load(std::memory_order_relaxed);
             for (const int32_t expert : ids) {
                 if (n_rtx && rtx_slots[expert] >= 0) {
                     continue;
@@ -3784,9 +3795,16 @@ struct llama_moe_cache::impl {
                 }
                 auto victim = std::find(scratch.begin(), scratch.end(), -1);
                 if (victim == scratch.end()) {
-                    victim = std::find_if(scratch.begin(), scratch.end(), [&](int32_t resident) {
-                        return slots[resident] < 0;
-                    });
+                    const auto eligible = [&](int32_t resident) { return slots[resident] < 0; };
+                    if (scratch_lru) {
+                        bool changed;
+                        victim = llama_expert_scratch_lru_victim(scratch.begin(), scratch.end(), eligible,
+                                [&](int32_t resident) { return l.packed_last_used[resident]; }, changed);
+                        scratch_lru_applied += victim != scratch.end();
+                        scratch_lru_changed += changed;
+                    } else {
+                        victim = std::find_if(scratch.begin(), scratch.end(), eligible);
+                    }
                 }
                 if (victim == scratch.end()) {
                     GGML_ABORT("packed expert scratch slots exhausted in layer %d", il);
@@ -4667,6 +4685,10 @@ llama_expert_round_stats llama_moe_cache::round_stats() const {
         self.packed_promotions,
         self.packed_writeback_bytes,
         self.placement && self.placement->max_ubatch == 2 && !self.placement->overlap && !self.rtx_expert,
+        self.tuple_h2d_count,
+        self.tuple_h2d_bytes,
+        self.scratch_lru_applied,
+        self.scratch_lru_changed,
     };
 }
 
