@@ -179,6 +179,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 ## 最新の比較試作
 
+- **仮置き枠が満杯のときだけLRU。** 試作 `14b35bc29` を固定3幅・4K・上限512でOFF→ON→ON→OFF。通常H2Dは8,469→3,985件、17.08→7.90 GB。検証あたりも7.40→3.62件。本体31.76→31.49 ms/検証、生成59.45→62.84 tok/s、MTP採用60.53→65.61%。自然生成のため候補・生成IDとExpert常駐状態の差を含む。20回答EOS、スワップアウト0、既定OFF。[実機比較](../research/rocm-mtp3-scratch-lru.md#固定3幅上限512の実モデル比較)
+
 `codex/rocm-iq3-strata-reuse` から、IQ3_XXS・IQ2_S Strataと次層Router読み戻しの3施策を採用した。ここでの比較値は試作ブランチで計測した。順位付きTop-10、スロット表圧縮、先読みD2D省略、CPU担当Expertのゼロ枠内積省略のフラグ・条件・数値は、[採用と見送りの一覧](10-decode-pipeline.md#strata再利用ブランチの採用と計測結果)を参照。
 
 - **固定3幅のcatch-up＋第1候補の統合（通常起動ON）。** `codex/rocm-mtp3-catchup-first-draft` の `4336cdca7`。会話KV再利用、生成上限512、4K、device-pending有効の5問を同一サーバーでON/OFF各2回。生成57.55→60.20 tok/s（+4.6%）、ドラフト＋catch-up 6.03→5.20 ms/検証、MTP採用1,459/2,324→1,395/2,194。第5問は4回とも自然なEOSで、2K・上限128の試行で起きた43トークンの途中EOSは再現しなかった。以前の診断では両候補棄却後と第1候補だけ採用した場合のドラフトKV末尾を照合した。[手法・計測・出力](../research/mtp3-efficiency-20261125.md#固定3幅でのcatch-up統合の追加調査)
