@@ -12,9 +12,11 @@ struct llama_next_router_budget {
 
     struct totals {
         size_t observed_layers = 0;
+        uint64_t candidate_to_router_us = 0;
         uint64_t window_sample_us = 0;
         size_t candidates = 0;
         size_t budget_checks = 0;
+        size_t first_admission_bytes = 0;
         size_t budget_blocked = 0;
         size_t budget_blocked_bytes = 0;
         size_t budget_blocked_selected = 0;
@@ -38,30 +40,37 @@ struct llama_next_router_budget {
     bool active() const { return enabled || telemetry; }
     totals & current() { return stats[enabled]; }
 
-    void arm(int32_t layer, int64_t now) {
+    void arm(int32_t layer) {
         target = layer;
-        start_us = now;
+        candidate_us = 0;
+    }
+
+    void candidates_ready(int32_t layer, int64_t now) {
+        if (target == layer && !candidate_us) {
+            candidate_us = now;
+        }
     }
 
     bool observe(int32_t layer, int64_t now) {
-        if (target != layer) {
+        if (target != layer || !candidate_us) {
             return false;
         }
-        // The host interval includes other streams and host work. Only budget the calibrated MI50 share.
-        const auto sample = std::clamp((now - start_us) * 2 / 5, int64_t(1), max_window_us);
+        const auto elapsed = now - candidate_us;
+        const auto sample = std::clamp(elapsed, int64_t(1), max_window_us);
         auto & estimate = window_us[layer];
         estimate = estimate ? (3 * estimate + sample) / 4 : sample;
         ++current().observed_layers;
+        current().candidate_to_router_us += elapsed;
         current().window_sample_us += sample;
         reset();
         return true;
     }
 
     size_t available_bytes(int32_t layer, int64_t now) const {
-        if (target != layer) {
+        if (target != layer || !candidate_us) {
             return 0;
         }
-        const auto remaining = std::max(int64_t(0), window_us[layer] - (now - start_us));
+        const auto remaining = std::max(int64_t(0), window_us[layer] - (now - candidate_us));
         return remaining * bytes_per_us;
     }
 
@@ -69,5 +78,5 @@ struct llama_next_router_budget {
 
 private:
     int32_t target = -1;
-    int64_t start_us = 0;
+    int64_t candidate_us = 0;
 };

@@ -2531,13 +2531,16 @@ struct llama_moe_cache::impl {
 
     void log_next_prefetch_budget(bool enabled) const {
         const auto & s = next_prefetch_budget.stats[enabled];
-        LLAMA_LOG_INFO("packed expert HIP next Router byte budget: enabled=%d observed_layers=%zu window_sample_us=%" PRIu64
-                " window_cap_us=%" PRId64 " bytes_per_us=%zu candidates=%zu checks=%zu blocked=%zu blocked_bytes=%zu"
+        LLAMA_LOG_INFO("packed expert HIP next Router byte budget: enabled=%d observed_layers=%zu"
+                " candidate_to_router_us=%" PRIu64 " window_sample_us=%" PRIu64
+                " window_cap_us=%" PRId64 " bytes_per_us=%zu candidates=%zu checks=%zu first_admission_bytes=%zu"
+                " blocked=%zu blocked_bytes=%zu"
                 " blocked_selected=%zu unarmed_layers=%zu"
                 " h2d_tuples=%zu h2d_bytes=%zu ready_hits=%zu ready_hit_bytes=%zu late_hits=%zu late_hit_bytes=%zu"
                 " demand_tuples=%zu demand_bytes=%zu demand_sync_us=%" PRIu64 "\n",
-                enabled, s.observed_layers, s.window_sample_us, next_prefetch_budget.max_window_us, next_prefetch_budget.bytes_per_us,
-                s.candidates, s.budget_checks, s.budget_blocked, s.budget_blocked_bytes, s.budget_blocked_selected,
+                enabled, s.observed_layers, s.candidate_to_router_us, s.window_sample_us,
+                next_prefetch_budget.max_window_us, next_prefetch_budget.bytes_per_us,
+                s.candidates, s.budget_checks, s.first_admission_bytes, s.budget_blocked, s.budget_blocked_bytes, s.budget_blocked_selected,
                 s.unarmed_layers, s.h2d_tuples, s.h2d_bytes,
                 s.ready_hits, s.ready_hit_bytes, s.late_hits, s.late_hit_bytes, s.demand_tuples, s.demand_bytes, s.demand_sync_us);
     }
@@ -2695,6 +2698,9 @@ struct llama_moe_cache::impl {
             return;
         }
         const bool initial = next_prefetch_queue_head == 0;
+        if (initial && next_prefetch_budget.active()) {
+            next_prefetch_budget.candidates_ready(next_prefetch_queue_layer, ggml_time_us());
+        }
         if (initial && next_prefetch_budget.enabled && next_prefetch_tail_pending) {
             // A preceding layer may have retired its IDs before its unused DMA finished.
             if (!next_prefetch_event_ready(next_prefetch_backend.get(), next_prefetch_events[next_prefetch_sources - 1].get())) {
@@ -2718,6 +2724,9 @@ struct llama_moe_cache::impl {
             const auto bytes = next_prefetch_budget.available_bytes(next_prefetch_queue_layer, ggml_time_us());
             auto & stats = next_prefetch_budget.current();
             ++stats.budget_checks;
+            if (initial) {
+                stats.first_admission_bytes += bytes;
+            }
             allowed = std::min(queued, bytes / stride);
             stats.budget_blocked += queued - allowed;
             stats.budget_blocked_bytes += (queued - allowed) * stride;
@@ -2979,7 +2988,7 @@ struct llama_moe_cache::impl {
                     if (self.next_prefetch_submit_launch) {
                         if (self.next_prefetch_budget.active()) {
                             self.next_prefetch_blocked_count = 0;
-                            self.next_prefetch_budget.arm(il + 1, ggml_time_us());
+                            self.next_prefetch_budget.arm(il + 1);
                         }
                         ++self.next_prefetch_submit_executed;
                         const int64_t start = self.next_profile_start ? ggml_time_us() : 0;
