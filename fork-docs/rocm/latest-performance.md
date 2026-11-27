@@ -179,6 +179,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 ## 最新の比較試作
 
+- **MI50→RTXの待機方式を単体比較。** HIP既定と明示Spinは両方flags `0x1`。共有RAM直書き後のHIP同期中央値13.66→13.61 µs。CPU補正後の公開フラグでRTXのH2D・CUDA Graphを先行投入する試作は、30,720 Bが全件ビット一致したが、全体中央値30.27→40.24 µs、前置2 MiB H2Dありは191.35→192.09 µs。実モデルへの組み込みは見送り。[既存トレースと単体計測](../research/rocm-transfer-optimization-integration-20261127.md#mi50のhipホスト待機と戻りh2dの発行)
+
 - **未完了の先読みExpertのCPU振替をいつもの5問で交互に6回。** 毎回会話KVを消去し、直前8トークンウォームアップあり・なしを各3回。生成は直前ウォームアップなしでOFF 61.08 / ON 60.39、ありでOFF 59.96 / ON 60.52 tok/s。全回合算はOFF 60.71 / ON 60.47 tok/s。全30応答EOS、スワップアウト0、第4問のコード全回正解。既定OFF維持。[比較と出力確認](../research/rocm-late-prefetch-cpu.md#いつもの5問を直前ウォームアップありなしで各3回)
 
 - **未完了の先読みExpertのCPU振替をON固定で再測定。** 第4問の固定履歴で54.26 / 70.84 / 70.75 tok/s、合算64.63 tok/s。ON固定でも前回のOFF→ONに近い速度上昇が再現した。D2Dを328件、イベント待ちの発行を133件省いた。全3回EOS、Python出力は全回正しく、1回目の説明文に数値誤り。スワップアウト0。[ON固定3回の詳細](../research/rocm-late-prefetch-cpu.md#第4問をon固定で3回再計測)

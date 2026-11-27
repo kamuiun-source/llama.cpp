@@ -84,3 +84,43 @@ D4採用済み統合版の既存Nsight・rocprofトレースから、第4問の�
 | MI50最終集約の終了から消費側CUDA Graphの開始 | 54.47 µs | 189.82 µs |
 
 時刻差にはホストの投入や既に並んでいるRTX側の仕事も含む。独立したHIP後続処理を戻りの後ろへ移せる証拠は得られなかった。すでに採用済みのRTX Shared Expert先行発行・非同期戻りは維持する。次の試作は通常のCPU割り当てを優先し、空きワーカーがある場合だけ、未完了の先読みを待つ実ルートのExpertをCPUに回す。先読みのイベント依存とD2Dの減少、CPU合流待ち、生成ID・MTP採用、生成速度を確認する。先読み済み重みの転送やRAM枠の寿命は既存経路が管理する。[元トレース](/home/t-saka/rocm-integrated-d4-full-adopted-trace-20261127-retry) · [照合スクリプト](/home/t-saka/rocm-return-gap-20261127/inspect-existing.py)
+
+## MI50のHIPホスト待機と戻りH2Dの発行
+
+既存の第4問の固定3幅トレースから、MI50の最終集約カーネル、同じ戻りsplit内の `hipStreamSynchronize`、RTXの30,720 B H2Dの発行と実開始をさらに照合した。HIP同期が1件に絞れた41検証の1,800層を対象にした。
+
+| 区間 | 中央値 | P95 |
+| --- | ---: | ---: |
+| MI50最終集約終了から同期API復帰 | 12.94 µs | 15.67 µs |
+| 同期API復帰からCUDAのH2D APIに入るまで | 3.41 µs | 15.82 µs |
+| CUDAのH2D APIに入ってから転送開始まで | 9.51 µs | 12.67 µs |
+| MI50最終集約終了からH2Dの転送開始まで | 25.77 µs | 48.30 µs |
+
+同期復帰からCUDA APIまでには該当層でのCPU Expertの合流・補正やスケジューラ処理が含まれる。このトレースではそこを個別に時刻計測していない。表は照合できた層のみの分布なので、前節の1,880層のP95と同じ母集団ではない。[再集計スクリプト](/home/t-saka/rocm-return-gap-20261127/inspect-return-submit.py)
+
+ROCm 7.2.1のCLRでは、HIP初期化時にデバイスの `ActiveWait` を有効にする。明示的な `hipDeviceScheduleSpin` と `hipDeviceScheduleYield` は、どちらも同じ `SetActiveWait(true)` を設定する。flagsが既定値とSpinで異なる場合も、待ち方は同じになり得る。ストリームの `finish()` には条件付きのマーカー投入やキュー整理もあり、同期APIの復帰までをすべてOSのスレッド起床とは見なせない。[HIP初期化](https://github.com/ROCm/clr/blob/rocm-7.2.1/hipamd/src/hip_context.cpp#L1112-L1126) · [待機フラグ](https://github.com/ROCm/clr/blob/rocm-7.2.1/hipamd/src/hip_device_runtime.cpp#L3284-L3363) · [キューの完了処理](https://github.com/ROCm/clr/blob/rocm-7.2.1/rocclr/platform/commandqueue.cpp#L1226-L1342)
+
+MI50実機で、30,720 BをMI50のカーネルから共有RAMへ直接書き、ホストがHIPを同期してからRTXへH2Dする単体を測定した。ストリーム作成前の既定値は `0x1`（Spin）で、明示Spinも `0x1`。対照のBlockingSyncだけが `0x4` に変わった。各プロセスでウォームアップ100回と計測1,000回のペイロードがすべて一致した。
+
+| HIP待機設定 | HIP同期APIのホスト時間中央値 | 全体の中央値 |
+| --- | ---: | ---: |
+| 既定 | 13.66 µs | 21.14 µs |
+| 明示Spin | 13.61 µs | 20.76 µs |
+| BlockingSync | 13.77 µs | 21.10 µs |
+
+単体のHIP同期API時間には短いGPUカーネルの実行待ちも含む。既定を明示Spinに指定し直すことによる短縮は確認できなかった。[単体計測ログと再現用ソース](/home/t-saka/rocm-hip-schedule-spin-20261127)
+
+### CPUの公開フラグでRTXの戻りを先に投入する単体試作
+
+MI50に共有RAMへの書き込みを投入した直後、RTXの同一ストリームへ `cuStreamWaitValue32`、30,720 BのH2D、データを読むCUDA Graph、完了イベントを積む。CPUはHIPの同期後に共有RAMの1行を補正し、単調増加する32ビットの番号をrelease storeで公開する。イベントが完了するまで共有領域の再利用を待つ。RTX上の依存を同一ストリーム順序で表現し、CPUが公開する番号を待つ前に必要なRTX作業がある場合は先に投入する必要がある。GPU間の直接フラグ通知の過去試作と区別する。[CUDA Stream Memory Operations](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-driver-api/group__CUDA__MEMOP.html)
+
+RTX 4070 TiとMI50で、従来の「補正後にH2DとGraphを投入」と、先行投入して補正後にCPUが番号を公開する経路を交互に実施した。両経路に同じデータを使い、30,720 B全体を受信後にビット比較。先行する2 MiBのHIP H2Dの有無を別プロセスで測り、各プロセスで各経路100回のウォームアップと3,000回の計測、計6,200件の照合が通った。CUDA Graphの中身はD2Dによる出力確認の代用で、実モデルの消費グラフとは異なる。
+
+| MI50側の前置処理 | RTX投入 | 全体の中央値 | CPU補正完了からRTXイベント完了までの中央値 |
+| --- | --- | ---: | ---: |
+| なし | 補正後に投入 | 30.27 µs | 15.04 µs |
+| なし | フラグ待ちと一緒に先行投入 | 40.24 µs | 25.05 µs |
+| 2 MiBのHIP H2D | 補正後に投入 | 191.35 µs | 27.28 µs |
+| 2 MiBのHIP H2D | フラグ待ちと一緒に先行投入 | 192.09 µs | 28.00 µs |
+
+CPUの公開フラグでRTXが補正後のデータを読めることを単体で確認した。今回のベンチマークでは先行投入による短縮は確認できず、アプリ側への組み込みは見送った。計時はホストの完了イベント復帰までを含み、RTX上のH2D終了と消費グラフ開始の間を個別に計測していない。[単体計測ログとソース](/home/t-saka/rocm-host-ticket-return-20261127)
