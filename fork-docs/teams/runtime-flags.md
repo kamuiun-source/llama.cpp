@@ -38,6 +38,8 @@ IQ2_S Strataは既存の符号復号とQ8_1入力共有を使い、同型のLDS�
 
 統合版のJSONLは設定切替・リクエスト境界・メモリ統計を記録する。応答JSONにある第1問16トークン目の `106806` / `159212` の分岐はcatch-upのON同士・OFF同士で再現した。原因の切り分けは同じ接頭辞でCPU Expertだけ変更し、競合する2語の本体logit、実際のExpert計算先、必要ならプリフィルのグループ幅を照合する。通常の `CATCHUP_FIRST_DRAFT=on` は維持。[同一ビルド再実行](../rocm/latest-performance.md#同じ統合ビルドの再実行) · [catch-up統合OFF](../rocm/latest-performance.md#同じ統合ビルドでcatch-up統合をoff)
 
+`codex/rocm-live-output-flags` ではモデルの配置を共通にし、`LLAMA_GPU_OUTPUT_MODE_FILE` と `LLAMA_EXPERT_OUTPUT_MODE_FILE` でGPUカーネル、次層先読み、HIPプリフィルを待機中に切り替えられる。既存のCPU Expert、Strata、Router読み戻し、catch-upのモードファイルも併用できる。[切り替え手順と第4問の比較](../research/rocm-live-output-flags-20261127.md)
+
 ### MTP固定3幅の機能単体比較
 
 - 通常の対話計測は固定3幅・自然な採用判定で行い、生成 tok/s、本体 ms/検証、候補別採用率、生成トークン/検証を記録する。機能による速度差を見るときは、そのカーネルまたは処理区間の時間と、通った回数・転送量を照合する。
