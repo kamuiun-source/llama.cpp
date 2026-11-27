@@ -8,6 +8,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "sync-telemetry.cuh"
+#include "copy-api-batch.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/gpu-output-modes.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -7793,6 +7794,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_hip_graph_mapped_return") == 0) {
         return (void *)ggml_backend_hip_graph_mapped_return;
+    }
+#endif
+#ifdef GGML_CUDA_MTP3_D2H_BATCH
+    if (strcmp(name, "ggml_backend_cuda_mtp3_d2h_batch") == 0) {
+        return (void *)ggml_backend_cuda_mtp3_d2h_batch;
     }
 #endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
