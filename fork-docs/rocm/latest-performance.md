@@ -183,6 +183,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 ## 最新の比較試作
 
+- **未統合。各層の公開順位301〜310位をRTXに常駐。** `codex/rocm-rtx-ranked-experts` の固定3幅・同一履歴とMTP候補の5問で、通常Expert H2Dが6.528→6.055 GB、本体検証が31.412→35.469 ms/回、生成が61.95→56.15 tok/s。試作は既定OFF。[配置と計測の詳細](../research/rocm-mtp3-rtx-ranked-experts.md)
+
 - **未統合。RTXに1層・2層分の全Expertを常駐。** 試作ブランチ名は `codex/rocm-rtx-expert-layer`（最終 `437ff74cc`）。固定3幅の実測で、現行配置から層0だけを移すと本体31.455→31.086 ms/検証。層2を追加した同一ビルド比較では31.320→31.247 ms/検証、RTX空きVRAMは2,801→1,841 MiB。試作コードは未統合。[選定根拠と計測メモ](../research/rocm-mtp3-rtx-expert-layer.md)
 
 - **未統合。共有RAM入力の直接Q8_1量子化。** 試作ブランチ `codex/rocm-mapped-input-q8`（記録元 `7957a7453`）。固定3幅のリプレイ後半はON平均30.399、OFF 30.277 ms/検証で短縮を確認できなかった。16 BロードとRTX先行量子化も見送り。比較条件、ビット一致、単体計測、Astraによるログ再分析を記録した。[計測メモ](../research/rocm-mtp3-mapped-input-q8.md)
