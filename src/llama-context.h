@@ -136,6 +136,8 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);
     bool supports_state_row() const;
+    bool enable_mtp_device_pending();
+    bool copy_mtp_pending_row(int64_t row);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -159,10 +161,23 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   profile = false,
+                              bool   draft_cache_eligible = false,
+                              bool   narrow_prefill = false);
+
+    bool supports_mtp_verify_three() const { return mtp_verify_three_enabled; }
+    bool supports_mtp_verify_four() const { return mtp_verify_four_enabled; }
+    void set_mtp_logit_trace(bool enabled) { mtp_logit_trace_enabled = enabled; }
+    int set_expert_hip_next_router_prefetch(bool enabled);
+    int set_expert_hip_prefill(bool enabled);
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, bool prefill = false, bool prefill_wide = true, bool target_mtp_verify = false,
+               llama_mtp_draft_row draft_row = llama_mtp_draft_row::normal, bool mtp_catchup = false);
+    const float * read_mtp_first_draft_row(int32_t index);
+    void discard_mtp_first_draft_row();
+    llama_mtp_draft_row_stats get_mtp_draft_row_stats() const { return mtp_draft_row_stats; }
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -273,12 +288,17 @@ private:
 
 public:
     uint32_t graph_max_nodes() const;
+    uint32_t n_ubatch_prefill() const;
+    uint32_t n_ubatch_reserve() const;
+    bool mtp_vocab_subset_enabled() const { return mtp_vocab_head != nullptr; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, bool profile = false);
+    void get_sched_telemetry(uint64_t & graphs, uint64_t & splits) const;
+    llama_expert_round_stats get_expert_round_stats() const;
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -313,6 +333,10 @@ private:
 
     // create a new backend scheduler with the given parameters, unless the current one can be reused
     void sched_new(const sched_params & params);
+    ggml_backend_sched_ptr sched_create(const sched_params & params);
+
+    void mtp_draft_graph_cache_swap();
+    void mtp_draft_graph_cache_reset();
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -402,7 +426,19 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    void init_mtp_vocab_subset();
+    ggml_context_ptr mtp_vocab_ctx;
+    ggml_backend_buffer_ptr mtp_vocab_buffer;
+    ggml_tensor * mtp_vocab_head = nullptr;
+    ggml_tensor * mtp_vocab_ids = nullptr;
+
     ggml_backend_sched_ptr sched;
+    bool mtp_catchup_supported = false;
+    bool mtp_verify_three_enabled = false;
+    bool mtp_verify_four_enabled = false;
+    bool mtp_verify_three_vulkan_waves = false;
+    bool mtp_logit_trace_enabled = false;
+    uint32_t target_mtp_verify_width = 0;
 
     sched_params sched_params_cur;
 
@@ -457,6 +493,16 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // The alternate draft graph keeps its scheduler allocations, as in Castagna's LLAMA_GRAPH_CACHE2.
+    llm_graph_result_ptr gf_res_draft_alt;
+    ggml_backend_sched_ptr sched_draft_alt;
+    llm_graph_result * gf_res_draft_alt_active = nullptr;
+    bool sched_draft_alt_active = false;
+    bool mtp_draft_graph_cache2 = false;
+    bool mtp_draft_graph_primary_small = false;
+    uint64_t mtp_draft_graph_cache_switches = 0;
+    uint64_t mtp_draft_graph_cache_hits = 0;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -475,7 +521,7 @@ private:
     bool ev_layer_inp_read_recorded = false;
 
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
-    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+    // Row r < n_batch is the token at batch index r of the last decode; row n_batch + s is reserved for seq s.
     // ordered with the reader context like the layer input buffer
     ggml_context_ptr        ctx_h_nextn_dev;
     ggml_backend_buffer_ptr buf_h_nextn_dev;
@@ -486,6 +532,10 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+    bool mtp_device_pending         = false;
+    bool mtp_first_draft_ready       = false;
+    ggml_tensor * mtp_first_draft_row = nullptr;
+    llama_mtp_draft_row_stats mtp_draft_row_stats;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -494,6 +544,11 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    bool decode_profile = false;
+    bool decode_profile_active = false;
+    uint64_t telemetry_graphs = 0;
+    uint64_t telemetry_splits = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

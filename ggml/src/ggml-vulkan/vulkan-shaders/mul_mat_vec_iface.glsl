@@ -27,6 +27,16 @@ layout (binding = 1) readonly buffer BV2 {B_TYPEV2 data_b_v2[];};
 layout (binding = 1) readonly buffer BV4 {B_TYPEV4 data_b_v4[];};
 #endif
 
+#ifdef MOE_GATE_UP
+layout (binding = 3) readonly buffer Up {A_TYPE data_a_up[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 3) readonly buffer UpPacked16 {A_TYPE_PACKED16 data_a_packed16_up[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 3) readonly buffer UpPacked32 {A_TYPE_PACKED32 data_a_packed32_up[];};
+#endif
+#endif
+
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 layout (binding = 3) readonly buffer Fuse0 {D_TYPE data_fuse0[];};

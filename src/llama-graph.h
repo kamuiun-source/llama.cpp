@@ -813,6 +813,8 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
+    ggml_tensor * mtp_vocab_head = nullptr;
+    ggml_tensor * mtp_vocab_ids = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -836,6 +838,11 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    bool target_mtp_verify_three = false;
+    bool target_mtp_verify_packed = false;
+    bool trace_next_router = false;
+    int next_router_score_mode = 0;
+    bool narrow_iq_prefill = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -910,6 +917,13 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
+            mtp_vocab_head == other.mtp_vocab_head &&
+            mtp_vocab_ids == other.mtp_vocab_ids &&
+            target_mtp_verify_three == other.target_mtp_verify_three &&
+            target_mtp_verify_packed == other.target_mtp_verify_packed &&
+            trace_next_router == other.trace_next_router &&
+            next_router_score_mode == other.next_router_score_mode &&
+            narrow_iq_prefill == other.narrow_iq_prefill &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -978,6 +992,8 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    std::vector<ggml_tensor *> t_next_router;
+    std::vector<ggml_tensor *> t_next_router_scores;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1082,6 +1098,9 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const bool target_mtp_verify_three;
+    const bool target_mtp_verify_packed;
+    const bool narrow_iq_prefill;
 
     const llama_prec_policy * prec_policy;
 
@@ -1091,6 +1110,8 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    ggml_tensor * mtp_vocab_head;
+    ggml_tensor * mtp_vocab_ids;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1143,7 +1164,8 @@ struct llm_graph_context {
               ggml_tensor * ids,
               ggml_tensor * w_s    = nullptr,
               ggml_tensor * slots  = nullptr,
-                     bool   cached = true) const;
+                     bool   cached = true,
+                     bool   cold = false) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1258,7 +1280,11 @@ struct llm_graph_context {
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
                     bool   cpu_part,
-                     int   il) const;
+                     int   il,
+                    bool   cold = false,
+                 int32_t   prefill_wave = -1,
+             ggml_tensor * prefill_ids = nullptr,
+                bool   mtp_verify_three = false) const;
 
     //
     // inputs

@@ -693,7 +693,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
             last_seq_id = batch.seq_id[i][0];
 
-            if (cur_seq_set.size() > n_ubatch) {
+            if (cur_seq_set.size() >= n_ubatch) {
                 break;
             }
         }
@@ -754,8 +754,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // if n_keep_tail > 0, keep only the seqs that either finish in this ubatch or have at least
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
+    // A narrow batch can only retain snapshots for positions in its last microbatch.
+    n_keep_tail = std::min(n_keep_tail, n_ubatch);
     if (n_keep_tail > 0) {
-        GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);

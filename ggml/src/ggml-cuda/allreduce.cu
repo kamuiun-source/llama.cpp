@@ -1,4 +1,5 @@
 #include "allreduce.cuh"
+#include "sync-telemetry.cuh"
 
 #if !defined(GGML_USE_MUSA)
 
@@ -369,7 +370,7 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * 
     if (pool_lapped) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            CUDA_CHECK(ggml_cuda_event_synchronize(p->ev_pool[i][slot].ker));
         }
     }
 
@@ -390,7 +391,7 @@ static void ggml_cuda_ar_wait_for_compute(
         ggml_cuda_ar_pipeline * p, ggml_backend_cuda_context * cuda_ctx, int rank, int slot) {
     ggml_cuda_ar_event_slot & ev = p->ev_pool[rank][slot];
     CUDA_CHECK(cudaEventRecord(ev.app, cuda_ctx->stream()));
-    CUDA_CHECK(cudaStreamWaitEvent(p->streams[rank], ev.app));
+    CUDA_CHECK(ggml_cuda_stream_wait_event(p->streams[rank], ev.app));
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +549,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+            CUDA_CHECK(ggml_cuda_stream_synchronize(p->streams[i]));
         }
     }
 
@@ -631,7 +632,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // No-op on the first AR -- no prior record exists.
         if (p->host_large_read_done_valid) {
             const int peer = 1 - i;
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
+            CUDA_CHECK(ggml_cuda_stream_wait_event(p->streams[i], p->host_large_read_done[peer]));
         }
 
         if (!compute[i]) {
@@ -665,7 +666,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // finish reading dev_tmp before our H2D overwrites it.  No-op on the
         // first copy_impl call.
         if (p->dev_tmp_kernel_done_valid) {
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
+            CUDA_CHECK(ggml_cuda_stream_wait_event(p->streams[i], p->dev_tmp_kernel_done[i]));
         }
 
         for (size_t c = 0; c < copy_chunks; ++c) {
@@ -673,7 +674,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
             const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
                 (nbytes - offset) : chunk_bytes;
 
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].cpy[c]));
+            CUDA_CHECK(ggml_cuda_stream_wait_event(p->streams[i], p->ev_pool[peer][slot].cpy[c]));
             CUDA_CHECK(cudaMemcpyAsync(
                 p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
                 cudaMemcpyHostToDevice, p->streams[i]));
@@ -686,7 +687,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // Hand off from AR stream (copy engine) to compute stream: compute
         // stream waits for all H2Ds to finish, then runs the add_kernel.
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
+        CUDA_CHECK(ggml_cuda_stream_wait_event(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
 
         const int block_size = 256;
         int n_blocks = (int) ((ne + block_size - 1) / block_size);

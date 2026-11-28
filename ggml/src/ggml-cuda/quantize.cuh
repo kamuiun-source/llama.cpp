@@ -11,10 +11,29 @@
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
 
+static __device__ __forceinline__ void ggml_cuda_quantize_q8_1_block(float xi, block_q8_1 * y, int iqs) {
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int sum = warp_reduce_sum<QK8_1>(int(q));
+
+    y->qs[iqs] = q;
+    if (iqs == 0) {
+        y->ds = make_half2(d, d * sum);
+    }
+}
+
 void quantize_row_q8_1_cuda(
         const float * x, void * vy,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+#ifdef GGML_USE_HIP
+void quantize_narrow_iq_prefill_d4_cuda(
+        const float * x, void * vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+#endif
 
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,

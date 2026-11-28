@@ -5893,6 +5893,70 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_flash_next : public test_mul_mat_id {
+    test_mul_mat_id_flash_next(ggml_type type, bool broadcast, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 16, 10, broadcast, m, n, k) {
+        GGML_ASSERT(n == 2 || n == 3);
+    }
+
+    std::string vars() override { return test_mul_mat_id::vars() + ",flash_next=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * weights = ggml_get_tensor(ctx, "as");
+        ggml_tensor * activations = ggml_get_tensor(ctx, "b");
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+
+        for (ggml_tensor * sentinel : sentinels) {
+            init_tensor_uniform(sentinel, 0.5f, 0.5f);
+        }
+        init_tensor_uniform(ggml_get_tensor(ctx, "out"), 0.5f, 0.5f);
+
+        static constexpr int32_t expert_ids[3][16] = {
+            {  5,  1, 15,  2,  9,  7, 12,  0,  8,  4,  3,  6, 10, 11, 13, 14 },
+            { 13,  0,  6, 11,  2, 15,  3, 10,  9, 14,  1,  4,  5,  7,  8, 12 },
+            {  8, 14,  4,  6,  1, 10,  7, 13, 11, 12,  0,  2,  3,  5,  9, 15 },
+        };
+        ggml_backend_tensor_set(ids, expert_ids, 0, n * sizeof(expert_ids[0]));
+
+        std::mt19937 rng(1234);
+        const auto next_value = [&rng]() {
+            return static_cast<float>(rng() >> 16) / 32768.0f - 1.0f;
+        };
+        std::vector<float> input(ggml_nelements(activations));
+        const auto input_extra = std::generate_n(input.begin(), 2 * k * activations->ne[1], next_value);
+
+        // Reuse quantized rows to limit the setup cost of the expert bank.
+        constexpr int64_t pool_rows = 128;
+        const size_t row_size = ggml_row_size(type_a, k);
+        std::vector<float> rows(pool_rows * k);
+        std::generate(rows.begin(), rows.end(), next_value);
+        std::vector<float> imatrix(k, 1.0f);
+        std::vector<uint8_t> pool(pool_rows * row_size);
+        ggml_quantize_chunk(type_a, rows.data(), pool.data(), 0, pool_rows, k, imatrix.data());
+
+        std::vector<uint8_t> data(ggml_nbytes(weights));
+        for (int64_t row = 0; row < ggml_nrows(weights); ++row) {
+            const size_t pool_row = rng() % pool_rows;
+            memcpy(data.data() + row * row_size, pool.data() + pool_row * row_size, row_size);
+        }
+        ggml_backend_tensor_set(weights, data.data(), 0, data.size());
+
+        // Fill the third position last so both widths use the same weights.
+        std::generate(input_extra, input.end(), next_value);
+        ggml_backend_tensor_set(activations, input.data(), 0, input.size() * sizeof(float));
+    }
+
+    // Keep routing fixed across timed runs.
+    void reinit_perf_iter(ggml_context *) override {}
+};
+
+static void add_flash_next_mul_mat_id_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int n : {2, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id_flash_next(GGML_TYPE_IQ3_XXS, true,   640, n, 2560)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id_flash_next(GGML_TYPE_IQ4_NL,  false, 2560, n,  640)); // down
+    }
+}
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -12215,6 +12279,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
+    add_flash_next_mul_mat_id_cases(test_cases);
+
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
     // repeated expert ids within a row
@@ -13416,6 +13482,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    add_flash_next_mul_mat_id_cases(test_cases);
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

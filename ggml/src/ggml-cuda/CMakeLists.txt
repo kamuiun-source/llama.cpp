@@ -160,6 +160,11 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CCCL::CCCL)
     endif()
 
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET CUDA::cupti)
+        target_include_directories(ggml-cuda PRIVATE $<TARGET_PROPERTY:CUDA::cupti,INTERFACE_INCLUDE_DIRECTORIES>)
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library

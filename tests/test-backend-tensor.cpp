@@ -608,8 +608,110 @@ static bool test_mock() {
         test_mock_grouping();
 }
 
-int main() {
+static bool test_cuda_hip_copy(bool timing) {
+    constexpr size_t n_elements = 2560 * 3;
+    const char * names[] = { "CUDA0", "ROCm0" };
+    ggml_backend_ptr backends[2];
+
+    ggml_init_params params = {};
+    params.mem_size = 2 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        fprintf(stderr, "Failed to create tensor context\n");
+        return false;
+    }
+
+    ggml_backend_buffer_ptr buffers[2];
+    ggml_tensor * tensors[2];
+    for (size_t i = 0; i < 2; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(names[i]);
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            fprintf(stderr, "Required GPU %s is unavailable\n", names[i]);
+            return false;
+        }
+        backends[i].reset(ggml_backend_dev_init(dev, nullptr));
+        if (!backends[i]) {
+            fprintf(stderr, "Failed to initialize %s\n", names[i]);
+            return false;
+        }
+
+        auto buft = ggml_backend_get_default_buffer_type(backends[i].get());
+        if (ggml_backend_buft_is_host(buft) || ggml_backend_buft_get_device(buft) != dev) {
+            fprintf(stderr, "%s has no device-owned default buffer type\n", names[i]);
+            return false;
+        }
+        std::vector<ggml_tensor *> allocated;
+        buffers[i] = alloc_tensors(ctx.get(), buft, { n_elements }, allocated);
+        if (!buffers[i]) {
+            fprintf(stderr, "Failed to allocate a device tensor on %s\n", names[i]);
+            return false;
+        }
+        tensors[i] = allocated[0];
+    }
+
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    std::vector<uint8_t> expected(nbytes), actual(nbytes);
+    bool ok = true;
+    for (size_t src = 0; src < 2; ++src) {
+        const size_t dst = 1 - src;
+        for (size_t i = 0; i < nbytes; ++i) {
+            expected[i] = (uint8_t) (i ^ (i >> 8) ^ (src ? 0xA5 : 0x5A));
+            actual[i] = expected[i] ^ 0xFF;
+        }
+        ggml_backend_tensor_set(tensors[src], expected.data(), 0, nbytes);
+        ggml_backend_tensor_set(tensors[dst], actual.data(), 0, nbytes);
+
+        const auto copy = [&] {
+            // Wait on each owning runtime before copying between them.
+            ggml_backend_synchronize(backends[src].get());
+            ggml_backend_synchronize(backends[dst].get());
+            ggml_backend_tensor_copy(tensors[src], tensors[dst]);
+        };
+        copy();
+        ggml_backend_tensor_get(tensors[dst], actual.data(), 0, nbytes);
+
+        const bool matched = expected == actual;
+        printf("%s -> %s (%zu bytes) %s\n", names[src], names[dst], nbytes, matched ? "PASSED" : "FAILED");
+        ok = ok && matched;
+        if (!timing || !matched) {
+            continue;
+        }
+
+        for (uint8_t & byte : actual) {
+            byte ^= 0xFF;
+        }
+        ggml_backend_tensor_set(tensors[dst], actual.data(), 0, nbytes);
+        ggml_backend_synchronize(backends[dst].get());
+
+        constexpr int repeats = 1000;
+        const int64_t start_us = ggml_time_us();
+        for (int i = 0; i < repeats; ++i) {
+            copy();
+        }
+        const double mean_us = double(ggml_time_us() - start_us) / repeats;
+
+        ggml_backend_tensor_get(tensors[dst], actual.data(), 0, nbytes);
+        const bool matched_after_timing = expected == actual;
+        printf("%s -> %s (%zu bytes) %.3f us/copy over %d copies, readback %s\n",
+               names[src], names[dst], nbytes, mean_us, repeats, matched_after_timing ? "PASSED" : "FAILED");
+        ok = ok && matched_after_timing;
+    }
+
+    return ok;
+}
+
+int main(int argc, char ** argv) {
     ggml_backend_load_all();
+
+    if (argc > 1 && strcmp(argv[1], "--cuda-hip-copy") == 0) {
+        const bool timing = argc == 3 && strcmp(argv[2], "--timing") == 0;
+        if (argc != 2 && !timing) {
+            fprintf(stderr, "Usage: %s --cuda-hip-copy [--timing]\n", argv[0]);
+            return 1;
+        }
+        return test_cuda_hip_copy(timing) ? 0 : 1;
+    }
 
     // run the unified test set on each backend buffer type
     const size_t n_devs = ggml_backend_dev_count();

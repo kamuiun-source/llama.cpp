@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-expert-placement.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1432,6 +1433,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
+    }
+
+    if (expert_placement && (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+            tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS || tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS)) {
+        const auto & source = require_weight(tn.str().c_str());
+        ++n_created;
+        return expert_placement->add_weight(tn.bid, cur, source.idx, source.offs);
     }
 
     if (flags & TENSOR_READ_LAZY) {

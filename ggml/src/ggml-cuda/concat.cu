@@ -1,5 +1,7 @@
 #include "concat.cuh"
+#include "gpu-output-modes.cuh"
 
+#include <cstdlib>
 #include <stdint.h>
 
 // contiguous kernels
@@ -139,6 +141,26 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Flatten short rows so that each block can copy several rows.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_small(
+        const char * src0, const char * src1, char * dst,
+        int64_t ne00, int64_t ne0, int64_t ne1, int64_t n,
+        uint64_t nb00, uint64_t nb01, uint64_t nb02,
+        uint64_t nb10, uint64_t nb11, uint64_t nb12,
+        uint64_t nb0,  uint64_t nb1,  uint64_t nb2) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t row = i / ne0;
+        const int64_t i0 = i - row*ne0;
+        const int64_t i2 = row / ne1;
+        const int64_t i1 = row - i2*ne1;
+        const char * src = i0 < ne00
+            ? src0 + i0*nb00 + i1*nb01 + i2*nb02
+            : src1 + (i0 - ne00)*nb10 + i1*nb11 + i2*nb12;
+        *(T *) (dst + i0*nb0 + i1*nb1 + i2*nb2) = *(const T *) src;
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +184,20 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::concat_small>() && dim == 0 && dst->ne[0] > 0 && dst->ne[0] <= 32 &&
+                src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+                dst->ne[1] > 0 && dst->ne[2] > 0) {
+            const int64_t n = ggml_nelements(dst);
+            const int n_blocks = std::min<int64_t>(1 + (n - 1)/CUDA_CONCAT_BLOCK_SIZE, 1024);
+            concat_dim0_small<T><<<n_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], dst->ne[0], dst->ne[1], n,
+                src0->nb[0], src0->nb[1], src0->nb[2],
+                src1->nb[0], src1->nb[1], src1->nb[2],
+                dst->nb[0], dst->nb[1], dst->nb[2]);
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

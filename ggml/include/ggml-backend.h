@@ -323,6 +323,14 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    struct ggml_backend_hip_handoff_timing {
+        uint64_t ops, batches, copies, bytes, pinned_copies, pinned_bytes;
+        uint64_t source_wait_us, destination_wait_us, read_us, write_us;
+        uint64_t async_input_batches, async_input_copies, async_input_bytes, enqueue_us;
+    };
+    // Current thread totals, in CUDA->ROCm then ROCm->CUDA order.
+    GGML_API void ggml_backend_get_hip_handoff_timing(struct ggml_backend_hip_handoff_timing timing[2]);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
@@ -389,6 +397,35 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    // Register one callback during a weight copy. Run it after that split is submitted successfully.
+    GGML_API bool ggml_backend_sched_after_split_submit(ggml_backend_sched_t sched,
+            void (*callback)(ggml_backend_sched_t sched, void * user_data), void * user_data);
+    GGML_API void ggml_backend_sched_set_before_split_submit(ggml_backend_sched_t sched,
+            void (*callback)(void * user_data), void * user_data);
+    // Carry an accumulator through an empty prefix from the active weight copy callback.
+    GGML_API void ggml_backend_sched_mark_mtp_three_empty_wave(ggml_backend_sched_t sched, const struct ggml_cgraph * wave_zero);
+    GGML_API bool ggml_backend_sched_carry_accumulator(ggml_backend_sched_t sched, const struct ggml_cgraph * graph, struct ggml_tensor * accumulator);
+    GGML_API bool ggml_backend_sched_set_custom_op_backend(ggml_backend_sched_t sched, struct ggml_tensor * op, ggml_backend_t backend);
+    // Return the previous target verification scope.
+    GGML_API bool ggml_backend_sched_set_target_mtp_verify(ggml_backend_sched_t sched, bool enabled);
+    GGML_API bool ggml_backend_sched_set_target_mtp_verify_three(ggml_backend_sched_t sched, bool enabled);
+
+    // Internal: prepare a host weight before the split's input copies and their waits.
+    // Return true after preparing one weight. Do not write the input copy or need other split inputs.
+    // The normal copy callback still runs to publish the result.
+    GGML_API void                 ggml_backend_sched_set_early_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Internal: retain small I32 input copies that pass through host memory from CUDA to Vulkan.
+    // The exact copied destination and byte count are valid only during the same split's normal weight callback.
+    GGML_API void                 ggml_backend_sched_set_host_copy_capture(ggml_backend_sched_t sched, bool enabled);
+    GGML_API void                 ggml_backend_sched_trace_expert_misses(ggml_backend_sched_t sched, int layer, size_t tokens, size_t misses, size_t bytes);
+    GGML_API bool                 ggml_backend_sched_get_host_copy(ggml_backend_sched_t sched, const struct ggml_tensor * dst, void * data, size_t size);
+    GGML_API const struct ggml_tensor * ggml_backend_sched_get_post_copy_source(ggml_backend_sched_t sched,
+            const struct ggml_cgraph * graph, const struct ggml_tensor * weight, const struct ggml_tensor * dst,
+            const struct ggml_tensor * contribution);
+
+    // Serialize split execution and collect host timings for graphs run while enabled. Log totals when the scheduler is freed.
+    GGML_API void                 ggml_backend_sched_set_split_profile(ggml_backend_sched_t sched, bool enabled);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);

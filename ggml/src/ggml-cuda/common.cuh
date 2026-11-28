@@ -1392,6 +1392,8 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return *concurrent_stream_context; }
+    const ggml_tensor * mapped_hc_output = nullptr;
+    float * mapped_hc_data = nullptr;
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {

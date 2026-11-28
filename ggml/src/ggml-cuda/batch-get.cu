@@ -1,5 +1,6 @@
 #include "batch-get.cuh"
 #include "common.cuh"
+#include "sync-telemetry.cuh"
 #include "ggml-cpp.h"
 
 #include <climits>
@@ -181,7 +182,7 @@ bool ggml_cuda_get_tensor_n(int device,
             CUDA_CHECK(cudaGetLastError());
             if (first + n_batch < n_reads_gather) {
                 // Wait before refilling the pinned host descriptor buffer.
-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+                CUDA_CHECK(ggml_cuda_stream_synchronize(cudaStreamPerThread));
             }
         }
     }
@@ -192,7 +193,7 @@ bool ggml_cuda_get_tensor_n(int device,
         }
     }
     // Wait for GPU writes before releasing the CPU mapping and descriptor buffers.
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_stream_synchronize(cudaStreamPerThread));
     return true;
 #endif
 }
