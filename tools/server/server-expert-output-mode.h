@@ -36,7 +36,22 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
         scratch_lru_mode = mode;
     };
 
-    std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
+    const auto apply_ranked_rtx_early = [&](int mode) {
+        const bool enabled = mode != 0;
+        if (ggml_backend_sched_set_ranked_rtx_early(enabled) || (mode >= 0 && ranked_rtx_early_mode != mode)) {
+            LOG_INF("Ranked RTX Expert mode applied: RANKED_RTX_EARLY=%s\n", enabled ? "on" : "off");
+        }
+        ranked_rtx_early_mode = mode;
+    };
+
+    const auto mode_path = std::filesystem::u8path(path);
+    std::ifstream input(mode_path, std::ios::binary);
+    if (!input.is_open() && ranked_rtx_early_mode == 0) {
+        std::error_code error;
+        if (!std::filesystem::exists(mode_path, error) && !error) {
+            apply_ranked_rtx_early(-1);
+        }
+    }
     char buffer[128];
     input.read(buffer, sizeof(buffer));
     std::string_view text(buffer, input.gcount());
@@ -91,11 +106,6 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             prefetch_unsupported, "NEXT_ROUTER_PREFETCH");
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
     apply_scratch_lru(want_scratch_lru);
-    const bool early = want_ranked_rtx_early == 1;
-    if (ggml_backend_sched_set_ranked_rtx_early(early) ||
-            (want_ranked_rtx_early >= 0 && ranked_rtx_early_mode != want_ranked_rtx_early)) {
-        LOG_INF("Ranked RTX Expert mode applied: RANKED_RTX_EARLY=%s\n", early ? "on" : "off");
-    }
-    ranked_rtx_early_mode = want_ranked_rtx_early;
+    apply_ranked_rtx_early(want_ranked_rtx_early);
     return prefetch_changed || prefill_changed;
 }
