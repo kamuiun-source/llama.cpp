@@ -9,6 +9,7 @@
 ## 現在の状態
 
 - 統合版 `24eba4dbc` から `codex/rocm-mapped-input-q8` を作成。共有F32をMI50で直接Q8_1へ変換する試作は実入力3件・各8,640 Bでビット一致。LRU ON、履歴・候補固定の後半ではON平均30.399、OFF 30.277 ms/検証で、短縮は確認できなかった。既定OFF。[試作と実測](../research/rocm-mtp3-mapped-input-q8.md)
+  公開実装を再調査。Exabitのgfx906向けQ8_1生成融合は起動128回減で生成速度ほぼ横ばい。次の候補はMI50の共有RAMからの16 Bロードを単体比較し、必要ならRTX側で量子化してから転送する。追加実装と測定は未実施。[公開実装と候補](../research/rocm-mtp3-mapped-input-q8.md#公開実装の再調査)
 
 - LRU既定ONの統合版 `c6fb78eb4` を固定3幅・上限512で自然生成比較。ON3回合算62.30 tok/s、OFF1回60.68。本体31.292対31.220 ms/検証。後半ON2回は31.137 ms/検証、通常H2Dのバイト数は検証あたりOFF比で約14%減。全20応答EOS、スワップアウト0。[採用後の比較](../research/rocm-mtp3-scratch-lru.md#採用後の統合版でonを3回offを1回)
 
