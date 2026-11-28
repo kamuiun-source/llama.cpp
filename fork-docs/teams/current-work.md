@@ -10,7 +10,7 @@
 
 - 統合版 `61107ad0f` から `codex/rocm-rtx-ranked-experts` を作成。MI50の公開上位300を維持し、各層301〜310位だけRTXへ常駐。対象ゼロの層を飛ばす版で固定3幅の同一リプレイを各3回。通常Expert H2D 7.25%減、本体31.650→32.146 ms/検証、生成61.66→60.62 tok/s。既定OFF・未統合。 [プロファイルと結果](../research/rocm-mtp3-rtx-ranked-experts.md#対象のみ計算する版を交互に追加測定)
 
-- **RTX追加Expert投影の先行投入。** `codex/rocm-rtx-ranked-experts`。固定3幅で先行投入ONを3回追加。同じバイナリの前回OFF 30.638 ms/検証・63.916 tok/sに対し、追加ON 30.243・64.647、前回込みON5回 30.356・64.400。追加OFF計測はなし。第4問の両GPUトレースでRTX投影の約90%がMI50演算と重なった。既定OFF。 [条件と計測](../research/rocm-mtp3-rtx-ranked-experts.md#先行投入onの追加3試行)
+- **RTX追加Expert投影の先行投入。** `codex/rocm-rtx-ranked-experts`。固定3幅で先行投入ONをさらに3回。前回OFF 30.638 ms/検証・63.916 tok/sに対し、今回ON 30.364・64.344、ON全8回 30.359・64.379。追加OFF計測はなし。第4問の両GPUトレースでRTX投影の約90%がMI50演算と重なった。既定OFF。 [条件と計測](../research/rocm-mtp3-rtx-ranked-experts.md#同一設定で先行投入onをさらに3回)
 
 - **RTX追加Expertの重み付き集約と最終加算。** CUDAノードトレースで対象あり506層ステップすべてに既存gate/up＋SwiGLU融合と追加の集約＋加算融合を確認。転送量が近い固定3幅の後半比較でOFF 30.948→ON 30.933 ms/検証、生成63.250→63.253 tok/s。新フラグは既定OFF。 [比較とフラグ](../research/rocm-mtp3-rtx-ranked-experts.md#実モデルとcudaノードトレース)
 
