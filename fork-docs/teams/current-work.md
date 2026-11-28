@@ -10,7 +10,7 @@
 
 - 統合版 `61107ad0f` から `codex/rocm-rtx-ranked-experts` を作成。MI50の公開上位300を維持し、各層301〜310位だけRTXへ常駐。対象ゼロの層を飛ばす版で固定3幅の同一リプレイを各3回。通常Expert H2D 7.25%減、本体31.650→32.146 ms/検証、生成61.66→60.62 tok/s。既定OFF・未統合。 [プロファイルと結果](../research/rocm-mtp3-rtx-ranked-experts.md#対象のみ計算する版を交互に追加測定)
 
-- **RTX追加Expert投影の先行投入を試作ブランチで採用。** `codex/rocm-rtx-ranked-experts` のRTX追加常駐を指定したときに既定ON。同じ固定リプレイでON全8回30.359 ms/検証・64.379 tok/s、前回OFF2回30.638・63.916。自然生成の計算20問は14問正解で、以前の同梱版と同じ6問を誤答。 [起動設定と計測](../research/rocm-mtp3-rtx-ranked-experts.md#rtx追加常駐の試作ブランチで先行投入を採用)
+- **RTX追加Expert投影の先行投入を試作ブランチで採用。** `codex/rocm-rtx-ranked-experts` でRTX追加常駐を指定した場合に既定ON。レーン絞り込みOFFの同一ビルド・固定リプレイを各2回比較し、本体30.937→30.466 ms/検証、生成63.316→64.215 tok/s。各セッション初回の通常H2Dは一致。自然生成の計算20問は同梱版と同じ6問を誤答。 [再計測と設定](../research/rocm-mtp3-rtx-ranked-experts.md#レーン絞り込み実装後に先行投入だけをoffで再測定)
 
 - **RTX追加Expertのレーン絞り込み。** 固定3幅で1〜4件の対象を4枠に詰め、down前も実レーンだけ量子化。固定リプレイ各2回で本体30.466→30.530 ms/検証、生成64.215→64.035 tok/s。対象18,423層ステップの89.9%に適用。既定OFF。 [設定と測定](../research/rocm-mtp3-rtx-ranked-experts.md#固定リプレイでのレーン絞り込み比較)
 
