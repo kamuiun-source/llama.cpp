@@ -1,4 +1,7 @@
 #include "mmvq.cuh"
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include "../ggml-backend-hip-mapped-input-q8.h"
+#endif
 #include "hc-fused.cuh"
 #include "gpu-output-modes.cuh"
 #include "quantize.cuh"
@@ -2267,8 +2270,16 @@ void ggml_cuda_mul_mat_vec_q(
     }
 #endif
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const char * activation_q8 = nullptr;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (ctx.mapped_input_q8 && ggml_hip_mapped_input_q8_base(src1) == ctx.mapped_input_q8) {
+        GGML_ASSERT(ggml_hip_mapped_input_q8_layout(src1) && src1->data == ctx.mapped_input_q8->data);
+        activation_q8 = static_cast<const char *>(src1->data);
+    }
+#endif
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!activation_q8) {
+        activation_q8 = src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -2335,7 +2346,7 @@ void ggml_cuda_mul_mat_vec_q(
             const auto * groups = static_cast<const int32_t *>(map->data) + plan::experts;
             const ggml_cuda_kernel_launch_params params(dim3(reuse::nrows / reuse::rows_per_tile, plan::routes),
                     dim3(reuse::waves * reuse::wave), 0, stream);
-            const auto * q8 = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());
+            const auto * q8 = reinterpret_cast<const block_q8_1 *>(activation_q8);
             if (iq2_strata) {
                 ggml_cuda_kernel_launch(iq2_strata_reuse::gate_up_packed, params,
                         static_cast<const block_iq2_s *>(src0->data), static_cast<const block_iq2_s *>(fusion_local.gate),
@@ -2364,7 +2375,7 @@ void ggml_cuda_mul_mat_vec_q(
         const ggml_cuda_kernel_launch_params params(dim3(320, 10), dim3(device.warp_size, 3), 0, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_iq3_xxs_moe_share_weights, params,
                 static_cast<const block_iq3_xxs *>(src0->data), static_cast<const block_iq3_xxs *>(fusion_local.gate),
-                reinterpret_cast<const block_q8_1 *>(src1_q8_1.get()), ids_d, dst_d, int(ids_stride), int(s02), int(s01),
+                reinterpret_cast<const block_q8_1 *>(activation_q8), ids_d, dst_d, int(ids_stride), int(s02), int(s01),
                 int(stride_col_y), int(stride_channel_dst), int(stride_col_dst));
         static const bool logged = [] {
             GGML_LOG_INFO("HIP gfx906 IQ3_XXS shared routed weights: MTP positions=3 top_k=10\n");
@@ -2387,7 +2398,7 @@ void ggml_cuda_mul_mat_vec_q(
             const mmvq_launch_trace trace(params, 3, false, false, false, true, 1, "partial");
 #endif
             ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, 3, false, false, false, true, 1, hc_down_split_k_parts>, params,
-                src0->data, src1_q8_1.get(), nullptr, fusion_local, partial.get(), uint32_t(ne00), make_uint3(0, 0, 0),
+                src0->data, activation_q8, nullptr, fusion_local, partial.get(), uint32_t(ne00), make_uint3(0, 0, 0),
                 uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
                 init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(n), uint32_t(0));
         }
@@ -2438,7 +2449,7 @@ void ggml_cuda_mul_mat_vec_q(
                         down && ncols == 3 ? "dot" : nullptr);
 #endif
                 ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, ncols, false, false, false, true, row_groups>, params,
-                    src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
+                    src0->data, activation_q8, nullptr, fusion_local, dst_d, uint32_t(ne00), make_uint3(0, 0, 0),
                     uint32_t(s01), uint32_t(s11), uint32_t(s1), init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
                     init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
             };
@@ -2473,7 +2484,7 @@ void ggml_cuda_mul_mat_vec_q(
         // Short reductions need fewer warps; keep the Q8_1 input and dot product unchanged.
         const auto dims = calc_launch_params<GGML_TYPE_Q8_0>(2, ne01, 1, 1, device.warp_size, get_device_table_id(device.cc), true);
         mul_mat_vec_q_switch_fusion<GGML_TYPE_Q8_0, 2, true>(
-            src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d, ne00, make_uint3(0, 0, 0), s01, s11, s1,
+            src0->data, activation_q8, nullptr, fusion_local, dst_d, ne00, make_uint3(0, 0, 0), s01, s11, s1,
             init_fastdiv_values(1), s02, s12, s2, init_fastdiv_values(1), s03, s13, s3,
             dims.first, dims.second, 0, 0, stream);
         static const bool logged = [] {
@@ -2486,7 +2497,7 @@ void ggml_cuda_mul_mat_vec_q(
 #endif
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, activation_q8, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, iq_mode);

@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-mtp.h"
+#include "ggml-backend-hip-mapped-input-q8.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1265,6 +1266,9 @@ struct ggml_backend_sched_split {
     uint64_t mapped_hip_return_uid;
     uint64_t mapped_hip_input_uid;
     uint64_t mapped_hip_input_after_shared_uid;
+    uint64_t mapped_input_q8_plan_uid;
+    const ggml_tensor * mapped_input_q8_plan_input;
+    bool mapped_input_q8_plan_valid;
     ggml_tensor * mapped_hip_input;
     int next_router_begin;
     uint64_t next_router_uid;
@@ -1566,6 +1570,10 @@ struct ggml_backend_sched {
     bool async_hip_input;
     bool mapped_hip_input;
     ggml_backend_hip_mapped_input_blit_t hip_mapped_input_blit;
+    ggml_backend_hip_mapped_input_q8_t hip_mapped_input_q8;
+    ggml_backend_hip_mapped_input_q8_scope_t hip_mapped_input_q8_scope;
+    size_t hip_mapped_input_q8_applied;
+    size_t hip_mapped_input_q8_fallback;
     size_t hip_mapped_input_read_eligible;
     size_t hip_mapped_input_read_applied;
     ggml_backend_event_t hip_return_h2d_event;
@@ -2531,6 +2539,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split.mapped_hip_return_uid = 0;
         split.mapped_hip_input_uid = 0;
         split.mapped_hip_input_after_shared_uid = 0;
+        split.mapped_input_q8_plan_uid = 0;
+        split.mapped_input_q8_plan_input = nullptr;
+        split.mapped_input_q8_plan_valid = false;
         split.mapped_hip_input = nullptr;
         if (sched->mapped_hip_input && sched->target_mtp_verify_three && i + 1 < sched->n_splits) {
             const auto & next = sched->splits[i + 1];
@@ -2980,6 +2991,9 @@ struct ggml_backend_sched_mapped_hip_input {
     }
 
     ~ggml_backend_sched_mapped_hip_input() { wait(); }
+
+    ggml_tensor * q8_destination = nullptr;
+    const void * q8_mapped = nullptr;
 };
 
 static void ggml_backend_sched_wait_hip_return_h2d(ggml_backend_sched_t sched) {
@@ -3526,6 +3540,8 @@ static bool ggml_backend_sched_merge_empty_wave(ggml_backend_sched_t sched, ggml
     return true;
 }
 
+#include "ggml-backend-hip-mapped-input-q8-sched.h"
+
 static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int first,
         ggml_backend_sched_host_copies * host_copies, ggml_backend_sched_upload & upload,
         ggml_backend_sched_mapped_hip_input & mapped_input) {
@@ -3755,6 +3771,11 @@ static int ggml_backend_sched_batch_device_inputs(ggml_backend_sched_t sched, st
                 if (i == mirrored && eligible) {
                     ++sched->hip_mapped_input_read_eligible;
                     const auto * hip_input = slab.hip_mapped + (slab.cuda_input_data - slab.data);
+                    if (ggml_backend_sched_try_mapped_input_q8(sched, split, dst_backend, dsts[i], hip_input)) {
+                        mapped_input.q8_destination = dsts[i];
+                        mapped_input.q8_mapped = hip_input;
+                        continue;
+                    }
                     if (sched->hip_mapped_input_blit(dst_backend, dsts[i], hip_input)) {
                         ++sched->hip_mapped_input_read_applied;
                         continue;
@@ -4702,7 +4723,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->before_split_submit(sched->before_split_submit_user_data);
             }
             stage.next("graph_submit");
+            auto * prequantized = mapped_input.destination == split ? mapped_input.q8_destination : nullptr;
+            if (prequantized && (main_graph != &split->graph || upload.compute || graph_readback)) {
+                GGML_ASSERT(sched->hip_mapped_input_blit(split_backend, prequantized, mapped_input.q8_mapped));
+                ++sched->hip_mapped_input_read_applied;
+                ++sched->hip_mapped_input_q8_fallback;
+                prequantized = nullptr;
+            }
+            mapped_input.q8_destination = nullptr;
+            ggml_backend_sched_mapped_input_q8_scope q8_scope(sched, split_backend, prequantized);
             enum ggml_status ec = dispatch(main_graph);
+            q8_scope.clear();
+            sched->hip_mapped_input_q8_applied += prequantized && ec == GGML_STATUS_SUCCESS;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -4893,6 +4925,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i]));
                 sched->hip_mapped_input_blit = reinterpret_cast<ggml_backend_hip_mapped_input_blit_t>(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_mapped_input_blit"));
+                sched->hip_mapped_input_q8 = reinterpret_cast<ggml_backend_hip_mapped_input_q8_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_mapped_input_q8"));
+                sched->hip_mapped_input_q8_scope = reinterpret_cast<ggml_backend_hip_mapped_input_q8_scope_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_mapped_input_q8_scope"));
                 break;
             }
         }
@@ -5208,6 +5244,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 sched->hip_mapped_input_read_eligible, sched->hip_mapped_input_read_applied,
                 sched->hip_mapped_input_read_applied * (2560 * 3 * sizeof(float)), sched->hip_handoff.hip_mapped != nullptr,
                 sched->mapped_hip_input_after_shared_producers);
+        if (sched->hip_mapped_input_q8_applied || sched->hip_mapped_input_q8_fallback ||
+                hip_mapped_input_q8_enabled.load(std::memory_order_relaxed)) {
+            GGML_LOG_INFO("packed HIP MTP3 mapped input Q8_1: applied=%zu fallback=%zu\n",
+                    sched->hip_mapped_input_q8_applied, sched->hip_mapped_input_q8_fallback);
+        }
     }
     if (sched->async_hip_return) {
         GGML_LOG_INFO("packed HIP MTP3 async return H2D: applied=%zu fallback=%zu reuse_waits=%zu\n",

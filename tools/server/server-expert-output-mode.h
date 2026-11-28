@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/llama-ext.h"
+#include "../../ggml/src/ggml-backend-mtp.h"
 #include "log.h"
 
 #include <cstdlib>
@@ -44,6 +45,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     bool seen_prefetch = false;
     bool seen_prefill = false;
     int want_scratch_lru = -1;
+    int want_mapped_input_q8 = -1;
     while (valid && !text.empty()) {
         const auto end = text.find('\n');
         auto line = text.substr(0, end);
@@ -62,6 +64,8 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             seen_prefill = true;
         } else if (want_scratch_lru < 0 && (line == "SCRATCH_LRU=on" || line == "SCRATCH_LRU=off")) {
             want_scratch_lru = line == "SCRATCH_LRU=on";
+        } else if (want_mapped_input_q8 < 0 && (line == "MAPPED_INPUT_Q8=on" || line == "MAPPED_INPUT_Q8=off")) {
+            want_mapped_input_q8 = line == "MAPPED_INPUT_Q8=on";
         } else {
             valid = false;
         }
@@ -86,5 +90,9 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             prefetch_unsupported, "NEXT_ROUTER_PREFETCH");
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
     apply_scratch_lru(want_scratch_lru);
+    const bool mapped_input_q8 = want_mapped_input_q8 == 1;
+    if (ggml_backend_sched_set_hip_mapped_input_q8(mapped_input_q8)) {
+        LOG_INF("HIP mapped input Q8_1 mode applied: MAPPED_INPUT_Q8=%s\n", mapped_input_q8 ? "on" : "off");
+    }
     return prefetch_changed || prefill_changed;
 }

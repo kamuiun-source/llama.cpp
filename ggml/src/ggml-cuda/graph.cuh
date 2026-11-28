@@ -54,6 +54,10 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     const ggml_tensor * mapped_hc_output = nullptr;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    const ggml_tensor * mapped_input_q8 = nullptr;
+    const void * mapped_input_q8_data = nullptr;
+#endif
     const void * mapped_hc_data = nullptr;
     int64_t last_used_time = 0;
     uint32_t gpu_output_modes = 0;

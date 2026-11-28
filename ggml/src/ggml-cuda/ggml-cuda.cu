@@ -3362,6 +3362,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     bool res = graph->mapped_hc_output != cuda_ctx->mapped_hc_output || graph->mapped_hc_data != cuda_ctx->mapped_hc_data;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    const auto * q8_input = cuda_ctx->mapped_input_q8;
+    const void * q8_data = q8_input ? q8_input->data : nullptr;
+    res |= graph->mapped_input_q8 != q8_input || graph->mapped_input_q8_data != q8_data;
+#endif
 
     if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
@@ -3375,6 +3380,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     graph->uid = cgraph->uid;
     graph->mapped_hc_output = cuda_ctx->mapped_hc_output;
     graph->mapped_hc_data = cuda_ctx->mapped_hc_data;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    graph->mapped_input_q8 = q8_input;
+    graph->mapped_input_q8_data = q8_data;
+#endif
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -6795,6 +6804,8 @@ static bool ggml_backend_hip_mapped_input_blit(ggml_backend_t backend, ggml_tens
     return true;
 }
 
+#include "hip-mapped-input-q8.cuh"
+
 static void * ggml_backend_hip_get_host_mapping(ggml_backend_dev_t dev, void * buffer) {
     auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
     ggml_cuda_set_device(ctx->device);
@@ -7784,6 +7795,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #if defined(GGML_USE_HIP) && defined(__linux__)
     if (strcmp(name, "ggml_backend_hip_register_mapped_host") == 0) {
         return (void *)ggml_backend_hip_register_mapped_host;
+    }
+    if (strcmp(name, "ggml_backend_hip_mapped_input_q8") == 0) {
+        return (void *) ggml_backend_hip_mapped_input_q8;
+    }
+    if (strcmp(name, "ggml_backend_hip_mapped_input_q8_scope") == 0) {
+        return (void *) ggml_backend_hip_mapped_input_q8_scope;
     }
     if (strcmp(name, "ggml_backend_hip_mapped_input_blit") == 0) {
         return (void *)ggml_backend_hip_mapped_input_blit;
