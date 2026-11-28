@@ -1281,6 +1281,7 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph after_shared;
     ggml_tensor * ranked_rtx_merge;
     uint64_t ranked_rtx_empty_uid[2][2][2];
+    ggml_ranked_rtx::early_projection ranked_rtx_early;
 };
 
 struct ggml_backend_sched_cuda_profile {
@@ -1339,6 +1340,7 @@ struct ggml_backend_sched_single_miss {
 };
 
 static std::atomic<int> hip_single_miss_cpu_mode{0};
+static std::atomic<bool> ranked_rtx_early_mode{false};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
     if (mode == 0 || mode == 1) {
@@ -1532,6 +1534,10 @@ struct ggml_backend_sched {
     const ggml_backend_sched_host_copies * active_host_copies;
     const ggml_backend_sched_split * active_copy_split;
     const ggml_backend_sched_split * ranked_rtx_empty_split;
+    const ggml_backend_sched_split * ranked_rtx_early_split;
+    size_t ranked_rtx_early_started;
+    size_t ranked_rtx_early_applied;
+    size_t ranked_rtx_early_fallback;
     bool ranked_rtx_configured;
     size_t ranked_rtx_empty;
     size_t ranked_rtx_hot;
@@ -2386,6 +2392,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->carry_plan_end = 0;
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        split->ranked_rtx_early = {};
         split->has_custom = false;
         if (sched->custom_dispatch && sched->backends[split->backend_id] == sched->custom_backend) {
             for (int j = 0; j < split->graph.n_nodes; ++j) {
@@ -2402,6 +2409,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (sched->defer_next_router && sched->target_mtp_verify_three && !sched->profile.enabled && !sched->callback_eval) {
         for (int i = 0; i + 1 < sched->n_splits; ++i) {
             ggml_backend_sched_plan_next_router(sched, sched->splits[i], sched->splits[i + 1], opt_params);
+        }
+    }
+
+    if (sched->ranked_rtx_configured) {
+        for (int i = 1; i < sched->n_splits; ++i) {
+            auto * split = &sched->splits[i];
+            if (split->n_inputs == 1 && sched->n_copies == 1 &&
+                    ggml_backend_sched_is_cuda_pair(sched->backends[sched->splits[i - 1].backend_id],
+                        sched->backends[split->backend_id], "ROCm") &&
+                    strncmp(ggml_backend_name(sched->backends[split->backend_id]), "CUDA", 4) == 0) {
+                auto * copy = tensor_copy(split->inputs[0], split->backend_id, sched->cur_copy);
+                auto & plan = split->ranked_rtx_early;
+                plan = ggml_ranked_rtx::find_early_projection(split->graph, copy);
+                if (plan.weighted) {
+                    // The return destination and both merge operands must survive the relocated writes.
+                    auto * down = plan.weighted->src[0];
+                    opt_params.add_alloc_dep(opt_params.user_data, copy, down);
+                    opt_params.add_alloc_dep(opt_params.user_data, plan.base->src[1], down);
+                }
+            }
         }
     }
 
@@ -2556,6 +2583,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             uid = ggml_graph_next_uid() | ggml_ranked_rtx::empty_uid_bit;
                         }
                     }
+                }
+            }
+        }
+
+        auto & early = split.ranked_rtx_early;
+        if (early.weighted) {
+            early.graph = ggml_graph_view(&split.graph, early.begin, early.end);
+            early.graph.uid = ggml_graph_next_uid();
+            for (auto & deferred : early.suffix_uid) {
+                for (auto & uid : deferred) {
+                    uid = ggml_graph_next_uid() | ggml_ranked_rtx::projected_uid_bit;
                 }
             }
         }
@@ -4021,6 +4059,38 @@ static bool ggml_backend_sched_shared_range(const ggml_tensor * tensor, const gg
     return a < b ? b - a >= ggml_nbytes(tensor) : a - b >= ggml_nbytes(copied);
 }
 
+static bool ggml_backend_sched_ranked_rtx_early_safe(ggml_backend_sched_t sched, ggml_backend_sched_split & split) {
+    auto & plan = split.ranked_rtx_early;
+    if (!plan.checked) {
+        plan.checked = true;
+        if (!plan.weighted || !split.ranked_rtx_merge || split.has_custom ||
+                split.shared_prefix.n_nodes != plan.begin - 2 ||
+                (split.next_router_begin && plan.end >= split.next_router_begin)) {
+            return false;
+        }
+        auto * buft = ggml_backend_get_default_buffer_type(sched->backends[split.backend_id]);
+        for (int i = 0; i < plan.graph.n_nodes; ++i) {
+            const auto * node = plan.graph.nodes[i];
+            if (!ggml_backend_sched_shared_range(node, plan.base->src[0], buft) ||
+                    !ggml_backend_sched_shared_range(node, plan.base->src[1], buft) ||
+                    !ggml_backend_sched_shared_range(node, plan.base, buft)) {
+                return false;
+            }
+            for (const auto * src : node->src) {
+                if (!src) {
+                    continue;
+                }
+                auto * buf = src->view_src ? src->view_src->buffer : src->buffer;
+                if (!buf || !src->data || ggml_backend_buffer_get_type(buf) != buft) {
+                    return false;
+                }
+            }
+        }
+        plan.safe = true;
+    }
+    return plan.safe;
+}
+
 static bool ggml_backend_sched_plan_shared(ggml_backend_sched_t sched, ggml_backend_sched_split & split,
         ggml_backend_sched_split & routed, bool allow_hip = false) {
     if (split.n_inputs != 1) {
@@ -4316,6 +4386,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched->active_deferred_router = nullptr;
             sched->active_single_miss = nullptr;
             sched->ranked_rtx_empty_split = nullptr;
+            sched->ranked_rtx_early_split = nullptr;
         }
     } after_submit{sched, {}, {}, {}};
     sched->active_after_submit = &after_submit.pending;
@@ -4372,6 +4443,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     sched->mtp_three_shared_overlap_submits += width == 3;
                 }
                 main_graph = &split->after_shared;
+            }
+        }
+
+        bool ranked_rtx_projected = false;
+        if (sched->ranked_rtx_early_split == split) {
+            sched->ranked_rtx_early_split = nullptr;
+            if (main_graph == &split->after_shared && ggml_backend_sched_ranked_rtx_early_safe(sched, *split)) {
+                stage.next("ranked_rtx_early");
+                const auto status = ggml_backend_graph_compute_async(split_backend, &split->ranked_rtx_early.graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                ++sched->ranked_rtx_early_applied;
+                ranked_rtx_projected = true;
+            } else {
+                ++sched->ranked_rtx_early_fallback;
             }
         }
 
@@ -4603,6 +4690,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ++sched->ranked_rtx_empty_fallback;
                 }
+            }
+
+            ggml_cgraph projected_suffix;
+            if (ranked_rtx_projected) {
+                GGML_ASSERT(after_shared);
+                const auto & plan = split->ranked_rtx_early;
+                const auto & uid = plan.suffix_uid[graph == &without_router];
+                projected_suffix = ggml_ranked_rtx::omit_early_projection(*graph, plan, ranked_rtx_nodes, uid[0]);
+                if (mapped_input_uid) {
+                    mapped_input_uid = uid[1];
+                }
+                graph = &projected_suffix;
             }
 
             if (mapped_input_uid && !profile.enabled &&
@@ -5111,6 +5210,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("ranked RTX Experts sparse dispatch: empty_skipped=%zu hot_layers=%zu empty_fallback=%zu inactive_hot_lanes=%zu\n",
                 sched->ranked_rtx_empty, sched->ranked_rtx_hot, sched->ranked_rtx_empty_fallback, sched->ranked_rtx_inactive_hot_lanes);
     }
+    if (sched->ranked_rtx_early_started) {
+        GGML_LOG_INFO("ranked RTX Experts early projection: started=%zu applied=%zu fallback=%zu\n",
+                sched->ranked_rtx_early_started, sched->ranked_rtx_early_applied, sched->ranked_rtx_early_fallback);
+    }
     if (auto * trace = sched->hip_verify_trace) {
         ggml_backend_sched_hip_verify_stage_flush(sched);
         delete trace;
@@ -5471,12 +5574,20 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_copy_user_data = user_data;
 }
 
+bool ggml_backend_sched_set_ranked_rtx_early(bool enabled) {
+    return ranked_rtx_early_mode.exchange(enabled, std::memory_order_relaxed) != enabled;
+}
+
 void ggml_backend_sched_ranked_rtx_routes(ggml_backend_sched_t sched, int layer, int lanes) {
     if (lanes) {
         ++sched->ranked_rtx_hot;
         sched->ranked_rtx_inactive_hot_lanes += 30 - lanes;
-        return;
+        if (!ranked_rtx_early_mode.load(std::memory_order_relaxed)) {
+            return;
+        }
+        ++sched->ranked_rtx_early_started;
     }
+    auto & fallback = lanes ? sched->ranked_rtx_early_fallback : sched->ranked_rtx_empty_fallback;
     const auto * split = sched->active_copy_split;
     static const bool concurrent_cuda_graph = [] {
         const char * value = getenv("GGML_CUDA_GRAPH_OPT");
@@ -5484,16 +5595,20 @@ void ggml_backend_sched_ranked_rtx_routes(ggml_backend_sched_t sched, int layer,
     }();
     if (!split || split + 1 == sched->splits + sched->n_splits || sched->n_copies != 1 ||
             sched->profile.enabled || sched->callback_eval || concurrent_cuda_graph) {
-        ++sched->ranked_rtx_empty_fallback;
+        ++fallback;
         return;
     }
     const auto * next = split + 1;
     if (!next->ranked_rtx_merge || next->ranked_rtx_merge->op_params[ggml_ranked_rtx::layer_param] != layer ||
             strncmp(ggml_backend_name(sched->backends[next->backend_id]), "CUDA", 4) != 0) {
-        ++sched->ranked_rtx_empty_fallback;
+        ++fallback;
         return;
     }
-    sched->ranked_rtx_empty_split = next;
+    if (lanes) {
+        sched->ranked_rtx_early_split = next;
+    } else {
+        sched->ranked_rtx_empty_split = next;
+    }
 }
 
 bool ggml_backend_sched_after_split_submit(ggml_backend_sched_t sched,

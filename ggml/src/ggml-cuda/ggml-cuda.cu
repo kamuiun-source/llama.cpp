@@ -3365,10 +3365,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    if (cgraph->uid & ggml_ranked_rtx::empty_uid_bit) {
-        // Use the alias view as a separate key without moving it in the execution order.
+    if (cgraph->uid & (ggml_ranked_rtx::empty_uid_bit | ggml_ranked_rtx::projected_uid_bit)) {
+        // Use separate keys for the two pruned suffixes without moving any nodes.
+        const int flag = cgraph->uid & ggml_ranked_rtx::empty_uid_bit ?
+                ggml_ranked_rtx::anchor_flag : ggml_ranked_rtx::weighted_flag;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->flags & ggml_ranked_rtx::anchor_flag) {
+            if (cgraph->nodes[i]->flags & flag) {
                 return cgraph->nodes[i];
             }
         }

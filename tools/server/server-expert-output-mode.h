@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml-backend.h"
 #include "src/llama-ext.h"
 #include "log.h"
 
@@ -24,6 +25,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     static bool invalid = false;
     static bool prefetch_unsupported = false;
     static bool prefill_unsupported = false;
+    static int ranked_rtx_early_mode = -1;
 
     const auto apply_scratch_lru = [&](int mode) {
         const bool enabled = mode != 0;
@@ -44,6 +46,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     bool seen_prefetch = false;
     bool seen_prefill = false;
     int want_scratch_lru = -1;
+    int want_ranked_rtx_early = -1;
     while (valid && !text.empty()) {
         const auto end = text.find('\n');
         auto line = text.substr(0, end);
@@ -62,6 +65,8 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             seen_prefill = true;
         } else if (want_scratch_lru < 0 && (line == "SCRATCH_LRU=on" || line == "SCRATCH_LRU=off")) {
             want_scratch_lru = line == "SCRATCH_LRU=on";
+        } else if (want_ranked_rtx_early < 0 && (line == "RANKED_RTX_EARLY=on" || line == "RANKED_RTX_EARLY=off")) {
+            want_ranked_rtx_early = line == "RANKED_RTX_EARLY=on";
         } else {
             valid = false;
         }
@@ -86,5 +91,11 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             prefetch_unsupported, "NEXT_ROUTER_PREFETCH");
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
     apply_scratch_lru(want_scratch_lru);
+    const bool early = want_ranked_rtx_early == 1;
+    if (ggml_backend_sched_set_ranked_rtx_early(early) ||
+            (want_ranked_rtx_early >= 0 && ranked_rtx_early_mode != want_ranked_rtx_early)) {
+        LOG_INF("Ranked RTX Expert mode applied: RANKED_RTX_EARLY=%s\n", early ? "on" : "off");
+    }
+    ranked_rtx_early_mode = want_ranked_rtx_early;
     return prefetch_changed || prefill_changed;
 }
