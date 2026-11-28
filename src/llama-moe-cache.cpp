@@ -450,6 +450,9 @@ struct llama_moe_cache::impl {
     size_t pending_request_misses = 0;
     size_t pending_upload_bytes = 0;
     size_t packed_scratch_hits = 0;
+    size_t ranked_rtx_layers = 0;
+    size_t ranked_rtx_lanes = 0;
+    size_t ranked_rtx_unique = 0;
     size_t packed_request_misses = 0;
     const bool mtp_verify_three_enabled;
     static constexpr int32_t mtp_pair_experts = 10;
@@ -2611,6 +2614,7 @@ struct llama_moe_cache::impl {
             }
             seen[expert] = false;
             if (map.resident[expert] < 0 && map.host[expert] >= 0 &&
+                    !(placement->ranked_rtx && placement->ranked_rtx->owns(layer, expert)) &&
                     std::find(scratch.begin(), scratch.end(), expert) == scratch.end()) {
                 eligible += accepted[expert];
                 next_prefetch_score_rejected += !accepted[expert];
@@ -2724,6 +2728,7 @@ struct llama_moe_cache::impl {
                 const int expert = ids[token * next_prefetch_priority_ranks + rank];
                 GGML_ASSERT(expert >= 0 && expert < next_prefetch_experts);
                 if (map.resident[expert] >= 0 || map.host[expert] < 0 ||
+                        (placement->ranked_rtx && placement->ranked_rtx->owns(layer, expert)) ||
                         std::find(scratch.begin(), scratch.end(), expert) != scratch.end()) {
                     continue;
                 }
@@ -2771,7 +2776,9 @@ struct llama_moe_cache::impl {
                 }
                 const int32_t host_slot = map.host[expert];
                 const auto end = next_prefetch_ids.begin() + next_prefetch_count;
-                if (map.resident[expert] >= 0 || host_slot < 0 || std::find(scratch.begin(), scratch.end(), expert) != scratch.end() ||
+                if (map.resident[expert] >= 0 || host_slot < 0 ||
+                        (placement->ranked_rtx && placement->ranked_rtx->owns(target, expert)) ||
+                        std::find(scratch.begin(), scratch.end(), expert) != scratch.end() ||
                         std::find(next_prefetch_ids.begin(), end, expert) != end) {
                     continue;
                 }
@@ -3696,12 +3703,33 @@ struct llama_moe_cache::impl {
                     ++scratch_hits;
                 }
             }
+            const auto * ranked_rtx = lookup->op_params[1] == llama_ranked_rtx_experts::lookup_tag ?
+                    placement->ranked_rtx.get() : nullptr;
+            if (ranked_rtx) {
+                GGML_ASSERT(fixed_three && !use_waves);
+                const int32_t zero = llama_expert_profile::n_resident + placement->n_slots;
+                std::array<bool, llama_ranked_rtx_experts::count> seen{};
+                ++ranked_rtx_layers;
+                for (const int32_t expert : ids) {
+                    const int32_t rtx_slot = ranked_rtx->layers[il].slots[expert];
+                    if (rtx_slot == llama_ranked_rtx_experts::count) {
+                        continue;
+                    }
+                    slots[expert] = zero;
+                    ++ranked_rtx_lanes;
+                    ranked_rtx_unique += !seen[rtx_slot];
+                    seen[rtx_slot] = true;
+                    if (promote_index >= 0 && scratch[promote_index] == expert) {
+                        promote_index = -1;
+                    }
+                }
+            }
             // Count requests before fills turn repeated misses into slot-map hits.
             size_t request_misses = 0;
             if (placement->max_ubatch > 1) {
                 scratch_hits = 0;
                 for (const int32_t expert : ids) {
-                    if (map.resident[expert] < 0) {
+                    if (map.resident[expert] < 0 && !(ranked_rtx && ranked_rtx->owns(il, expert))) {
                         if (slots[expert] >= 0) {
                             ++scratch_hits;
                         } else {
@@ -3933,7 +3961,7 @@ struct llama_moe_cache::impl {
                     const int64_t prep_start = measure ? ggml_time_us() : 0;
                     int32_t * plan = staging + strata::experts;
                     const int32_t zero_slot = llama_expert_profile::n_resident + placement->n_slots;
-                    strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu));
+                    strata::build(plan, ids.data(), slots.data(), zero_slot, zero_slot + int(placement->hip_single_miss_cpu || ranked_rtx));
                     if (measure) {
                         stats->prep_us += ggml_time_us() - prep_start;
                         ++stats->plans;
@@ -4338,6 +4366,10 @@ struct llama_moe_cache::impl {
                         prefill_layer_batches, prefill_max_tokens, prefill_unique_cold, prefill_waves_needed, prefill_waves_scheduled);
                 LLAMA_LOG_INFO("packed expert prefill waves: active_only=%d executed=%zu skipped=%zu\n",
                         prefill_active_waves, prefill_waves_executed, prefill_waves_skipped);
+            }
+            if (placement->ranked_rtx) {
+                LLAMA_LOG_INFO("ranked RTX Experts dispatch: layer_steps=%zu lanes=%zu unique_per_layer_step=%zu repeated_lanes=%zu\n",
+                        ranked_rtx_layers, ranked_rtx_lanes, ranked_rtx_unique, ranked_rtx_lanes - ranked_rtx_unique);
             }
             LLAMA_LOG_INFO("packed expert slots: reuse=%s permanent_hits=%zu scratch_hits=%zu ram_uploads=%zu upload_mode=%s\n",
                     "on", stats_small.hits - packed_scratch_hits, packed_scratch_hits, stats_small.misses,

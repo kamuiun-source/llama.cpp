@@ -1380,6 +1380,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    ggml_tensor * ranked_rtx = nullptr;
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1394,7 +1395,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr, nullptr, 1e-5f, &ranked_rtx);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
@@ -1424,6 +1426,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         cur = moe_out;
     }
 
+    if (ranked_rtx) {
+        // Preserve the adjacent MI50 return and Shared Expert merge.
+        ggml_build_forward_expand(gf, cur);
+        cur = ggml_add(ctx0, cur, ranked_rtx);
+        cb(cur, "ffn_ranked_rtx_merged", il);
+    }
     return cur;
 }
 

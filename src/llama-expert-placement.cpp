@@ -200,6 +200,21 @@ llama_expert_placement::llama_expert_placement(const char * path, ggml_backend_d
             maps[il].host[expert] = on_gpu ? -1 : host++;
         }
     }
+    if (const char * path = std::getenv("LLAMA_EXPERT_RANKED_CUDA0_PROFILE")) {
+        if (*path) {
+            if (!hip_tuple_dma) {
+                throw std::runtime_error("ranked RTX Experts require dynamic HIP tuple placement with fixed3 verification");
+            }
+            ranked_rtx = std::make_unique<llama_ranked_rtx_experts>(path);
+            for (int il = 0; il < n_layers; ++il) {
+                for (int expert = 0; expert < n_experts; ++expert) {
+                    if (ranked_rtx->owns(il, expert) && maps[il].resident[expert] >= 0) {
+                        throw std::runtime_error("ranked RTX Expert profile overlaps MI50 residency");
+                    }
+                }
+            }
+        }
+    }
     const ggml_init_params init{3 * n_layers * ggml_tensor_overhead(), nullptr, true};
     host_ctx.reset(ggml_init(init));
     bank_ctx.reset(ggml_init(init));
@@ -226,7 +241,7 @@ ggml_tensor * llama_expert_placement::add_weight(int layer, const ggml_tensor * 
     }
     auto * host = ggml_new_tensor_3d(host_ctx.get(), source->type, source->ne[0], source->ne[1], n_experts - n_resident);
     auto * bank = ggml_new_tensor_3d(bank_ctx.get(), source->type, source->ne[0], source->ne[1],
-            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots + int(hip_single_miss_cpu)));
+            n_resident + (overlap ? 1 + int(hip_overlap_promotion) : n_slots + int(hip_single_miss_cpu || ranked_rtx)));
     auto * cold = overlap ? ggml_new_tensor_3d(cold_ctx.get(), source->type, source->ne[0], source->ne[1], n_slots + 1) : nullptr;
     ggml_set_name(host, source->name);
     ggml_format_name(bank, "expert_bank.%s", source->name);
@@ -324,6 +339,9 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
     if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
         throw std::runtime_error("HIP Expert tuple DMA uses native pinned buffers and requires an unlocked model load mode");
     }
+    if (ranked_rtx && loader.get_arch() != LLM_ARCH_QWEN4EXP) {
+        throw std::runtime_error("ranked RTX Experts require Qwen4Exp");
+    }
     const auto host_buft = ggml_backend_dev_host_buffer_type(target);
     const auto device_buft = ggml_backend_dev_buffer_type(target);
     if (!host_buft) {
@@ -377,7 +395,7 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
         auto & tuple = tuples[il];
         tuple.stride = (sizes[il] + alignments[il] - 1) / alignments[il] * alignments[il];
         tuple.host = ggml_new_tensor_1d(tuple_host_ctx.get(), GGML_TYPE_I8, (n_experts - n_resident) * tuple.stride);
-        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots + int(hip_single_miss_cpu)) * tuple.stride);
+        tuple.device = ggml_new_tensor_1d(tuple_bank_ctx.get(), GGML_TYPE_I8, (n_resident + n_slots + int(hip_single_miss_cpu || ranked_rtx)) * tuple.stride);
         ggml_format_name(tuple.host, "expert_tuple_host.%d", il);
         ggml_format_name(tuple.device, "expert_tuple_bank.%d", il);
     }
@@ -416,6 +434,17 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
     ggml_backend_buffer_clear(host_buf.get(), 0);
     ggml_backend_buffer_clear(bank_buf.get(), 0);
 
+    std::vector<ggml_tensor *> ranked_planes;
+    if (ranked_rtx) {
+        ranked_planes.reserve(weights.size());
+        for (const auto & w : weights) {
+            ranked_planes.push_back(ranked_rtx->add_plane(w.layer, w.host));
+        }
+        ranked_rtx->allocate();
+        LLAMA_LOG_INFO("ranked RTX Experts: layers=%d experts_per_layer=%d bytes=%zu phase=target_verify width=3\n",
+                n_layers, llama_ranked_rtx_experts::count, ggml_backend_buffer_get_size(ranked_rtx->buffer.get()));
+    }
+
     std::vector<char> resident;
     for (const auto & w : weights) {
         if (params.progress_callback && !params.progress_callback(
@@ -448,6 +477,10 @@ bool llama_expert_placement::load_tuples(llama_model_loader & loader, const llam
             file.read_raw(data, bytes);
             if (loader.check_tensors && !ggml_validate_row_data(w.host->type, data, bytes)) {
                 throw std::runtime_error(format("invalid data in expert tensor %s", w.host->name));
+            }
+            if (ranked_rtx && ranked_rtx->owns(w.layer, expert)) {
+                const int32_t rtx_slot = ranked_rtx->layers[w.layer].slots[expert];
+                ggml_backend_tensor_set(ranked_planes[&w - weights.data()], data, rtx_slot * bytes, bytes);
             }
         }
         ggml_backend_tensor_set_2d(w.bank, resident.data(), 0, bytes, n_resident, tuple.stride, bytes);

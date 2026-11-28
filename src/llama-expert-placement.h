@@ -3,6 +3,7 @@
 #include "ggml-cpp.h"
 #include "llama-expert-profile.h"
 #include "llama-mmap.h"
+#include "llama-ranked-rtx-experts.h"
 #include "llama.h"
 
 #include <atomic>
@@ -62,6 +63,7 @@ struct llama_expert_placement {
     std::array<layer_map, llama_expert_profile::n_layers> maps;
     std::vector<weight> weights;
     std::array<tuple_bank, llama_expert_profile::n_layers> tuples;
+    std::unique_ptr<llama_ranked_rtx_experts> ranked_rtx;
     ggml_context_ptr host_ctx;
     ggml_context_ptr bank_ctx;
     ggml_context_ptr cold_ctx;

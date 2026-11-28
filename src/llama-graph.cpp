@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-expert-placement.h"
 #include "llama-moe-cache.h"
 #include "llama-rtx-expert.h"
 #include "llama-batch.h"
@@ -2234,7 +2235,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor ** ranked_rtx_out) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2257,7 +2259,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        ranked_rtx_out
     );
 }
 
@@ -2287,7 +2290,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor ** ranked_rtx_out) const {
     const llm_arch arch = model.arch;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -2472,6 +2476,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    if (ranked_rtx_out && model.expert_placement && model.expert_placement->ranked_rtx &&
+            target_mtp_verify_packed && n_tokens == 3) {
+        if (!cache.slots || cache.cpu_ids || !can_cpu_share || type_op != LLM_FFN_SILU ||
+                hparams.swiglu_clamp_exp[il] > 1e-6f || gate_up_exps || gate_exps_b || up_exps_b || down_exps_b ||
+                up_exps_s || gate_exps_s || down_exps_s || post_exp_norm ||
+                (prec_policy && std::any_of(exps.begin(), exps.end(), [&](ggml_tensor * w) {
+                    return w && (prec_policy->prec_src1.count(w) || prec_policy->prec_acc.count(w));
+                }))) {
+            throw std::runtime_error("unsupported fixed3 graph for ranked RTX Experts");
+        }
+        *ranked_rtx_out = model.expert_placement->ranked_rtx->output(ctx0, sched, il, selected_experts, cur, weights);
+        GGML_ASSERT(cache.slots->src[0]->op == GGML_OP_GET_ROWS);
+        cache.slots->src[0]->op_params[1] = llama_ranked_rtx_experts::lookup_tag;
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
