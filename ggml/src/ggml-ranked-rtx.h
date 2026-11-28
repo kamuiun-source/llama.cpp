@@ -11,6 +11,7 @@ constexpr int branch_flag = 1 << 24;
 constexpr int merge_flag = 1 << 25;
 constexpr int ids_flag = 1 << 26;
 constexpr int anchor_flag = 1 << 27;
+constexpr int weighted_flag = 1 << 28;
 constexpr uint64_t empty_uid_bit = UINT64_C(1) << 63;
 constexpr int inactive_id = -1;
 constexpr int count_param = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;

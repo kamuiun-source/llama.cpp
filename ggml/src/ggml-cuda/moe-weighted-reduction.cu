@@ -63,3 +63,36 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void ranked_rtx_weighted_merge_f32(
+        const float * __restrict__ experts, const float * __restrict__ weights, float * dst) {
+    constexpr int columns = 2560;
+    constexpr int routes = 10;
+    const int token = blockIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
+    const int first = token * routes;
+    // Match the generic CUDA reduction, then round the merge separately.
+    float sum = __fmul_rn(experts[first * columns + col], weights[first]);
+
+#pragma unroll
+    for (int rank = 1; rank < routes; ++rank) {
+        const int row = first + rank;
+        sum = __fmaf_rn(experts[row * columns + col], weights[row], sum);
+    }
+
+    const int element = token * columns + col;
+    dst[element] = __fadd_rn(dst[element], sum);
+}
+
+void ggml_cuda_op_ranked_rtx_weighted_merge(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst) {
+    const auto * expert_data = static_cast<const float *>(experts->data);
+    const auto * weight_data = static_cast<const float *>(weights->data);
+    auto * output_data = static_cast<float *>(dst->data);
+    constexpr int threads = 256;
+    const dim3 blocks(3, 10);
+    ranked_rtx_weighted_merge_f32<<<blocks, threads, 0, ctx.stream()>>>(expert_data, weight_data, output_data);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif

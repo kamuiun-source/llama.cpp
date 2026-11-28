@@ -3988,7 +3988,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * same_element_input = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -4021,7 +4022,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias || src == same_element_input) {
                     continue;
                 }
 
@@ -4612,11 +4613,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
-                ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
-                return match.node_count - 1;
+            if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                return 0;
             }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if ((node->flags & ggml_ranked_rtx::weighted_flag) && !match.expert_scale &&
+                    match.experts->ne[0] == 2560 && match.experts->ne[1] == 10 &&
+                    match.experts->ne[2] == 3 && match.experts->ne[3] == 1 &&
+                    ggml_gpu_output_modes::enabled<ggml_gpu_output_modes::ranked_rtx_reduce>(0)) {
+                const int merge_idx = output_idx + 1;
+                if (merge_idx < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, output_idx, 1) &&
+                        !(match.dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    auto * merge = cgraph->nodes[merge_idx];
+                    const auto * base = merge->src[0];
+                    if (merge->op == GGML_OP_ADD && (merge->flags & ggml_ranked_rtx::merge_flag) &&
+                            (merge->flags & GGML_TENSOR_FLAG_COMPUTE) && merge->src[1] == match.dst &&
+                            base && (base->flags & ggml_ranked_rtx::anchor_flag) &&
+                            merge->data == base->data && merge->buffer == base->buffer &&
+                            ggml_is_contiguous(merge) && ggml_are_same_layout(base, merge) &&
+                            ggml_are_same_layout(match.dst, merge) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count + 1, &merge_idx, 1, false, base)) {
+                        ggml_cuda_op_ranked_rtx_weighted_merge(*cuda_ctx, match.experts, match.weights, merge);
+                        return match.node_count;
+                    }
+                }
+            }
+#endif
+            ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+            return match.node_count - 1;
         }
     }
 
@@ -6043,6 +6067,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         output_mode_bits |= output_modes::gfx906_bits;
     }
 #elif !defined(GGML_USE_MUSA)
+    output_mode_bits |= output_modes::bit(output_modes::ranked_rtx_reduce);
     if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_ADA_LOVELACE) {
         output_mode_bits |= output_modes::ada_bits;
     }

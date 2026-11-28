@@ -138,6 +138,7 @@ struct llama_ranked_rtx_experts {
         auto * act = on_cuda(ggml_swiglu_split(graph, gate, up));
         auto * down = on_cuda(ggml_mul_mat_id(graph, l.down, act, slots));
         auto * weighted = on_cuda(ggml_mul(graph, down, weights));
+        weighted->flags |= ggml_ranked_rtx::weighted_flag;
         ggml_tensor * sum = nullptr;
         for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
             auto * lane = ggml_view_2d(graph, weighted, weighted->ne[0], ids->ne[1], weighted->nb[2], rank * weighted->nb[1]);
