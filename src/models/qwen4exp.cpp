@@ -1429,8 +1429,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     if (ranked_rtx) {
         // Preserve the adjacent MI50 return and Shared Expert merge.
         ggml_build_forward_expand(gf, cur);
-        cur = ggml_add(ctx0, cur, ranked_rtx);
+        const int begin = ggml_graph_n_nodes(gf);
+        const bool has_shared = cur != moe_out;
+        if (has_shared) {
+            auto * alias = ggml_view_2d(ctx0, cur, cur->ne[0], cur->ne[1], cur->nb[1], 0);
+            cur = ggml_add_inplace(ctx0, alias, ranked_rtx);
+        } else {
+            cur = ggml_add(ctx0, cur, ranked_rtx);
+        }
         cb(cur, "ffn_ranked_rtx_merged", il);
+        if (has_shared) {
+            ggml_build_forward_expand(gf, cur);
+            const int end = ggml_graph_n_nodes(gf);
+            for (int i = begin; i < end; ++i) {
+                ggml_graph_node(gf, i)->flags |= ggml_ranked_rtx::branch_flag;
+            }
+            cur->src[0]->flags |= ggml_ranked_rtx::anchor_flag;
+            cur->flags |= ggml_ranked_rtx::merge_flag;
+            cur->op_params[ggml_ranked_rtx::count_param] = end - begin;
+            cur->op_params[ggml_ranked_rtx::layer_param] = il;
+        }
     }
     return cur;
 }

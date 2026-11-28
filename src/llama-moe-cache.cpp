@@ -3710,19 +3710,22 @@ struct llama_moe_cache::impl {
                 const int32_t zero = llama_expert_profile::n_resident + placement->n_slots;
                 std::array<bool, llama_ranked_rtx_experts::count> seen{};
                 ++ranked_rtx_layers;
+                int lanes = 0;
                 for (const int32_t expert : ids) {
                     const int32_t rtx_slot = ranked_rtx->layers[il].slots[expert];
                     if (rtx_slot == llama_ranked_rtx_experts::count) {
                         continue;
                     }
                     slots[expert] = zero;
-                    ++ranked_rtx_lanes;
+                    ++lanes;
                     ranked_rtx_unique += !seen[rtx_slot];
                     seen[rtx_slot] = true;
                     if (promote_index >= 0 && scratch[promote_index] == expert) {
                         promote_index = -1;
                     }
                 }
+                ranked_rtx_lanes += lanes;
+                ggml_backend_sched_ranked_rtx_routes(sched, il, lanes);
             }
             // Count requests before fills turn repeated misses into slot-map hits.
             size_t request_misses = 0;

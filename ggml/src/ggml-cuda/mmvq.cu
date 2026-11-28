@@ -1,3 +1,4 @@
+#include "../ggml-ranked-rtx.h"
 #include "mmvq.cuh"
 #include "hc-fused.cuh"
 #include "gpu-output-modes.cuh"
@@ -1220,7 +1221,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_down_compact(
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
           int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false,
-          iq_prefill::mode iq_mode = iq_prefill::mode::legacy>
+          iq_prefill::mode iq_mode = iq_prefill::mode::legacy, bool ranked_rtx = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1333,6 +1334,17 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    if constexpr (ranked_rtx) {
+        if (channel_x == uint32_t(ggml_ranked_rtx::inactive_id)) {
+            for (int row = threadIdx.x; row < c_rows_per_block; row += warp_size) {
+                const int row_x = c_rows_per_block * blockIdx.x + row;
+                if (row_x < nrows_x) {
+                    dst[channel_dst * stride_channel_dst + token_idx * stride_col_dst + row_x] = 0.0f;
+                }
+            }
+            return;
+        }
+    }
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const auto * y = static_cast<const Activation *>(vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -2481,6 +2493,40 @@ void ggml_cuda_mul_mat_vec_q(
             return true;
         }();
         GGML_UNUSED(logged);
+        return;
+    }
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ids && (ids->flags & ggml_ranked_rtx::ids_flag)) {
+        GGML_ASSERT(ncols_dst == 3 && nchannels_dst == 10 && !fusion_local.shared_up);
+        constexpr int rows_per_block = 2;
+        const ggml_cuda_kernel_launch_params params(
+                dim3((ne01 + rows_per_block - 1) / rows_per_block, nchannels_dst),
+                dim3(ggml_cuda_info().devices[ctx.device].warp_size, ncols_dst), 0, stream);
+        const auto launch = [&](auto type_tag, auto fusion_tag) {
+            constexpr ggml_type type = decltype(type_tag)::value;
+            constexpr bool fused = decltype(fusion_tag)::value;
+            ggml_cuda_kernel_launch(
+                    mul_mat_vec_q_moe<type, rows_per_block, fused, false, 0, 1, false, false, iq_prefill::mode::legacy, true>,
+                    params, src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, init_fastdiv_values(nchannels_y),
+                    ne01, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
+        };
+        const auto launch_type = [&](auto type_tag) {
+            if (fusion_local.gate) {
+                launch(type_tag, std::true_type{});
+            } else {
+                launch(type_tag, std::false_type{});
+            }
+        };
+        switch (src0->type) {
+            case GGML_TYPE_IQ2_S:   launch_type(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});   break;
+            case GGML_TYPE_IQ3_XXS: launch_type(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{}); break;
+            case GGML_TYPE_IQ4_XS:  launch_type(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{});  break;
+            case GGML_TYPE_IQ4_NL:  launch_type(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{});  break;
+            case GGML_TYPE_Q2_0:    launch_type(std::integral_constant<ggml_type, GGML_TYPE_Q2_0>{});    break;
+            default: GGML_ABORT("unsupported ranked RTX Expert weight type");
+        }
         return;
     }
 #endif

@@ -81,6 +81,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
+#include "../ggml-ranked-rtx.h"
 
 #include <algorithm>
 #include <array>
@@ -2484,6 +2485,9 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
     // For MUL_MAT_ID: same kernel choice as ggml_cuda_mul_mat_id, with the nominal tiles of all experts (the per-expert token counts are only known on the GPU).
     const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
+    if (is_id && (up->src[2]->flags & ggml_ranked_rtx::ids_flag)) {
+        return false;
+    }
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
     const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
@@ -2605,6 +2609,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    if (ids->flags & ggml_ranked_rtx::ids_flag) {
+        // Only the per-lane multi-token MMVQ path accepts a disabled lane.
+        GGML_ASSERT(!GGML_CUDA_CC_IS_AMD(cc) && ne2 == 3 && ggml_is_quantized(src0->type) &&
+                ne2 <= get_mmvq_mmid_max_batch(src0->type, cc));
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3355,6 +3365,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    if (cgraph->uid & ggml_ranked_rtx::empty_uid_bit) {
+        // Use the alias view as a separate key without moving it in the execution order.
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->flags & ggml_ranked_rtx::anchor_flag) {
+                return cgraph->nodes[i];
+            }
+        }
+        GGML_ABORT("missing ranked RTX CUDA Graph cache anchor");
+    }
     return cgraph->nodes[0];
 }
 

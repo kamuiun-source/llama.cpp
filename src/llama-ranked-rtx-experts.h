@@ -3,6 +3,7 @@
 #include "ggml-cpp.h"
 #include "llama-expert-profile.h"
 #include "llama-impl.h"
+#include "../ggml/src/ggml-ranked-rtx.h"
 
 #include <cstring>
 #include <fstream>
@@ -96,7 +97,13 @@ struct llama_ranked_rtx_experts {
             if (!l.gate || !l.up || !l.down) {
                 throw std::runtime_error("missing ranked RTX Expert projection");
             }
-            ggml_backend_tensor_set(l.map, l.slots.data(), 0, sizeof(l.slots));
+            auto slots = l.slots;
+            for (auto & slot : slots) {
+                if (slot == count) {
+                    slot = ggml_ranked_rtx::inactive_id;
+                }
+            }
+            ggml_backend_tensor_set(l.map, slots.data(), 0, sizeof(slots));
         }
     }
 
@@ -125,6 +132,7 @@ struct llama_ranked_rtx_experts {
         auto * flat = ggml_reshape_1d(graph, contiguous, ggml_nelements(ids));
         auto * slots = on_cuda(ggml_get_rows(graph, l.map, flat));
         slots = ggml_reshape_2d(graph, slots, ids->ne[0], ids->ne[1]);
+        slots->flags |= ggml_ranked_rtx::ids_flag;
         auto * gate = on_cuda(ggml_mul_mat_id(graph, l.gate, input, slots));
         auto * up = on_cuda(ggml_mul_mat_id(graph, l.up, input, slots));
         auto * act = on_cuda(ggml_swiglu_split(graph, gate, up));
