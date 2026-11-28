@@ -185,6 +185,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 - **未統合。各層の公開順位301〜310位をRTXに常駐。** `codex/rocm-rtx-ranked-experts` の対象のみ計算する版を同じ固定リプレイで各3回。通常Expert H2Dは毎回6.528→6.055 GB、本体は31.650→32.146 ms/検証、生成は61.66→60.62 tok/s。追加の交互2組も同方向。既定OFF。 [配置と計測の詳細](../research/rocm-mtp3-rtx-ranked-experts.md#対象のみ計算する版を交互に追加測定)
 
+- **RTX追加Expert投影の先行投入。** `codex/rocm-rtx-ranked-experts`。同一サーバー・固定3幅の5問を各2回。本体30.638→30.524 ms/検証、生成63.916→64.033 tok/s。第4問の両GPUトレースでRTX投影の約90%がMI50演算と重なった。試作は既定OFF。 [起動設定と計測](../research/rocm-mtp3-rtx-ranked-experts.md#rtx追加expertの投影を先に投入する試作)
+
 - **RTX追加Expertの重み付き集約と最終加算。** CUDAノードトレースで対象あり506層ステップすべてに既存gate/up＋SwiGLU融合と追加の集約＋加算融合を確認。転送量が近い固定3幅の後半比較でOFF 30.948→ON 30.933 ms/検証、生成63.250→63.253 tok/s。新フラグは既定OFF。 [比較とフラグ](../research/rocm-mtp3-rtx-ranked-experts.md#実モデルとcudaノードトレース)
 
 - **未統合。RTXに1層・2層分の全Expertを常駐。** 試作ブランチ名は `codex/rocm-rtx-expert-layer`（最終 `437ff74cc`）。固定3幅の実測で、現行配置から層0だけを移すと本体31.455→31.086 ms/検証。層2を追加した同一ビルド比較では31.320→31.247 ms/検証、RTX空きVRAMは2,801→1,841 MiB。試作コードは未統合。[選定根拠と計測メモ](../research/rocm-mtp3-rtx-expert-layer.md)
