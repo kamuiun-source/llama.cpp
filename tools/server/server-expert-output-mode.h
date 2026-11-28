@@ -26,6 +26,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     static bool prefetch_unsupported = false;
     static bool prefill_unsupported = false;
     static int ranked_rtx_early_mode = -1;
+    static int ranked_rtx_compact_mode = -1;
 
     const auto apply_scratch_lru = [&](int mode) {
         const bool enabled = mode != 0;
@@ -62,6 +63,7 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     bool seen_prefill = false;
     int want_scratch_lru = -1;
     int want_ranked_rtx_early = -1;
+    int want_ranked_rtx_compact = -1;
     while (valid && !text.empty()) {
         const auto end = text.find('\n');
         auto line = text.substr(0, end);
@@ -82,6 +84,8 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
             want_scratch_lru = line == "SCRATCH_LRU=on";
         } else if (want_ranked_rtx_early < 0 && (line == "RANKED_RTX_EARLY=on" || line == "RANKED_RTX_EARLY=off")) {
             want_ranked_rtx_early = line == "RANKED_RTX_EARLY=on";
+        } else if (want_ranked_rtx_compact < 0 && (line == "RANKED_RTX_COMPACT=on" || line == "RANKED_RTX_COMPACT=off")) {
+            want_ranked_rtx_compact = line == "RANKED_RTX_COMPACT=on";
         } else {
             valid = false;
         }
@@ -107,5 +111,11 @@ inline bool server_refresh_expert_output_modes(llama_context * target, int & scr
     const bool prefill_changed = apply(llama_set_expert_hip_prefill(target, want_prefill), prefill_unsupported, "HIP_PREFILL");
     apply_scratch_lru(want_scratch_lru);
     apply_ranked_rtx_early(want_ranked_rtx_early);
+    const bool compact = want_ranked_rtx_compact == 1;
+    if (ggml_backend_sched_set_ranked_rtx_compact(compact) ||
+            (want_ranked_rtx_compact >= 0 && ranked_rtx_compact_mode != want_ranked_rtx_compact)) {
+        LOG_INF("Ranked RTX Expert mode applied: RANKED_RTX_COMPACT=%s\n", compact ? "on" : "off");
+    }
+    ranked_rtx_compact_mode = want_ranked_rtx_compact;
     return prefetch_changed || prefill_changed;
 }

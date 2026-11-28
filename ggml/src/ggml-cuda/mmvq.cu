@@ -3,6 +3,7 @@
 #include "hc-fused.cuh"
 #include "gpu-output-modes.cuh"
 #include "quantize.cuh"
+#include "ranked-rtx-compact.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #ifdef GGML_USE_HIP
@@ -1221,7 +1222,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_down_compact(
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool packed_signs = false,
           int iq_lds_tokens = 0, int iq_row_groups = 1, bool iq2_paired_dot = false, bool iq4_compact_decode = false,
-          iq_prefill::mode iq_mode = iq_prefill::mode::legacy, bool ranked_rtx = false>
+          iq_prefill::mode iq_mode = iq_prefill::mode::legacy, bool ranked_rtx = false, bool compact_ranked = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1322,17 +1323,30 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
-    const uint32_t token_idx = threadIdx.y;
+    uint32_t token_idx = threadIdx.y;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
-
+    uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (compact_ranked) {
+        ggml_cuda_pdl_sync();
+        const int route = ggml_ranked_rtx::compact_route(ids, threadIdx.y);
+        if (route < 0) {
+            ggml_cuda_pdl_lc();
+            return;
+        }
+        token_idx = route / ggml_ranked_rtx::ranks;
+        channel_dst = route % ggml_ranked_rtx::ranks;
+    }
+#endif
     if (token_idx >= ncols_dst) {
         return;
     }
+    if constexpr (!compact_ranked) {
+        ggml_cuda_pdl_sync();
+    }
 
-    ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     if constexpr (ranked_rtx) {
         if (channel_x == uint32_t(ggml_ranked_rtx::inactive_id)) {
@@ -2279,6 +2293,10 @@ void ggml_cuda_mul_mat_vec_q(
     }
 #endif
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const bool compact = ggml_ranked_rtx::cuda_compact && ids && (ids->flags & ggml_ranked_rtx::ids_flag);
+    const bool compact_down = compact && ne00 == 640 && ne01 == 2560 && ne11 == ggml_ranked_rtx::ranks;
+#endif
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
@@ -2288,6 +2306,15 @@ void ggml_cuda_mul_mat_vec_q(
 #ifdef GGML_USE_HIP
             if (iq_prefill::d4_activation(iq_mode)) {
                 quantize_narrow_iq_prefill_d4_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                return;
+            }
+#endif
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (compact_down) {
+                const dim3 blocks(ne10_padded / CUDA_QUANTIZE_BLOCK_SIZE, ggml_ranked_rtx::compact_cap);
+                ggml_ranked_rtx::ranked_rtx_compact_quantize_down<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                        src1_d, ids_d, reinterpret_cast<block_q8_1 *>(src1_q8_1.get()), dst_d, s11, s12, ne10_padded);
+                CUDA_CHECK(cudaGetLastError());
                 return;
             }
 #endif
@@ -2501,22 +2528,32 @@ void ggml_cuda_mul_mat_vec_q(
     if (ids && (ids->flags & ggml_ranked_rtx::ids_flag)) {
         GGML_ASSERT(ncols_dst == 3 && nchannels_dst == 10 && !fusion_local.shared_up);
         constexpr int rows_per_block = 2;
+        const bool compact_projection = compact_down || (compact && fusion_local.gate);
         const ggml_cuda_kernel_launch_params params(
-                dim3((ne01 + rows_per_block - 1) / rows_per_block, nchannels_dst),
-                dim3(ggml_cuda_info().devices[ctx.device].warp_size, ncols_dst), 0, stream);
-        const auto launch = [&](auto type_tag, auto fusion_tag) {
+                dim3((ne01 + rows_per_block - 1) / rows_per_block, compact_projection ? 1 : nchannels_dst),
+                dim3(ggml_cuda_info().devices[ctx.device].warp_size, compact_projection ? ggml_ranked_rtx::compact_cap : ncols_dst),
+                0, stream);
+        const auto launch = [&](auto type_tag, auto fusion_tag, auto compact_tag) {
             constexpr ggml_type type = decltype(type_tag)::value;
             constexpr bool fused = decltype(fusion_tag)::value;
+            constexpr bool packed = decltype(compact_tag)::value;
             ggml_cuda_kernel_launch(
-                    mul_mat_vec_q_moe<type, rows_per_block, fused, false, 0, 1, false, false, iq_prefill::mode::legacy, true>,
+                    mul_mat_vec_q_moe<type, rows_per_block, fused, false, 0, 1, false, false, iq_prefill::mode::legacy, true, packed>,
                     params, src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, init_fastdiv_values(nchannels_y),
                     ne01, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
         };
+        const auto launch_compact = [&](auto type_tag, auto fusion_tag) {
+            if (compact_projection) {
+                launch(type_tag, fusion_tag, std::true_type{});
+            } else {
+                launch(type_tag, fusion_tag, std::false_type{});
+            }
+        };
         const auto launch_type = [&](auto type_tag) {
             if (fusion_local.gate) {
-                launch(type_tag, std::true_type{});
+                launch_compact(type_tag, std::true_type{});
             } else {
-                launch(type_tag, std::false_type{});
+                launch_compact(type_tag, std::false_type{});
             }
         };
         switch (src0->type) {

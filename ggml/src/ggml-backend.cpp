@@ -1341,6 +1341,7 @@ struct ggml_backend_sched_single_miss {
 
 static std::atomic<int> hip_single_miss_cpu_mode{0};
 static std::atomic<bool> ranked_rtx_early_mode{true};
+static std::atomic<bool> ranked_rtx_compact_mode{false};
 
 void ggml_backend_sched_set_hip_single_miss_cpu(int mode) {
     if (mode == 0 || mode == 1) {
@@ -1538,6 +1539,10 @@ struct ggml_backend_sched {
     size_t ranked_rtx_early_started;
     size_t ranked_rtx_early_applied;
     size_t ranked_rtx_early_fallback;
+    int ranked_rtx_compact_lanes;
+    size_t ranked_rtx_compact_applied[ggml_ranked_rtx::compact_cap];
+    size_t ranked_rtx_compact_overflow;
+    size_t ranked_rtx_compact_fallback;
     bool ranked_rtx_configured;
     size_t ranked_rtx_empty;
     size_t ranked_rtx_hot;
@@ -2591,6 +2596,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         if (early.weighted) {
             early.graph = ggml_graph_view(&split.graph, early.begin, early.end);
             early.graph.uid = ggml_graph_next_uid();
+            if (ggml_ranked_rtx::compact_geometry(early)) {
+                early.compact_uid = ggml_graph_next_uid() | ggml_ranked_rtx::compact_uid_bit;
+            }
             for (auto & deferred : early.suffix_uid) {
                 for (auto & uid : deferred) {
                     uid = ggml_graph_next_uid() | ggml_ranked_rtx::projected_uid_bit;
@@ -4087,6 +4095,11 @@ static bool ggml_backend_sched_ranked_rtx_early_safe(ggml_backend_sched_t sched,
             }
         }
         plan.safe = true;
+        if (plan.compact_uid) {
+            const auto * down = plan.weighted->src[0];
+            plan.compact_safe = ggml_backend_sched_shared_range(down, down->src[1], buft) &&
+                    ggml_backend_sched_shared_range(down, down->src[2], buft);
+        }
     }
     return plan.safe;
 }
@@ -4387,6 +4400,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched->active_single_miss = nullptr;
             sched->ranked_rtx_empty_split = nullptr;
             sched->ranked_rtx_early_split = nullptr;
+            sched->ranked_rtx_compact_lanes = 0;
         }
     } after_submit{sched, {}, {}, {}};
     sched->active_after_submit = &after_submit.pending;
@@ -4449,16 +4463,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool ranked_rtx_projected = false;
         if (sched->ranked_rtx_early_split == split) {
             sched->ranked_rtx_early_split = nullptr;
+            const int compact_lanes = sched->ranked_rtx_compact_lanes;
+            sched->ranked_rtx_compact_lanes = 0;
             if (main_graph == &split->after_shared && ggml_backend_sched_ranked_rtx_early_safe(sched, *split)) {
-                stage.next("ranked_rtx_early");
-                const auto status = ggml_backend_graph_compute_async(split_backend, &split->ranked_rtx_early.graph);
+                auto & plan = split->ranked_rtx_early;
+                auto projection = plan.graph;
+                const bool compact = compact_lanes && plan.compact_safe;
+                if (compact) {
+                    projection.uid = plan.compact_uid;
+                }
+                stage.next(compact ? "ranked_rtx_compact" : "ranked_rtx_early");
+                const auto status = ggml_backend_graph_compute_async(split_backend, &projection);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
                 ++sched->ranked_rtx_early_applied;
+                if (compact) {
+                    ++sched->ranked_rtx_compact_applied[compact_lanes - 1];
+                } else if (compact_lanes) {
+                    ++sched->ranked_rtx_compact_fallback;
+                }
                 ranked_rtx_projected = true;
             } else {
                 ++sched->ranked_rtx_early_fallback;
+                sched->ranked_rtx_compact_fallback += compact_lanes != 0;
             }
         }
 
@@ -5214,6 +5242,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_INFO("ranked RTX Experts early projection: started=%zu applied=%zu fallback=%zu\n",
                 sched->ranked_rtx_early_started, sched->ranked_rtx_early_applied, sched->ranked_rtx_early_fallback);
     }
+    const auto * compact = sched->ranked_rtx_compact_applied;
+    const size_t compact_layers = compact[0] + compact[1] + compact[2] + compact[3];
+    if (compact_layers || sched->ranked_rtx_compact_overflow || sched->ranked_rtx_compact_fallback) {
+        const size_t active = compact[0] + 2 * compact[1] + 3 * compact[2] + 4 * compact[3];
+        GGML_LOG_INFO("ranked RTX Experts compact projection: lanes1=%zu lanes2=%zu lanes3=%zu lanes4=%zu active_lanes=%zu"
+                " launched_slots=%zu cap_overflow=%zu fallback=%zu\n",
+                compact[0], compact[1], compact[2], compact[3], active, ggml_ranked_rtx::compact_cap * compact_layers,
+                sched->ranked_rtx_compact_overflow, sched->ranked_rtx_compact_fallback);
+    }
     if (auto * trace = sched->hip_verify_trace) {
         ggml_backend_sched_hip_verify_stage_flush(sched);
         delete trace;
@@ -5578,11 +5615,19 @@ bool ggml_backend_sched_set_ranked_rtx_early(bool enabled) {
     return ranked_rtx_early_mode.exchange(enabled, std::memory_order_relaxed) != enabled;
 }
 
+bool ggml_backend_sched_set_ranked_rtx_compact(bool enabled) {
+    return ranked_rtx_compact_mode.exchange(enabled, std::memory_order_relaxed) != enabled;
+}
+
 void ggml_backend_sched_ranked_rtx_routes(ggml_backend_sched_t sched, int layer, int lanes) {
+    const bool compact_requested = lanes > 0 && ranked_rtx_compact_mode.load(std::memory_order_relaxed);
+    const bool compact_fits = compact_requested && lanes <= ggml_ranked_rtx::compact_cap;
+    sched->ranked_rtx_compact_overflow += compact_requested && !compact_fits;
     if (lanes) {
         ++sched->ranked_rtx_hot;
         sched->ranked_rtx_inactive_hot_lanes += 30 - lanes;
         if (!ranked_rtx_early_mode.load(std::memory_order_relaxed)) {
+            sched->ranked_rtx_compact_fallback += compact_fits;
             return;
         }
         ++sched->ranked_rtx_early_started;
@@ -5596,16 +5641,19 @@ void ggml_backend_sched_ranked_rtx_routes(ggml_backend_sched_t sched, int layer,
     if (!split || split + 1 == sched->splits + sched->n_splits || sched->n_copies != 1 ||
             sched->profile.enabled || sched->callback_eval || concurrent_cuda_graph) {
         ++fallback;
+        sched->ranked_rtx_compact_fallback += compact_fits;
         return;
     }
     const auto * next = split + 1;
     if (!next->ranked_rtx_merge || next->ranked_rtx_merge->op_params[ggml_ranked_rtx::layer_param] != layer ||
             strncmp(ggml_backend_name(sched->backends[next->backend_id]), "CUDA", 4) != 0) {
         ++fallback;
+        sched->ranked_rtx_compact_fallback += compact_fits;
         return;
     }
     if (lanes) {
         sched->ranked_rtx_early_split = next;
+        sched->ranked_rtx_compact_lanes = compact_fits ? lanes : 0;
     } else {
         sched->ranked_rtx_empty_split = next;
     }

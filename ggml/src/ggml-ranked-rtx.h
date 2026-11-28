@@ -14,6 +14,10 @@ constexpr int anchor_flag = 1 << 27;
 constexpr int weighted_flag = 1 << 28;
 constexpr uint64_t empty_uid_bit = UINT64_C(1) << 63;
 constexpr uint64_t projected_uid_bit = UINT64_C(1) << 62;
+constexpr uint64_t compact_uid_bit = UINT64_C(1) << 61;
+constexpr int ranks = 10;
+constexpr int routes = 3 * ranks;
+constexpr int compact_cap = 4;
 constexpr int inactive_id = -1;
 constexpr int count_param = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
 constexpr int layer_param = count_param - 1;
@@ -24,9 +28,11 @@ struct early_projection {
     ggml_tensor * weighted;
     ggml_tensor * base;
     ggml_cgraph graph;
+    uint64_t compact_uid;
     uint64_t suffix_uid[2][2];
     bool checked;
     bool safe;
+    bool compact_safe;
 };
 
 inline early_projection find_early_projection(const ggml_cgraph & graph, const ggml_tensor * copy) {
@@ -83,6 +89,28 @@ inline early_projection find_early_projection(const ggml_cgraph & graph, const g
         return plan;
     }
     return {};
+}
+
+inline bool compact_geometry(const early_projection & plan) {
+    const auto * down = plan.weighted->src[0];
+    const auto * ids = down->src[2];
+    const auto * act = down->src[1];
+    if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || !ggml_is_matrix(ids) ||
+            ids->ne[0] != ranks || ids->ne[1] != 3 ||
+            act->op != GGML_OP_GLU || ggml_get_glu_op(act) != GGML_GLU_OP_SWIGLU ||
+            act->type != GGML_TYPE_F32 || act->ne[0] != 640 || act->ne[1] != ranks || act->ne[2] != 3 || act->ne[3] != 1 ||
+            !ggml_is_contiguous(act) || down->type != GGML_TYPE_F32 || down->ne[3] != 1 || !ggml_is_contiguous(down)) {
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        const auto * projection = act->src[i];
+        if (projection->op != GGML_OP_MUL_MAT_ID || projection->src[2] != ids ||
+                projection->src[1]->ne[0] != 2560 || projection->src[1]->ne[1] != 1 ||
+                projection->src[1]->ne[2] != 3 || projection->src[1]->ne[3] != 1 || !ggml_is_contiguous(projection)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline ggml_cgraph omit_early_projection(const ggml_cgraph & source, const early_projection & plan,

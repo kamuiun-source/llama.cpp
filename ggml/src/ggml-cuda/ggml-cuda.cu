@@ -10,6 +10,7 @@
 #include "sync-telemetry.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/gpu-output-modes.cuh"
+#include "ggml-cuda/ranked-rtx-compact.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -3365,6 +3366,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    if (cgraph->uid & ggml_ranked_rtx::compact_uid_bit) {
+        // The compact projection ends at the unique ranked down node.
+        return cgraph->nodes[cgraph->n_nodes - 1];
+    }
     if (cgraph->uid & (ggml_ranked_rtx::empty_uid_bit | ggml_ranked_rtx::projected_uid_bit)) {
         // Use separate keys for the two pruned suffixes without moving any nodes.
         const int flag = cgraph->uid & ggml_ranked_rtx::empty_uid_bit ?
@@ -6051,6 +6056,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    struct restore_ranked_compact {
+        bool previous;
+        ~restore_ranked_compact() { ggml_ranked_rtx::cuda_compact = previous; }
+    } restore{ggml_ranked_rtx::cuda_compact};
+    ggml_ranked_rtx::cuda_compact = (cgraph->uid & ggml_ranked_rtx::compact_uid_bit) != 0;
+#endif
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

@@ -398,6 +398,7 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
     GGML_API bool ggml_backend_sched_set_ranked_rtx_early(bool enabled);
+    GGML_API bool ggml_backend_sched_set_ranked_rtx_compact(bool enabled);
     GGML_API void ggml_backend_sched_ranked_rtx_routes(ggml_backend_sched_t sched, int layer, int lanes);
     // Register one callback during a weight copy. Run it after that split is submitted successfully.
     GGML_API bool ggml_backend_sched_after_split_submit(ggml_backend_sched_t sched,
