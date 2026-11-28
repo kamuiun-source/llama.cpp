@@ -187,6 +187,8 @@ Qwen3.8 Flash Next UD-IQ3_XXSの同じGGUFとリポジトリ標準のWikiText-2 
 
 - **RTX追加Expert投影の先行投入を試作ブランチで採用。** `codex/rocm-rtx-ranked-experts` のRTX追加常駐を指定したときに既定ON。同じ固定リプレイでON全8回30.359 ms/検証・64.379 tok/s、前回OFF2回30.638・63.916。自然生成の計算20問は14問正解で、以前の同梱版と同じ6問を誤答。 [起動設定と計測](../research/rocm-mtp3-rtx-ranked-experts.md#rtx追加常駐の試作ブランチで先行投入を採用)
 
+- **RTX追加Expertのレーン絞り込み。** 固定3幅で1〜4件の対象を4枠に詰め、down前も実レーンだけ量子化。固定リプレイ各2回で本体30.466→30.530 ms/検証、生成64.215→64.035 tok/s。対象18,423層ステップの89.9%に適用。既定OFF。 [設定と測定](../research/rocm-mtp3-rtx-ranked-experts.md#固定リプレイでのレーン絞り込み比較)
+
 - **RTX追加常駐全体の温め済み比較。** 同じビルド・固定3幅と履歴・候補を使い、現行配置を1回測定。現行30.331 ms/検証・64.495 tok/s、追加常駐＋先行投入の同じ実行位置2回は30.339・64.415。追加常駐で通常Expert H2Dが11.95%減。 [条件と実測](../research/rocm-mtp3-rtx-ranked-experts.md#rtx追加常駐を外した現行配置との直接比較)
 
 - **RTX追加Expertの重み付き集約と最終加算。** CUDAノードトレースで対象あり506層ステップすべてに既存gate/up＋SwiGLU融合と追加の集約＋加算融合を確認。転送量が近い固定3幅の後半比較でOFF 30.948→ON 30.933 ms/検証、生成63.250→63.253 tok/s。新フラグは既定OFF。 [比較とフラグ](../research/rocm-mtp3-rtx-ranked-experts.md#実モデルとcudaノードトレース)
